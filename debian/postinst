@@ -1,0 +1,212 @@
+#!/bin/bash
+set -e
+
+case "$1" in
+  configure)
+    # ── Create easywall system user/group ────────────────────────────────
+    if ! getent group easywall > /dev/null 2>&1; then
+      addgroup --system easywall
+    fi
+    if ! getent passwd easywall > /dev/null 2>&1; then
+      adduser --system --ingroup easywall --no-create-home --shell /usr/sbin/nologin \
+              --gecos "easywall web service" easywall
+    fi
+
+    # ── Runtime and data directories ─────────────────────────────────────
+    #
+    # /etc/easywall is root-owned and group easywall: the web process must be
+    # able to traverse it to reach its own config, and must not be able to write
+    # in it. The directory holds easywall.toml, which the *root* daemon reads —
+    # a network-facing process able to replace that file would defeat the
+    # two-process split entirely.
+    #
+    # It used to be 0750 root:root, which left the easywall user unable to
+    # traverse the directory at all. easywall-web exited at startup with
+    # "permission denied" reading its own configuration, so a freshly installed
+    # package had no web interface. Nothing in CI installs the package, so
+    # nothing noticed.
+    #
+    # /var/lib/easywall is the core's: rules.json, the apply state, the panic
+    # marker. Owned by root, because root only reaches a directory it does not
+    # own through CAP_DAC_OVERRIDE, and the unit's capability set does not
+    # include it — it was easywall:easywall 0750 once, and the core could not
+    # write it. Group easywall with no write, so the web process can reach
+    # web/ inside it and nothing else. It was 0770 until 2.22, shared, and see
+    # below for what that let the web user do.
+    install -d -m 0750 -o root     -g easywall /run/easywall
+    install -d -m 0750 -o root     -g easywall /etc/easywall
+    install -d -m 0750 -o easywall -g easywall /etc/easywall/ssl
+    install -d -m 0750 -o root     -g easywall /var/lib/easywall
+    install -d -m 0750 -o root     -g easywall /var/log/easywall
+
+    # ── The web process keeps its state in /var/lib/easywall/web ──────────
+    #
+    # Its own directory, the only one under /var/lib/easywall it can write:
+    # passkeys, the TOTP replay guard, the version cache, the installation
+    # identifier. Until 2.22 they sat beside the core's files in a directory
+    # both could write, and in a directory you can write you can replace any
+    # file and plant a link in its place. The web user could swap rules.json,
+    # which the core restores at boot with no acceptance window, and point
+    # last_apply at any file for root to write the next time an apply was
+    # accepted — a path from the network-facing process to root.
+    #
+    # The install -d above made it 0750, so from here on only root adds,
+    # removes or renames anything in it. What the web user already owned is
+    # replaced by root-owned copies below. A live web process —
+    # dpkg-reconfigure does not stop it — can still write web/, so nothing here
+    # writes into web/ in place: a file for it is built in this directory and
+    # renamed in, which replaces whatever it put at that name rather than
+    # following it. What an older layout left behind is dealt with now, and
+    # each pass is a no-op on the next upgrade:
+    #   - a link is removed and never followed — nothing easywall writes is one;
+    #   - the web's own files move into web/, if the web user owns them — one
+    #     that is a hard link to somebody else's file is not the web's;
+    #   - a panic marker not owned by root is removed: only the core makes one;
+    #   - an entry that is not a regular file is removed: the core never makes
+    #     one here;
+    #   - anything else not owned by root is replaced by a root-owned copy.
+    #     Its owner could otherwise go on writing it in place, whatever the
+    #     directory's mode.
+    # web/ first of all: install -d through a link named web would chown its
+    # target to the web user. docker/entrypoint.sh does the same, in the same
+    # order.
+    data=/var/lib/easywall
+    if [ -L "$data/web" ] || { [ -e "$data/web" ] && [ ! -d "$data/web" ]; }; then
+      echo "easywall: $data/web was not a directory; removed" >&2
+      rm -f "$data/web"
+    fi
+    install -d -m 0700 -o easywall -g easywall "$data/web" ||
+      echo "easywall: could not create $data/web; the web interface cannot keep its state" >&2
+    for p in "$data"/* "$data"/.[!.]* "$data"/..?*; do
+      { [ -e "$p" ] || [ -L "$p" ]; } || continue
+      f=${p##*/}
+      [ "$f" = web ] && continue
+      if [ -L "$p" ]; then
+        echo "easywall: $p was a link; removed, not followed" >&2
+        rm -f "$p"
+        continue
+      fi
+      case "$f" in
+        totp_replay.json|passkeys.json|passkeys.json.corrupt|version_cache.json|telemetry.json)
+          if [ -f "$p" ] && [ "$(stat -c %U "$p")" = easywall ]; then
+            if [ -e "$data/web/$f" ] || [ -L "$data/web/$f" ]; then
+              rm -f "$p"
+            else
+              # Built here, in root's directory, and renamed into web/: install
+              # straight into web/ chmods through a link the web user swaps in
+              # between its chown and its chmod.
+              t=
+              if ! { t=$(mktemp "$data/.easywall-XXXXXX") &&
+                     install -m 0600 -o easywall -g easywall "$p" "$t" &&
+                     mv -fT "$t" "$data/web/$f" && rm -f "$p"; }; then
+                rm -f "${t:-}"
+                echo "easywall: could not move $p into $data/web" >&2
+              fi
+            fi
+            continue
+          fi ;;
+      esac
+      if [ "$(stat -c %u "$p")" = 0 ]; then
+        continue
+      elif [ "$f" = panic ]; then
+        # Only the core engages panic mode, and the core is root. A marker the
+        # web user made would leave the firewall down at every start.
+        echo "easywall: $p was not made by the core; removed, panic mode is not engaged" >&2
+        rm -rf "$p"
+      elif [ ! -f "$p" ]; then
+        echo "easywall: $p was not a regular file, which the core never makes here; removed" >&2
+        rm -rf "$p"
+      else
+        echo "easywall: $p was not owned by root; replaced by a root-owned copy. Review it" >&2
+        if ! { t=$(mktemp "$data/.easywall-XXXXXX") && cat "$p" > "$t" && mv -f "$t" "$p"; }; then
+          echo "easywall: could not give $p to root" >&2
+        fi
+      fi
+    done
+
+    # ── Generate web.toml from template if not already present ───────────
+    #
+    # Owned by easywall: the first-run wizard and the password page rewrite it.
+    # There is no csrf_key to generate — CSRF protection is Go's
+    # net/http.CrossOriginProtection, which checks Origin and Sec-Fetch-Site
+    # rather than issuing tokens, so it needs no secret. A second key used to be
+    # generated here and substituted into a placeholder the template does not
+    # contain.
+    if [ ! -f /etc/easywall/web.toml ]; then
+      SESSION_KEY=$(openssl rand -hex 32)
+      sed -e "s/CHANGE_ME_32_BYTES_HEX_ENCODED_SESSION_SECRET_HERE_XXXXXXXX/$SESSION_KEY/" \
+          /etc/easywall/web.toml.template > /etc/easywall/web.toml
+    fi
+    chown easywall:easywall /etc/easywall/web.toml
+    chmod 0600 /etc/easywall/web.toml
+
+    # ── Generate easywall.toml from template if not already present ──────
+    #
+    # Installed from a template for the same reason web.toml is, and it took
+    # longer to notice: easywall rewrites this file every time a setting is
+    # saved, so shipping it under its own name made it a dpkg conffile that a
+    # script modifies. An upgrade that also changed the shipped default then
+    # asked about it, and an unattended one answered EOF — leaving the package
+    # "unpacked" rather than "installed", with postinst unrun and the services
+    # never restarted. See debian/rules.
+    #
+    # Existing installations keep the file they already have: it is not created
+    # when one is there, and dpkg no longer tracks it either way.
+    if [ ! -f /etc/easywall/easywall.toml ]; then
+      cp /etc/easywall/easywall.toml.template /etc/easywall/easywall.toml
+    fi
+
+    # ── The core's config stays root-only ────────────────────────────────
+    chown root:root /etc/easywall/easywall.toml
+    chmod 0600 /etc/easywall/easywall.toml
+    ;;
+esac
+
+# ── Enable and start services ─────────────────────────────────────────────
+#
+# dh_installsystemd writes this part, at the debhelper marker below;
+# debian/rules says how. Outside the case on purpose: its snippets also answer abort-upgrade,
+# abort-remove and abort-deconfigure, which is how a failed upgrade puts the
+# old version's services back.
+#
+# They used to be hand-written here — `systemctl enable` and `start` under
+# `configure` only — with no debhelper marker, so debhelper's snippets were
+# dropped from this script and from prerm. Measured in an ubuntu:24.04 systemd
+# container: a 2.25.0 whose upgrade failed in the new preinst stayed
+# "install ok installed" with both services disabled and stopped, the firewall
+# gone at the next boot; and every upgrade re-enabled a web interface the
+# administrator had disabled. deb-systemd-helper keeps that choice;
+# `systemctl enable` cannot tell it from a fresh install.
+#
+# easywall-selftest.service is enabled but deliberately never started here
+# (`--no-start`). It is Type=oneshot with Before=easywall-core.service, so
+# systemd runs it ahead of the core on every boot; starting it in postinst
+# would hold the install for the length of the proof — a namespace, a veth pair
+# and four probes — on an upgrade path that is often unattended, and
+# `easywall-core selftest --if-stale` would then skip it at the next boot
+# anyway. The core is started regardless: Before= orders the two and never
+# gates them, which is this release's rule that no layer refuses to filter,
+# expressed in unit ordering.
+# A package operation is a deliberate start, not a crash loop, so it resets the
+# units' start rate limit first (StartLimitBurst=3 in 60 s, easywall-core.service).
+# Without this the limit counted dpkg's own stops and starts: an install, a failed
+# upgrade's abort-upgrade and the retry inside a minute were the fourth start,
+# and systemd refused it — "Start request repeated too quickly", the core left
+# down after an upgrade that succeeded. Measured in an ubuntu:24.04 systemd
+# container with the 2.25.1 CI package; build.yml's failed-upgrade step is the
+# sequence.
+if [ -d /run/systemd/system ]; then
+  systemctl reset-failed easywall-core.service easywall-web.service >/dev/null 2>&1 || true
+fi
+#DEBHELPER#
+
+# The first visitor to /firstrun used to own the firewall. It now asks for a
+# setup token that easywall-web prints when it starts; postinst cannot print
+# the token itself — the web process makes it — so it says where it is. Only
+# while no account exists: an upgrade prints nothing.
+if [ "$1" = configure ] && [ -d /run/systemd/system ] &&
+   grep -Eq '^[[:space:]]*password[[:space:]]*=[[:space:]]*""' /etc/easywall/web.toml; then
+  echo "easywall: open https://<this host>:12227/firstrun — the setup token it asks for: sudo journalctl -u easywall-web -g 'setup token' | tail -1"
+fi
+
+exit 0

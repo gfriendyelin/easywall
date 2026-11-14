@@ -1,0 +1,348 @@
+package shared
+
+import (
+	"net/netip"
+	"strings"
+	"testing"
+)
+
+func TestValidateIPOrCIDR(t *testing.T) {
+	valid := []string{"192.168.1.1", "10.0.0.0/8", "::1", "2001:db8::/32"}
+	for _, s := range valid {
+		if err := ValidateIPOrCIDR(s); err != nil {
+			t.Errorf("expected %q to be valid: %v", s, err)
+		}
+	}
+	invalid := []string{"", "notanip", "256.1.2.3", "10.0.0.0/33"}
+	for _, s := range invalid {
+		if err := ValidateIPOrCIDR(s); err == nil {
+			t.Errorf("expected %q to be invalid", s)
+		}
+	}
+}
+
+func TestValidatePortRule(t *testing.T) {
+	valid := []PortRule{
+		{Port: "1"}, {Port: "65535"}, {Port: "80"}, {Port: "8000:9000"},
+	}
+	for _, r := range valid {
+		if err := validatePortRule(r); err != nil {
+			t.Errorf("expected port %q to be valid: %v", r.Port, err)
+		}
+	}
+	invalid := []PortRule{
+		{Port: ""},
+		{Port: "0"},
+		{Port: "65536"},
+		{Port: "abc"},
+		{Port: "9000:8000"}, // end < start
+		{Port: "0:100"},
+	}
+	for _, r := range invalid {
+		if err := validatePortRule(r); err == nil {
+			t.Errorf("expected port %q to be invalid", r.Port)
+		}
+	}
+}
+
+func TestValidateRules_InvalidForwardingProtocol(t *testing.T) {
+	r := Rules{
+		TCP: []PortRule{}, UDP: []PortRule{},
+		Blocklist: []string{}, Allowlist: []string{}, Custom: []string{},
+		Forwarding: []ForwardingRule{{Protocol: "icmp", SourcePort: 80, DestPort: 8080}},
+	}
+	if err := ValidateRules(r); err == nil {
+		t.Error("expected error for invalid forwarding protocol")
+	}
+}
+
+func TestValidateRules_InvalidForwardingPort(t *testing.T) {
+	r := Rules{
+		TCP: []PortRule{}, UDP: []PortRule{},
+		Blocklist: []string{}, Allowlist: []string{}, Custom: []string{},
+		Forwarding: []ForwardingRule{{Protocol: "tcp", SourcePort: 0, DestPort: 80}},
+	}
+	if err := ValidateRules(r); err == nil {
+		t.Error("expected error for source port 0")
+	}
+}
+
+func TestValidateRules_InvalidDestPort(t *testing.T) {
+	r := Rules{
+		TCP: []PortRule{}, UDP: []PortRule{},
+		Blocklist: []string{}, Allowlist: []string{}, Custom: []string{},
+		Forwarding: []ForwardingRule{{Protocol: "tcp", SourcePort: 8080, DestPort: 0}},
+	}
+	if err := ValidateRules(r); err == nil {
+		t.Error("expected error for dest port 0")
+	}
+}
+
+func TestValidateRules_InvalidTCPPort(t *testing.T) {
+	r := Rules{
+		TCP:        []PortRule{{Port: "99999"}},
+		UDP:        []PortRule{},
+		Blocklist:  []string{},
+		Allowlist:  []string{},
+		Custom:     []string{},
+		Forwarding: []ForwardingRule{},
+	}
+	if err := ValidateRules(r); err == nil {
+		t.Error("expected error for invalid TCP port")
+	}
+}
+
+func TestValidateRules_InvalidUDPPort(t *testing.T) {
+	r := Rules{
+		TCP:        []PortRule{},
+		UDP:        []PortRule{{Port: "0"}},
+		Blocklist:  []string{},
+		Allowlist:  []string{},
+		Custom:     []string{},
+		Forwarding: []ForwardingRule{},
+	}
+	if err := ValidateRules(r); err == nil {
+		t.Error("expected error for invalid UDP port 0")
+	}
+}
+
+func TestValidateRules_InvalidBlocklistIP(t *testing.T) {
+	r := Rules{
+		TCP:        []PortRule{},
+		UDP:        []PortRule{},
+		Blocklist:  []string{"not-an-ip"},
+		Allowlist:  []string{},
+		Custom:     []string{},
+		Forwarding: []ForwardingRule{},
+	}
+	if err := ValidateRules(r); err == nil {
+		t.Error("expected error for invalid blocklist IP")
+	}
+}
+
+func TestValidateRules_InvalidAllowlistCIDR(t *testing.T) {
+	r := Rules{
+		TCP:        []PortRule{},
+		UDP:        []PortRule{},
+		Blocklist:  []string{},
+		Allowlist:  []string{"300.300.300.300"},
+		Custom:     []string{},
+		Forwarding: []ForwardingRule{},
+	}
+	if err := ValidateRules(r); err == nil {
+		t.Error("expected error for invalid allowlist IP")
+	}
+}
+
+func TestValidatePortRule_RejectsTrailingGarbage(t *testing.T) {
+	bad := []string{
+		"80abc", // read as 80
+		"80 90", // someone meaning two ports opens one
+		" 80",   // leading space
+		"80:",   // half a range
+		":90",   // the other half
+		"80:90:100",
+		"",
+		"http",
+		"-1",
+		"0",
+		"65536",
+		"8000:7000", // ends before it starts
+	}
+	for _, port := range bad {
+		t.Run(port, func(t *testing.T) {
+			if err := validatePortRule(PortRule{Port: port}); err == nil {
+				t.Errorf("accepted %q", port)
+			}
+		})
+	}
+}
+
+func TestValidatePortRule_AcceptsWhatItShould(t *testing.T) {
+	for _, port := range []string{"1", "22", "8080", "65535", "8000:9000", "1:65535"} {
+		t.Run(port, func(t *testing.T) {
+			if err := validatePortRule(PortRule{Port: port}); err != nil {
+				t.Errorf("rejected %q: %v", port, err)
+			}
+		})
+	}
+}
+
+// A custom rule is one nft statement. nft reads a newline or a semicolon as the
+// end of a command, so a rule carrying either is a second command — run by the
+// root daemon, and able to reach tables easywall does not own.
+//
+// Reachable through import, where a JSON string can hold anything the textarea
+// would have split apart. Demonstrated against a real kernel before this check
+// existed: an imported rule with a newline in it wrote a drop into a
+// neighbouring table, which is exactly what "easywall owns one table and never
+// looks at another" says cannot happen.
+func TestValidateRules_RejectsCommandSeparatorsInCustomRules(t *testing.T) {
+	payloads := []string{
+		"accept\nadd rule inet bystander c drop",
+		"accept\r\nflush ruleset",
+		"accept; add rule inet bystander c drop",
+		"accept;",
+		"tcp dport 22 accept\n}\ntable inet evil { chain c { type filter hook prerouting priority -300; accept } }",
+	}
+	for _, rule := range payloads {
+		err := ValidateRules(Rules{Custom: []string{rule}})
+		if err == nil {
+			t.Errorf("a rule carrying a command separator must be refused: %q", rule)
+		}
+	}
+}
+
+// And the rules operators actually write must keep working, braces and all.
+func TestValidateRules_AcceptsOrdinaryCustomRules(t *testing.T) {
+	ordinary := []string{
+		"ip saddr 192.0.2.50 tcp dport 9100 accept",
+		"tcp dport { 80, 443 } accept",
+		"udp dport 53 limit rate 50/second accept",
+		"ct state { new, established } accept",
+		`tcp dport 10000 log prefix "legacy-admin: " drop`,
+		"iif eth0 ip protocol udp udp dport 1194 accept",
+		"# a comment line",
+		"",
+	}
+	if err := ValidateRules(Rules{Custom: ordinary}); err != nil {
+		t.Errorf("ordinary custom rules must be accepted: %v", err)
+	}
+}
+
+// The message has to name the rule, or an operator with forty of them has to
+// find it by bisection.
+func TestValidateRules_NamesTheOffendingCustomRule(t *testing.T) {
+	err := ValidateRules(Rules{Custom: []string{
+		"tcp dport 80 accept",
+		"tcp dport 443 accept",
+		"accept\nflush ruleset",
+	}})
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	if !strings.Contains(err.Error(), "custom rule 3") {
+		t.Errorf("the error should name rule 3, got: %v", err)
+	}
+}
+
+func TestValidateRules_PortSources(t *testing.T) {
+	cases := []struct {
+		name    string
+		port    string
+		sources []string
+		wantErr bool
+	}{
+		{name: "no sources is anywhere", port: "443", sources: nil},
+		{name: "empty list is anywhere", port: "443", sources: []string{}},
+		{name: "a bare address", port: "443", sources: []string{"192.168.1.10"}},
+		{name: "a network", port: "443", sources: []string{"10.0.0.0/8"}},
+		{name: "an IPv6 network", port: "443", sources: []string{"fc00::/7"}},
+		{name: "several", port: "443", sources: []string{"10.0.0.0/8", "172.16.0.0/12"}},
+		{name: "a comment and a blank are kept, not rules",
+			port: "443", sources: []string{"# the LAN", "", "192.168.0.0/16"}},
+		{name: "not an address", port: "443", sources: []string{"the-lan"}, wantErr: true},
+		{name: "a hostname is not an address", port: "443", sources: []string{"nas.local"}, wantErr: true},
+		{name: "a port is not an address", port: "443", sources: []string{"192.168.1.10:443"}, wantErr: true},
+		{name: "a range port with a valid network source", port: "8000:9000", sources: []string{"10.0.0.0/8"}},
+		{name: "a range port with an invalid source is rejected", port: "8000:9000", sources: []string{"not-an-address"}, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateRules(Rules{TCP: []PortRule{{Port: tc.port, Sources: tc.sources}}})
+			if tc.wantErr && err == nil {
+				t.Fatalf("ValidateRules accepted sources %v", tc.sources)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("ValidateRules rejected sources %v: %v", tc.sources, err)
+			}
+		})
+	}
+}
+
+// Refused by name rather than coerced to the default. A scope nobody recognises
+// is a typo in a hand-edited rules.json, and silently treating it as "host"
+// would leave a forwarded rule reporting itself enforced while filtering the
+// wrong chain — which is the failure this release exists to end.
+func TestValidateRules_RejectsAnUnknownScope(t *testing.T) {
+	err := ValidateRules(Rules{TCP: []PortRule{{Port: "25", Scope: "forwarded-ish"}}})
+	if err == nil {
+		t.Fatal("an unknown scope was accepted")
+	}
+	if !strings.Contains(err.Error(), "forwarded-ish") {
+		t.Errorf("the error does not name the bad value: %v", err)
+	}
+}
+
+func TestValidateRules_AcceptsEveryKnownScope(t *testing.T) {
+	for _, s := range []PortScope{"", ScopeHost, ScopeForwarded, ScopeBoth} {
+		if err := ValidateRules(Rules{TCP: []PortRule{{Port: "25", Scope: s}}}); err != nil {
+			t.Errorf("scope %q was rejected: %v", s, err)
+		}
+	}
+}
+
+// ParseNetwork is what every rule builder and every containment check reads a
+// network entry with. A mapped network is the IPv4 network it names; every
+// other entry is the network it spells, masked.
+func TestParseNetwork_AMappedNetworkIsTheIPv4NetworkItNames(t *testing.T) {
+	for in, want := range map[string]string{
+		"::ffff:10.0.0.0/104":  "10.0.0.0/8",
+		"::FFFF:10.9.8.7/104":  "10.0.0.0/8",
+		"::ffff:192.0.2.1/128": "192.0.2.1/32",
+		" ::ffff:0:0/96 ":      "0.0.0.0/0",
+		"::ffff:10.0.0.0/95":   "::fffe:0:0/95", // shorter than the mapped prefix: an IPv6 network
+		"10.0.0.0/8":           "10.0.0.0/8",
+		"10.1.2.3/8":           "10.0.0.0/8",
+		"10.0.0.0/08":          "10.0.0.0/8", // ValidateIPOrCIDR accepts it, so this must
+		"2001:db8::/32":        "2001:db8::/32",
+	} {
+		got, err := ParseNetwork(in)
+		if err != nil || got.String() != want {
+			t.Errorf("ParseNetwork(%q) = %v, %v; want %s", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "10.0.0.1", "not a network", "10.0.0.0/33", "# note"} {
+		if p, err := ParseNetwork(in); err == nil {
+			t.Errorf("ParseNetwork(%q) = %v, want an error", in, p)
+		}
+	}
+}
+
+// The lockout check, the drop reasons and the trusted-proxy list all ask
+// InAnyEntry; the Docker-network steps ask inAnyCIDR. Both must agree with the
+// rule the kernel now holds for a mapped network.
+func TestInAnyEntry_AMappedNetworkHoldsItsIPv4Addresses(t *testing.T) {
+	entries := []string{"::ffff:10.0.0.0/104"}
+	in, out := netip.MustParseAddr("10.1.2.3"), netip.MustParseAddr("11.1.2.3")
+	if !InAnyEntry(in, entries) || !inAnyCIDR(in, entries) {
+		t.Errorf("10.1.2.3 is in ::ffff:10.0.0.0/104: InAnyEntry %v, inAnyCIDR %v",
+			InAnyEntry(in, entries), inAnyCIDR(in, entries))
+	}
+	if InAnyEntry(out, entries) || inAnyCIDR(out, entries) {
+		t.Error("11.1.2.3 is not in ::ffff:10.0.0.0/104")
+	}
+}
+
+// Spec §2: Rules.Feeds holds catalogue ids and own-1…own-3, each at most once.
+func TestValidateRules_Feeds(t *testing.T) {
+	for _, tc := range []struct {
+		feeds []string
+		want  string // "" = valid; else a fragment of the error
+	}{
+		{nil, ""},
+		{[]string{"spamhaus-drop", "own-1", "own-3", "tor-exits"}, ""},
+		{[]string{"firehol-level1"}, `feed "firehol-level1" is neither`},
+		{[]string{"own-4"}, `feed "own-4" is neither`},
+		{[]string{""}, `feed "" is neither`},
+		{[]string{"dshield", "cins", "dshield"}, `feed "dshield" is switched on twice`},
+	} {
+		err := ValidateRules(Rules{Feeds: tc.feeds})
+		switch {
+		case tc.want == "" && err != nil:
+			t.Errorf("%v: refused: %v", tc.feeds, err)
+		case tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)):
+			t.Errorf("%v: got %v, want an error containing %q", tc.feeds, err, tc.want)
+		}
+	}
+}

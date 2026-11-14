@@ -1,0 +1,371 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://easywall-project.org/schemas/easywall.schema.json",
+  "title": "easywall core configuration",
+  "description": "Configuration for the easywall-core daemon. See https://easywall-project.org/configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["socket_path", "data_dir", "log_dir"],
+  "properties": {
+    "socket_path": {
+      "type": "string",
+      "description": "Path to the Unix socket shared between easywall-core and easywall-web.",
+      "default": "/run/easywall/core.sock",
+      "examples": ["/run/easywall/core.sock"]
+    },
+    "data_dir": {
+      "type": "string",
+      "description": "Directory for persistent data (rules.json, version cache). Must be writable by root.",
+      "default": "/var/lib/easywall",
+      "examples": ["/var/lib/easywall"]
+    },
+    "log_dir": {
+      "type": "string",
+      "description": "Directory for log files (audit.log). Must be writable by root.",
+      "default": "/var/log/easywall",
+      "examples": ["/var/log/easywall"]
+    },
+    "acceptance": {
+      "type": "object",
+      "description": "Two-step activation settings. After applying rules, easywall waits for confirmation before committing. If not confirmed, rules are rolled back.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Enable the two-step activation mechanism. Strongly recommended — prevents accidental lockouts.",
+          "default": true
+        },
+        "duration": {
+          "type": "integer",
+          "description": "Seconds to wait for confirmation before auto-rollback.",
+          "minimum": 10,
+          "maximum": 3600,
+          "default": 120,
+          "examples": [60, 120, 300]
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "description": "How often the per-rule packet counters are read out of the kernel. This is what the \"Last used\" column is built from.",
+      "additionalProperties": false,
+      "properties": {
+        "interval": {
+          "type": "integer",
+          "description": "Seconds between counter reads. 0 stops the ticker; an apply still collects, because writing the rules resets every counter.",
+          "minimum": 0,
+          "default": 300,
+          "examples": [60, 300, 900]
+        }
+      }
+    },
+    "packet_log": {
+      "type": "object",
+      "description": "Where the packets the *_log switches log are kept. Read at start only.",
+      "additionalProperties": false,
+      "properties": {
+        "nflog_group": {
+          "type": "integer",
+          "description": "The NFLOG group easywall-core binds. One program per group per network namespace (per host, for a host-network install); a collision is reported at start and logging falls back to the kernel log.",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 12227
+        },
+        "entries": {
+          "type": "integer",
+          "description": "How many refused packets are kept in memory, newest first.",
+          "minimum": 1000,
+          "maximum": 200000,
+          "default": 20000
+        },
+        "persist": {
+          "type": "boolean",
+          "description": "Also write every entry to log_dir/packets.log so the log survives a restart. The file holds IP addresses, is root-only, and rotates itself at twice `entries`.",
+          "default": false
+        }
+      }
+    },
+    "ipv6": {
+      "type": "object",
+      "description": "What the firewall does with IPv6 traffic.",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "description": "filter — apply every rule to IPv6 as well as IPv4, and permit the ICMPv6 types IPv6 needs (the default). passthrough — accept all IPv6 before any rule; IPv6 is handled elsewhere. block — drop all IPv6 except loopback.",
+          "enum": ["filter", "passthrough", "block"],
+          "default": "filter"
+        },
+        "enabled": {
+          "type": "boolean",
+          "deprecated": true,
+          "description": "Obsolete since 2.5.0 and read only for migration: it never disabled IPv6 filtering. The table is inet, so every rule and the drop policy applied to IPv6 either way, and enabled = false removed only the ICMPv6 exemptions — leaving IPv6 filtered and broken. Both old values migrate to mode = \"filter\". Use mode instead.",
+          "default": true
+        },
+        "icmp_allow_router_advertisement": {
+          "type": "boolean",
+          "description": "Allow ICMPv6 Router Solicitation and Advertisement (types 133 and 134). Required for SLAAC address assignment.",
+          "default": true
+        },
+        "icmp_allow_neighbor_advertisement": {
+          "type": "boolean",
+          "description": "Allow ICMPv6 Neighbor Solicitation and Advertisement (types 135 and 136). Required for IPv6 address resolution.",
+          "default": true
+        }
+      }
+    },
+    "docker": {
+      "type": "object",
+      "description": "Docker coexistence settings. easywall uses its own nftables table (inet easywall) and does not touch Docker's chains.",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Auto-detect Docker bridge interfaces and allowlist their networks.",
+          "default": true
+        },
+        "allow_bridge_networks": {
+          "type": "boolean",
+          "description": "Automatically add ACCEPT rules for detected Docker bridge networks.",
+          "default": true
+        },
+        "custom_networks": {
+          "type": "array",
+          "description": "Additional networks to allowlist (CIDR notation). Useful for custom Docker networks not auto-detected. A blank line or a line starting with # is a comment, as in the other list editors, and is skipped.",
+          "items": {
+            "type": "string",
+            "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$|^[0-9a-fA-F:]+/\\d{1,3}$|^\\s*(#.*)?$",
+            "examples": ["172.20.0.0/16", "192.168.100.0/24"]
+          },
+          "default": []
+        },
+        "published_ports": {
+          "type": "string",
+          "description": "What happens to traffic this host forwards to a container. \"open\": Docker decides who reaches a published port \u2014 what easywall has always done. \"filtered\": the forward chain denies inbound traffic to a container address unless a port rule with scope \"forwarded\" opens it. \"filtered\" requires enabled = true, and the interface has no control for this key.",
+          "enum": ["open", "filtered"],
+          "default": "open"
+        }
+      }
+    },
+    "routing": {
+      "type": "object",
+      "description": "What crosses the forward chain — traffic this host passes on rather than receives. The chain drops by default and a drop there is final, so a host that routes has to say so here.",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["closed", "networks", "open"],
+          "description": "closed: pass nothing on beyond what Docker coexistence allows. networks: also pass on the networks listed below, in either direction. open: leave routed traffic alone entirely.",
+          "default": "closed"
+        },
+        "networks": {
+          "type": "array",
+          "description": "Networks that may be routed (CIDR notation). Read only when mode is \"networks\". Docker networks cross regardless of the mode and do not belong here. A blank line or a line starting with # is a comment and is skipped.",
+          "items": {
+            "type": "string",
+            "pattern": "^(\\d{1,3}\\.){3}\\d{1,3}/\\d{1,2}$|^[0-9a-fA-F:]+/\\d{1,3}$|^\\s*(#.*)?$",
+            "examples": ["10.8.0.0/24", "192.168.50.0/24"]
+          },
+          "default": []
+        }
+      }
+    },
+    "firewall": {
+      "type": "object",
+      "description": "Protection modules. All filters are applied via nftables directly — no subprocess, no injection risk.",
+      "additionalProperties": false,
+      "properties": {
+        "ssh_brute_force": {
+          "type": "boolean",
+          "description": "Enable SSH brute-force prevention. Rate-limits new SSH connections, counted separately for each source address, to ssh_brute_force_connection_limit per minute.",
+          "default": true
+        },
+        "ssh_brute_force_log": {
+          "type": "boolean",
+          "description": "Log dropped SSH brute-force packets.",
+          "default": false
+        },
+        "ssh_brute_force_connection_limit": {
+          "type": "integer",
+          "description": "New SSH connections per minute allowed from one source address before the rest are dropped.",
+          "minimum": 1,
+          "maximum": 100,
+          "default": 5
+        },
+        "ssh_brute_force_log_limit": {
+          "type": "integer",
+          "description": "Maximum log entries per minute for SSH brute-force drops.",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 60
+        },
+        "icmp_allow_echo_request": {
+          "type": "boolean",
+          "description": "Answer pings: accept ICMP type 8 and ICMPv6 type 128 (the latter under ipv6.mode = \"filter\" only), behind the ICMP flood limit. A file without the key reads as true.",
+          "default": true
+        },
+        "icmp_flood": {
+          "type": "boolean",
+          "description": "Enable ICMP flood prevention. Rate-limits echo requests — ICMP type 8 and ICMPv6 type 128 — counted separately for each source address.",
+          "default": true
+        },
+        "icmp_flood_log": {
+          "type": "boolean",
+          "description": "Log dropped ICMP flood packets.",
+          "default": false
+        },
+        "icmp_flood_connection_limit": {
+          "type": "integer",
+          "description": "Echo requests per second allowed from one source address.",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 10
+        },
+        "icmp_flood_log_limit": {
+          "type": "integer",
+          "description": "Maximum log entries per minute for ICMP flood drops.",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 60
+        },
+        "syn_flood": {
+          "type": "boolean",
+          "description": "Enable SYN flood prevention. Rate-limits new TCP connections, counted separately for each source address.",
+          "default": true
+        },
+        "syn_flood_log": {
+          "type": "boolean",
+          "description": "Log dropped SYN flood packets.",
+          "default": false
+        },
+        "syn_flood_limit": {
+          "type": "integer",
+          "description": "New TCP connections per second allowed from one source address.",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 100
+        },
+        "port_scan": {
+          "type": "boolean",
+          "description": "Enable port scan detection. Drops NULL, FIN, XMAS, and other scan probe packets.",
+          "default": true
+        },
+        "port_scan_log": {
+          "type": "boolean",
+          "description": "Log detected port scan packets.",
+          "default": false
+        },
+        "drop_invalid_packets": {
+          "type": "boolean",
+          "description": "Drop packets in an invalid connection tracking state (ct state invalid).",
+          "default": true
+        },
+        "drop_invalid_packets_log": {
+          "type": "boolean",
+          "description": "Log dropped invalid packets.",
+          "default": false
+        },
+        "drop_fragments": {
+          "type": "boolean",
+          "description": "Drop fragmented IPv4 packets addressed to this host, before the kernel reassembles them. Breaks any reply too large for one packet — a DNS answer over UDP with DNSSEC, for one.",
+          "default": false
+        },
+        "drop_fragments_log": {
+          "type": "boolean",
+          "description": "Log dropped fragmented packets.",
+          "default": false
+        },
+        "bogon_filter": {
+          "type": "boolean",
+          "description": "Drop packets from RFC-1918 private addresses arriving on external interfaces (bogon filter).",
+          "default": false
+        },
+        "bogon_filter_log": {
+          "type": "boolean",
+          "description": "Log dropped bogon packets.",
+          "default": false
+        },
+        "connection_limit_per_ip": {
+          "type": "boolean",
+          "description": "Limit maximum simultaneous connections per source IP.",
+          "default": false
+        },
+        "connection_limit_max": {
+          "type": "integer",
+          "description": "Maximum simultaneous connections allowed per source IP.",
+          "minimum": 1,
+          "maximum": 100000,
+          "default": 100
+        },
+        "tcp_rst_flood": {
+          "type": "boolean",
+          "description": "Enable TCP RST flood prevention. Rate-limits RST packets per source IP.",
+          "default": false
+        },
+        "tcp_rst_flood_log": {
+          "type": "boolean",
+          "description": "Log dropped TCP RST flood packets.",
+          "default": false
+        },
+        "tcp_rst_flood_limit": {
+          "type": "integer",
+          "description": "Inbound TCP RST packets per second allowed from one source address.",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 100
+        },
+        "drop_broadcast": {
+          "type": "boolean",
+          "description": "Drop broadcast packets (pkttype broadcast).",
+          "default": false
+        },
+        "drop_multicast": {
+          "type": "boolean",
+          "description": "Drop multicast packets (pkttype multicast).",
+          "default": false
+        },
+        "drop_anycast": {
+          "type": "boolean",
+          "description": "Drop anycast packets (pkttype anycast).",
+          "default": false
+        },
+        "log_blocked_connections": {
+          "type": "boolean",
+          "description": "Log all packets dropped by the final DROP policy.",
+          "default": false
+        },
+        "log_blocked_connections_limit": {
+          "type": "integer",
+          "description": "Maximum log entries per minute for general blocked connections.",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 60
+        },
+        "log_blocklist_connections": {
+          "type": "boolean",
+          "description": "Log packets dropped by the IP blocklist.",
+          "default": false
+        },
+        "log_blocklist_connections_limit": {
+          "type": "integer",
+          "description": "Maximum log entries per minute for blocklisted connections.",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 60
+        },
+        "log_feed_connections": {
+          "type": "boolean",
+          "description": "Log packets dropped by a feed, with the feed's id in the prefix.",
+          "default": false
+        },
+        "log_feed_connections_limit": {
+          "type": "integer",
+          "description": "Maximum log entries per minute for each feed and address family.",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 60
+        }
+      }
+    }
+  }
+}

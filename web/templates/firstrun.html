@@ -1,0 +1,251 @@
+{{define "firstrun.html"}}
+<!DOCTYPE html>
+<html lang="{{.Lang}}">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>easywall — {{T "firstrun_title"}}</title>
+  {{template "themeScript" .}}
+  <link rel="preload" href="/static/fonts/inter-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="/static/fonts/jetbrains-mono-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/style.css?v={{.Asset}}">
+  <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+  <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/apple-touch-icon.png">
+</head>
+<body>
+<div class="auth-page">
+  <div class="auth-card auth-card-wide">
+    <div class="auth-header">
+      <div class="auth-logo">
+        <span class="auth-logo-mark" aria-hidden="true"></span>
+        <span class="auth-logo-name">easywall</span>
+      </div>
+      <p class="auth-subtitle">{{T "firstrun_subtitle"}}</p>
+    </div>
+
+    <div class="auth-body">
+      {{if .Flash}}
+      <div role="alert" class="alert {{flashClass .Flash}} mb-4">
+        {{flashIcon .Flash}}
+        <span>{{T .Flash (dict "N" .FlashN)}}</span>
+      </div>
+      {{end}}
+
+      {{/* The old notice restated the subtitle word for word. What an operator
+           cannot look up once locked out is that this is the only account and
+           that resetting it needs shell access — so that is what it says now. */}}
+      <div role="alert" class="alert mb-4">
+        <svg class="size-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a.75.75 0 000 1.5h.253a.25.25 0 01.244.304l-.459 2.066A1.75 1.75 0 0010.747 15H11a.75.75 0 000-1.5h-.253a.25.25 0 01-.244-.304l.459-2.066A1.75 1.75 0 009.253 9H9z" clip-rule="evenodd"/></svg>
+        <span>{{T "firstrun_notice"}}</span>
+      </div>
+
+      {{if not .Data.Setup}}{{if not .Data.Codes}}
+      <form method="POST" action="/firstrun">
+        <div class="firstrun-grid">
+          <section class="firstrun-col">
+            <h2 class="firstrun-section">{{T "firstrun_account_title"}}</h2>
+            <p class="field-help">{{T "firstrun_account_desc"}}</p>
+
+            {{/* First, and never pre-filled: a rejected submission comes back
+                 with every other answer, and this one is the proof the claimant
+                 can read the host's log. It is not in firstRunData on purpose. */}}
+            <div class="field mt-2">
+              <label class="field-label" for="setup_token">{{T "firstrun_token_label"}}</label>
+              <input id="setup_token" name="setup_token" type="text" autocomplete="off" spellcheck="false"
+                     autocapitalize="characters" autofocus required class="input input-data w-full">
+              <p class="field-help">{{richText (T "firstrun_token_help")}}</p>
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="username">{{T "firstrun_username"}}</label>
+              <input id="username" name="username" type="text" autocomplete="username" required
+                     value="{{with .Data.Form}}{{.Username}}{{end}}"
+                     class="input w-full">
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="password">{{T "firstrun_password"}}</label>
+              <input id="password" name="password" type="password" autocomplete="new-password" required minlength="12"
+                     class="input w-full">
+              <p class="field-help">{{T "firstrun_password_hint"}}</p>
+            </div>
+
+            <div class="field">
+              <label class="field-label" for="password_confirm">{{T "firstrun_confirm"}}</label>
+              <input id="password_confirm" name="password_confirm" type="password" autocomplete="new-password" required minlength="12"
+                     class="input w-full">
+            </div>
+          </section>
+
+          {{with .Data.Form}}
+          <section class="firstrun-col">
+            <h2 class="firstrun-section">{{T "firstrun_choices_title"}}</h2>
+            <p class="field-help">{{T "firstrun_choices_desc"}}</p>
+
+            <div class="card mt-2">
+              <div class="firstrun-port">
+                <label class="field-label" for="ssh_port">{{T "firstrun_ssh_port"}}</label>
+                <input id="ssh_port" name="ssh_port" type="number" min="1" max="65535" required value="{{.SSHPort}}"
+                       class="input input-data w-28 mt-1.5">
+                <p class="field-help">{{T "firstrun_ssh_port_help"}}</p>
+              </div>
+
+              {{if .WebPort}}
+              <div class="firstrun-fixed">
+                <span class="switch-name">{{T "firstrun_web_port" (dict "Port" .WebPort)}}</span>
+                <span class="switch-desc">{{T "firstrun_web_port_desc"}}</span>
+              </div>
+              {{end}}
+
+              <label class="switch-row">
+                <span class="switch-text">
+                  <span class="switch-name">{{T "firstrun_open_web"}}</span>
+                  <span class="switch-desc">{{T "firstrun_open_web_desc"}}</span>
+                </span>
+                <input type="checkbox" name="open_web" class="toggle" {{if .OpenWeb}}checked{{end}}>
+              </label>
+
+              <fieldset class="choice-group">
+                <legend class="sr-only">{{T "firstrun_ipv6"}}</legend>
+                <p class="switch-row-label">{{T "firstrun_ipv6"}}</p>
+                <label class="choice-row">
+                  <input type="radio" name="ipv6_mode" value="filter" class="radio" {{if eq .IPv6Mode "filter"}}checked{{end}}>
+                  <span class="switch-text">
+                    <span class="switch-name">{{T "settings_ipv6_mode_filter"}}</span>
+                    <span class="switch-desc">{{T "settings_ipv6_mode_filter_desc"}}</span>
+                  </span>
+                </label>
+                <label class="choice-row">
+                  <input type="radio" name="ipv6_mode" value="passthrough" class="radio" {{if eq .IPv6Mode "passthrough"}}checked{{end}}>
+                  <span class="switch-text">
+                    <span class="switch-name">{{T "settings_ipv6_mode_passthrough"}}</span>
+                    <span class="switch-desc">{{T "settings_ipv6_mode_passthrough_desc"}}</span>
+                  </span>
+                </label>
+                <label class="choice-row">
+                  <input type="radio" name="ipv6_mode" value="block" class="radio" {{if eq .IPv6Mode "block"}}checked{{end}}>
+                  <span class="switch-text">
+                    <span class="switch-name">{{T "settings_ipv6_mode_block"}}</span>
+                    <span class="switch-desc">{{T "settings_ipv6_mode_block_desc"}}</span>
+                  </span>
+                </label>
+              </fieldset>
+
+              <label class="switch-row">
+                <span class="switch-text">
+                  <span class="switch-name">{{T "firstrun_telemetry"}}</span>
+                  <span class="switch-desc">{{T "firstrun_telemetry_desc"}}</span>
+                </span>
+                <input type="checkbox" name="telemetry" class="toggle" {{if .Telemetry}}checked{{end}}>
+              </label>
+            </div>
+          </section>
+          {{end}}
+        </div>
+
+        <button type="submit" class="btn btn-primary w-full mt-4">
+          <svg class="size-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd"/></svg>
+          {{T "firstrun_submit"}}
+        </button>
+      </form>
+      {{end}}{{end}}
+
+      {{if .Data.Setup}}
+      <div class="card mt-4">
+        <div class="section-head">
+          <div class="section-head-text">
+            <h2 class="section-title">{{T "totp_setup_title"}}</h2>
+          </div>
+        </div>
+        <div class="card-pad">
+          <p class="field-help mb-3">{{T "firstrun_totp_help"}}</p>
+          <div class="totp-setup">
+            {{/* White plate in both themes: an inverted QR code is rejected by a good
+                 share of scanners, and that is a defect only a dark-theme screenshot
+                 shows. */}}
+            <div class="qr-plate">
+              <img src="{{.Data.Setup.QR}}" width="256" height="256" alt="{{T "totp_qr_alt"}}">
+            </div>
+            <div>
+              <p>{{T "totp_scan"}}</p>
+              <p class="mt-2">{{T "totp_or_type"}}</p>
+              <p class="totp-secret">{{.Data.Setup.SecretText}}</p>
+              <p class="field-help">{{T "totp_server_time"}} {{.Data.Setup.ServerTime}}</p>
+
+              <form method="POST" action="/firstrun/confirm" class="flex gap-2 items-end mt-3">
+                <div class="field">
+                  <label class="field-label" for="code">{{T "totp_code_label"}}</label>
+                  <input type="text" id="code" name="code" inputmode="numeric"
+                         autocomplete="one-time-code" spellcheck="false" required class="input">
+                </div>
+                <button type="submit" class="btn btn-primary">{{T "totp_confirm"}}</button>
+              </form>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {{/* Only after a code has actually missed once (.Failed) — offered from
+           the first render, this would be the path of least resistance
+           instead of the escape hatch it is. The checkbox is the deliberate
+           act handleFirstRunRecover requires; a submission missing it is
+           refused, same as one arriving before .Failed is true. */}}
+      {{if .Data.Setup.Failed}}
+      <div class="card mt-4">
+        <div class="section-head">
+          <div class="section-head-text">
+            <h2 class="section-title">{{T "firstrun_totp_recover_title"}}</h2>
+          </div>
+        </div>
+        <div class="card-pad">
+          <p>{{T "firstrun_totp_recover_help"}}</p>
+          <form method="POST" action="/firstrun/recover" class="mt-3">
+            <label class="switch-row">
+              <span class="switch-text">
+                <span class="switch-name">{{T "firstrun_totp_recover_ack"}}</span>
+              </span>
+              <input type="checkbox" name="ack" value="1" required class="toggle">
+            </label>
+            <button type="submit" class="btn mt-3">{{T "firstrun_totp_recover_submit"}}</button>
+          </form>
+        </div>
+      </div>
+      {{end}}
+      {{end}}
+
+      {{if .Data.Codes}}
+      <div class="card mt-4">
+        <div class="section-head">
+          <div class="section-head-text">
+            <h2 class="section-title">{{T "totp_codes_title"}}</h2>
+          </div>
+        </div>
+        <div class="card-pad">
+          <ul class="recovery-codes">
+            {{range .Data.Codes}}
+            <li class="recovery-code">
+              {{.}}
+            </li>
+            {{end}}
+          </ul>
+          <div class="flex gap-2 mt-3 items-center">
+            <button type="button" class="btn" data-copy-codes>{{T "totp_copy"}}</button>
+            <p class="field-help"><strong>{{T "totp_codes_once"}}</strong></p>
+          </div>
+          <p class="mt-3"><a class="btn btn-primary" href="/login">{{T "firstrun_totp_done"}}</a></p>
+        </div>
+      </div>
+      {{end}}
+    </div>
+
+    <div class="auth-footer">
+      easywall {{.Version}} · {{T "tagline"}}
+      {{template "langswitch" .}}
+    </div>
+  </div>
+</div>
+<script src="/static/app.js?v={{.Asset}}"></script>
+</body>
+</html>
+{{end}}

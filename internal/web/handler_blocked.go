@@ -1,0 +1,687 @@
+package web
+
+import (
+	"log/slog"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// /blocked: what the firewall refused. The web process asks the core, the way
+// it asks for the audit log, and opens nothing itself.
+
+type blockedRows struct {
+	Entries []shared.PacketLogEntry
+	// Query is the active filter, encoded. The live tail asks for the same
+	// view, and every row action comes back to it. A plain string is right:
+	// measured, html/template leaves an already-encoded query after "?" intact
+	// and only turns & into &amp; for the attribute.
+	Query string
+	// Limit is how many rows the page keeps; the live tail drops the oldest
+	// beyond it after every insert.
+	Limit int
+
+	// The rest is what blocked_rows' own {{else}} needs to choose its empty
+	// message. handleBlocked fills these from the same two calls it already
+	// makes; handleBlockedRows — a separate request, on its own poll, handed
+	// nothing from the page that opened it — makes them again so the live
+	// tail's empty message matches the page's.
+	//
+	// CoreErr and LoggingKnown make that message tri-state: unreadable is not
+	// the same as false. GetPacketLog failing must not read as "nothing
+	// refused", and GetOptions failing must not read as "logging is off" —
+	// both are a fact the core did not answer, not a fact about the firewall.
+	CoreErr      string    // GetPacketLog failed; nothing below except Filtered is known
+	Logging      bool      // any of the ten switches is on; meaningful only when LoggingKnown
+	LoggingKnown bool      // GetOptions answered
+	Listening    bool      // the core holds its NFLOG group
+	Filtered     bool      // a filter narrowed this view
+	Since        time.Time // when the ring began
+
+	// What a default-drop row's reason is read against: the rules the kernel
+	// holds (Current), parsed once here rather than once per row (DropReason's
+	// InAnyEntry calls used to reparse the blocklist, the allowlist and every
+	// port rule's Sources for each on-screen row, every poll — see Task 8's
+	// "Cost per poll"), and the configuration they were applied with.
+	// WhyKnown is false when either could not be read, and then no row carries
+	// a reason — none is better than one computed from a guess.
+	Rules    shared.ParsedRules
+	Applied  shared.AppliedConfig
+	WhyKnown bool
+
+	// FeedNames is what each feed a "feed" row names is called, by id — filled
+	// by feedNames, only when such a row is on screen.
+	FeedNames map[string]string
+
+	// Lookup is true while the country lookup is on (2.27): the Country
+	// column is drawn. Countries holds a cell for each on-screen source the
+	// table names; a source with none reads "—".
+	Lookup    bool
+	Countries map[netip.Addr]countryCell
+}
+
+// countryCell is one source's Country cell and its Block button (spec D5, D6).
+type countryCell struct {
+	Code  string // "RU", what the cell shows
+	CC    string // "ru", what the button posts
+	Name  string // the cell's title, in the page's language
+	Block bool   // offered: the staged rules were read and do not hold it
+	Only  string // this view narrowed to the country (2.29 D11)
+}
+
+// rulesFunc is one request's GET_RULES: sync.OnceValues(s.client.GetRules),
+// so rulesNow, countryCells and buildPreview share a single answer, asked only
+// when one of them needs it.
+type rulesFunc func() (*shared.RulesState, error)
+
+// countryCells fills rows.Countries for the sources on screen. Nothing while
+// the lookup is off. The rules are read only when a row has a country: Block
+// is offered only for a country not staged already.
+func (s *Server) countryCells(r *http.Request, rows *blockedRows, rules rulesFunc) {
+	if s.lookup == nil {
+		return
+	}
+	lang := ResolveLang(s.bundle, r, s.cfg.Language)
+	var staged []string
+	known := false
+	only, _ := url.ParseQuery(rows.Query)
+	for _, e := range rows.Entries {
+		cc := s.lookup.country(e.Src)
+		if cc == "" {
+			continue
+		}
+		if rows.Countries == nil {
+			rows.Countries = map[netip.Addr]countryCell{}
+			if state, err := rules(); err == nil {
+				staged, known = state.Staged.Feeds, true
+			}
+		}
+		only.Set("country", cc)
+		rows.Countries[e.Src] = countryCell{Code: strings.ToUpper(cc), CC: cc, Name: countryName(lang, cc),
+			Block: known && !slices.Contains(staged, shared.CountryFeedID(cc)), Only: "/blocked?" + only.Encode()}
+	}
+}
+
+// feedNames fills rows.FeedNames for the "feed" rows on screen: the catalogue
+// name, a country's, or an own feed's configured one, in the request's
+// language.
+func (s *Server) feedNames(r *http.Request, rows *blockedRows) {
+	loc := NewLocalizer(s.bundle, r, s.cfg.Language)
+	tFunc := func(id string, args ...interface{}) string { return T(loc, id, args...) }
+	lang := ResolveLang(s.bundle, r, s.cfg.Language)
+	for _, e := range rows.Entries {
+		if e.Rule != "feed" || e.Feed == "" {
+			continue
+		}
+		if rows.FeedNames == nil {
+			rows.FeedNames = map[string]string{}
+		}
+		rows.FeedNames[e.Feed] = s.feedLabel(tFunc, lang, e.Feed)
+	}
+}
+
+// rulesNow fills rows' reason inputs, and asks only when a default-drop row is
+// on screen. The cost is at most two more socket round trips per five-second
+// poll — GET_RULES and GET_APPLIED_CONFIG, each one small file the core reads
+// from disk — on top of the two the tail already makes. GET_RULES is the
+// request's one answer (rules), shared with countryCells, so a country row
+// beside a drop row adds no third. The applied settings rather
+// than GET_SETTINGS: a saved setting reaches the kernel at the next apply,
+// and "now" means what the kernel holds. shared.ParseRules runs once here, not
+// once per row: DropReasonParsed reads the parsed form.
+func (s *Server) rulesNow(rows *blockedRows, rules rulesFunc) {
+	if !slices.ContainsFunc(rows.Entries, func(e shared.PacketLogEntry) bool { return e.Rule == "drop" }) {
+		return
+	}
+	state, err := rules()
+	if err != nil {
+		slog.Debug("no drop reasons: the rules could not be read", "error", err)
+		return
+	}
+	applied, err := s.client.GetAppliedConfig()
+	if err != nil || !applied.Recorded {
+		slog.Debug("no drop reasons: the applied settings are not known", "error", err)
+		return
+	}
+	rows.Rules, rows.Applied, rows.WhyKnown = shared.ParseRules(state.Current), applied.Config, true
+}
+
+// blockedForm is what the filter form shows back: the raw fields as typed,
+// independent of whether they parsed. A filter that could not be read must
+// still appear in its field, or the operator cannot see what they typed to
+// fix it.
+type blockedForm struct{ Src, Dst, Port, Proto, Rule, InDev, Country string }
+
+type blockedData struct {
+	Form     blockedForm
+	Bad      string // the name of the first field that could not be read, empty when the filter is good
+	Unread   bool   // a filter was given and could not be read, so none is applied
+	Result   *shared.PacketLogResult
+	Rows     blockedRows
+	CoreErr  string
+	Staged   int // changes waiting for Apply, counted exactly as /apply counts them
+	RuleList []string
+	Protos   []string
+	Lookup   *countryLookupStatus // the country table's line; nil while the lookup is off
+	// Countries is the Country field's choice, by name; none while no table
+	// is loaded, and then the field is not drawn (2.29 D10).
+	Countries []countryOption
+	CoreOld   bool // the country view stopped at the newest thousand: the core cannot page (D9)
+}
+
+// blockedFilter reads the URL. The second value names the first field that
+// could not be read ("src", "dst", "port", "proto", "rule", "in", "country"), empty when
+// the filter is good; the filter returned is then empty: a view the operator
+// did not ask for is better than a partly applied one they cannot tell from
+// the one they asked for.
+func blockedFilter(q url.Values) (shared.PacketLogFilter, string) {
+	f := shared.PacketLogFilter{
+		Src:   strings.TrimSpace(q.Get("src")),
+		Dst:   strings.TrimSpace(q.Get("dst")),
+		Proto: q.Get("proto"),
+		// A filter saved before 2.23 says rule=blacklist; read it as the rule's
+		// name now, and the redirect in handleBlocked moves the URL on.
+		Rule:    shared.CurrentListName(q.Get("rule")),
+		InDev:   strings.TrimSpace(q.Get("in")),
+		Country: strings.ToLower(strings.TrimSpace(q.Get("country"))),
+	}
+	if p := strings.TrimSpace(q.Get("port")); p != "" {
+		n, err := strconv.ParseUint(p, 10, 16)
+		if err != nil || n == 0 {
+			return shared.PacketLogFilter{}, "port"
+		}
+		f.Port = uint16(n)
+	}
+	// One field at a time, so the page can say which one it could not read.
+	for _, c := range []struct {
+		name string
+		one  shared.PacketLogFilter
+	}{
+		{"src", shared.PacketLogFilter{Src: f.Src}},
+		{"dst", shared.PacketLogFilter{Dst: f.Dst}},
+		{"proto", shared.PacketLogFilter{Proto: f.Proto}},
+		{"rule", shared.PacketLogFilter{Rule: f.Rule}},
+		{"in", shared.PacketLogFilter{InDev: f.InDev}},
+		{"country", shared.PacketLogFilter{Country: f.Country}},
+	} {
+		if c.one.Validate() != nil {
+			return shared.PacketLogFilter{}, c.name
+		}
+	}
+	return f, ""
+}
+
+// filterQuery encodes f for a URL. Built from the parsed filter, never from the
+// raw query, so nothing the request carried reaches a link unvalidated.
+func filterQuery(f shared.PacketLogFilter) string {
+	v := url.Values{}
+	for k, val := range map[string]string{"src": f.Src, "dst": f.Dst, "proto": f.Proto, "rule": f.Rule, "in": f.InDev, "country": f.Country} {
+		if val != "" {
+			v.Set(k, val)
+		}
+	}
+	if f.Port != 0 {
+		v.Set("port", strconv.Itoa(int(f.Port)))
+	}
+	return v.Encode()
+}
+
+// countryFilterOn is whether the Country filter exists: only while a table is
+// loaded (2.29 D10). Otherwise a country in the URL is dropped before it is
+// read, so a field the page does not draw is never the one marked bad.
+func (s *Server) countryFilterOn() bool { return s.lookup != nil && s.lookup.status().Loaded }
+
+func (s *Server) handleBlocked(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	asked := q.Encode()
+	if !s.countryFilterOn() {
+		q.Del("country")
+	}
+	f, bad := blockedFilter(q)
+	// A readable filter lives at one URL. The GET form sends every field, the
+	// empty ones too; redirect once to the query filterQuery would have built.
+	// Compared re-encoded, not raw: html/template writes an IPv6 link as
+	// %3a and url.Values.Encode as %3A, and those are the same query. Against
+	// the query as asked, so a dropped country redirects too.
+	if bad == "" && r.URL.RawQuery != "" && asked != filterQuery(f) {
+		to := "/blocked"
+		if enc := filterQuery(f); enc != "" {
+			to += "?" + enc
+		}
+		http.Redirect(w, r, to, http.StatusSeeOther)
+		return
+	}
+
+	data := &blockedData{
+		Bad: bad, Unread: bad != "",
+		Rows:     blockedRows{Query: filterQuery(f), Filtered: !f.IsZero(), Limit: f.EffectiveLimit()},
+		RuleList: append(append([]string{}, shared.PacketLogRules...), shared.PacketLogRuleOther),
+		Protos:   shared.PacketLogProtos,
+	}
+	if bad == "" {
+		data.Form = blockedForm{Src: f.Src, Dst: f.Dst, Proto: f.Proto, Rule: f.Rule, InDev: f.InDev, Country: f.Country}
+		if f.Port != 0 {
+			data.Form.Port = strconv.Itoa(int(f.Port))
+		}
+	} else {
+		data.Form = blockedForm{
+			Src: strings.TrimSpace(q.Get("src")), Dst: strings.TrimSpace(q.Get("dst")),
+			Port: strings.TrimSpace(q.Get("port")), Proto: q.Get("proto"), Rule: q.Get("rule"),
+			InDev: strings.TrimSpace(q.Get("in")), Country: strings.ToLower(strings.TrimSpace(q.Get("country"))),
+		}
+	}
+
+	rules := rulesFunc(sync.OnceValues(s.client.GetRules))
+	data.Rows.Lookup = s.lookup != nil
+	var res *shared.PacketLogResult
+	var err error
+	if f.Country != "" {
+		res, data.CoreOld, err = s.countryEntries(f)
+	} else {
+		res, err = s.client.GetPacketLog(f)
+	}
+	if err != nil {
+		slog.Warn("could not get the packet log", "error", err)
+		data.CoreErr = err.Error()
+		data.Rows.CoreErr = err.Error()
+	} else {
+		data.Result = res
+		data.Rows.Entries = res.Entries
+		data.Rows.Listening = res.Listening
+		data.Rows.Since = res.Since
+		s.rulesNow(&data.Rows, rules)
+		s.feedNames(r, &data.Rows)
+		s.countryCells(r, &data.Rows, rules)
+	}
+	if s.lookup != nil {
+		st := s.lookup.status()
+		data.Lookup = &st
+		if st.Loaded {
+			lang := ResolveLang(s.bundle, r, s.cfg.Language)
+			for _, cc := range shared.CountryCodes {
+				data.Countries = append(data.Countries, countryOption{ID: cc, Code: strings.ToUpper(cc), Name: countryName(lang, cc)})
+			}
+			slices.SortFunc(data.Countries, func(a, b countryOption) int { return strings.Compare(nameSortKey(a.Name), nameSortKey(b.Name)) })
+		}
+	}
+	// Only decides what the empty state and the header say. Unreadable, it
+	// says nothing rather than something false.
+	if opts, err := s.client.GetOptions(); err == nil {
+		data.Rows.Logging = opts.LogsAnything()
+		data.Rows.LoggingKnown = true
+	}
+	// The apply screen's own total, so the two pages cannot disagree about
+	// how many changes are waiting. One number, one source: /apply renders
+	// Total even when Incomplete is true (buildPreview already sets Total to
+	// the rule count before it returns on an unreadable configuration half),
+	// so /blocked must show the same number rather than hide it.
+	data.Staged = s.buildPreview(r, rules).Total
+	s.render(w, r, "blocked.html", "blocked", data)
+}
+
+// handleBlockedRows is the live tail: polled every five seconds with after=<seq>,
+// the highest Seq the page holds. It answers with the rows newer than that and
+// htmx puts them on top (HX-Reswap: afterbegin), or with 204 when there are
+// none, so an idle tail costs no body at all. With no after — the page had no
+// rows — or with a ring that went backwards (a core restarted without its
+// spill file numbers from 1 again), it answers with the whole view. A
+// separate request from handleBlocked's, so it asks the core the same two
+// questions again rather than inheriting an answer from a page load that may
+// be minutes old.
+func (s *Server) handleBlockedRows(w http.ResponseWriter, r *http.Request) {
+	// The answer is the state of the ring at this moment; nothing between the
+	// browser and this process may hand an older one back.
+	w.Header().Set("Cache-Control", "no-store")
+	q := r.URL.Query()
+	if q.Get("country") != "" && !s.countryFilterOn() {
+		// A country view open across an easywall-web restart: its rows are
+		// never mixed with every other country's. Loading: wait for the table.
+		// Switched off: reload, and the page's redirect drops the field.
+		if s.lookup == nil {
+			w.Header().Set("HX-Refresh", "true")
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	f, _ := blockedFilter(q) // an unreadable filter here renders as no filter, exactly like the page
+	after, _ := strconv.ParseUint(q.Get("after"), 10, 64)
+	rows := blockedRows{Entries: []shared.PacketLogEntry{}, Query: filterQuery(f), Filtered: !f.IsZero()}
+	// Before the packet log is asked: a failed tail still renders under the
+	// page's head, which has the Country column while the lookup is on.
+	rows.Lookup = s.lookup != nil
+	rules := rulesFunc(sync.OnceValues(s.client.GetRules))
+	swap := "innerHTML"
+	if res, delta, err := s.tailEntries(f, after); err == nil {
+		rows.Entries = res.Entries
+		rows.Listening = res.Listening
+		rows.Since = res.Since
+		if delta {
+			if len(res.Entries) == 0 {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			swap = "afterbegin"
+		}
+		s.rulesNow(&rows, rules)
+		s.feedNames(r, &rows)
+		s.countryCells(r, &rows, rules)
+	} else {
+		slog.Debug("could not get the packet log for the live tail", "error", err)
+		rows.CoreErr = err.Error()
+	}
+	if opts, err := s.client.GetOptions(); err == nil {
+		rows.Logging = opts.LogsAnything()
+		rows.LoggingKnown = true
+	}
+	w.Header().Set("HX-Reswap", swap)
+	s.renderPartial(w, r, "blocked_rows", rows)
+}
+
+// tailEntries is what one poll of the live tail shows: the rows newer than
+// after when delta is true, the whole view otherwise. With a country it asks
+// once for the newest thousand and filters them here (2.29 D8) — the page
+// load already made the exact scan — and only a ring that went backwards
+// since after costs the whole scan again.
+func (s *Server) tailEntries(f shared.PacketLogFilter, after uint64) (res *shared.PacketLogResult, delta bool, err error) {
+	if f.Country == "" {
+		if res, err = s.client.GetPacketLog(f); err != nil {
+			return nil, false, err
+		}
+		if newer, ok := entriesAfter(res.Entries, after); ok {
+			res.Entries, delta = newer, true
+		}
+		return res, delta, nil
+	}
+	q := f
+	q.Country, q.Limit = "", shared.PacketLogMaxLimit
+	if res, err = s.client.GetPacketLog(q); err != nil {
+		return nil, false, err
+	}
+	entries := res.Entries
+	if after != 0 {
+		newer, ok := entriesAfter(entries, after)
+		if !ok {
+			res, _, err = s.countryEntries(f)
+			return res, false, err
+		}
+		entries, delta = newer, true
+	}
+	mine := []shared.PacketLogEntry{}
+	for _, e := range entries {
+		if len(mine) < f.EffectiveLimit() && s.lookup.country(e.Src) == f.Country {
+			mine = append(mine, e)
+		}
+	}
+	res.Entries = mine
+	return res, delta, nil
+}
+
+// countryEntries reads the whole ring a page at a time and keeps the entries
+// whose source the country table places in f.Country (2.29 D7): exact, not a
+// sample of the newest 200. The second value is true when the core ignored
+// before — an older core (D9) — and the paging stopped there.
+func (s *Server) countryEntries(f shared.PacketLogFilter) (*shared.PacketLogResult, bool, error) {
+	q := f
+	q.Country, q.Limit, q.Before = "", shared.PacketLogMaxLimit, 0
+	keep := f.EffectiveLimit()
+	var out *shared.PacketLogResult
+	for {
+		res, err := s.client.GetPacketLog(q)
+		if err != nil {
+			return nil, false, err
+		}
+		if out == nil {
+			first := *res
+			first.Entries, first.Matched = []shared.PacketLogEntry{}, 0
+			out = &first
+		}
+		for _, e := range res.Entries {
+			if q.Before != 0 && e.Seq >= q.Before {
+				return out, true, nil
+			}
+			if s.lookup.country(e.Src) != f.Country {
+				continue
+			}
+			out.Matched++
+			if len(out.Entries) < keep {
+				out.Entries = append(out.Entries, e)
+			}
+		}
+		if len(res.Entries) < q.Limit {
+			return out, false, nil
+		}
+		// Nothing is older than seq 1, and a before of 0 is no before at all:
+		// the same page again, for ever.
+		last := res.Entries[len(res.Entries)-1].Seq
+		if last <= 1 {
+			return out, false, nil
+		}
+		q.Before = last
+	}
+}
+
+// entriesAfter returns the entries newer than after, newest first as the core
+// sends them, and whether a delta is meaningful at all: not without an after,
+// and not when the newest entry is older than after — the ring was renumbered
+// and the page's rows are no longer comparable — and not when there are no
+// entries at all: the page holds rows the view no longer has (the ring was
+// emptied, or a filter now matches nothing), and only the whole view replaces
+// them with the empty or no-match message. A 204 would leave them forever.
+func entriesAfter(entries []shared.PacketLogEntry, after uint64) ([]shared.PacketLogEntry, bool) {
+	if after == 0 || len(entries) == 0 || entries[0].Seq < after {
+		return nil, false
+	}
+	i := 0
+	for i < len(entries) && entries[i].Seq > after {
+		i++
+	}
+	return entries[:i], true
+}
+
+// handleBlockedStage runs one row action and returns to the view it came from.
+// The return URL is rebuilt from the validated filter, never copied from the
+// form, so there is no redirect a request can steer.
+func (s *Server) handleBlockedStage(w http.ResponseWriter, r *http.Request) {
+	back := "/blocked"
+	if q, err := url.ParseQuery(r.FormValue("q")); err == nil {
+		if f, bad := blockedFilter(q); bad == "" {
+			if enc := filterQuery(f); enc != "" {
+				back += "?" + enc
+			}
+		}
+	}
+	s.setFlash(w, r, s.stageFromLog(r))
+	http.Redirect(w, r, back, http.StatusSeeOther)
+}
+
+// stageFromLog stages one of the three actions and returns the flash that says
+// what happened. It stages; it never applies. Every other page saves and lets
+// the apply screen apply, and a log page that armed the rollback timer on one
+// click would be the only surprise in a product whose argument is that it has
+// none.
+//
+// The audit entry is the core's: SAVE_RULES writes rules_saved with the change
+// described, the same entry the blocklist page's own Save produces.
+func (s *Server) stageFromLog(r *http.Request) string {
+	state, err := s.client.GetRules()
+	if err != nil {
+		slog.Warn("could not read the rules to stage a row action", "error", err)
+		return "save_error"
+	}
+	next := state.Staged
+	var ruleType string
+	var payload any
+	var done string
+
+	// A /blocked page left open across the upgrade posts the old list name.
+	switch act := shared.CurrentListName(r.FormValue("act")); act {
+	case "allowlist", "blocklist":
+		// One address, never a network: a network is a decision, and the list
+		// page is where it is typed. Unmapped and unzoned before anything reads
+		// it, so the guard and the kernel see the same spelling.
+		addr, err := netip.ParseAddr(strings.TrimSpace(r.FormValue("addr")))
+		if err != nil {
+			return "blocked_refused_invalid"
+		}
+		entry := addr.Unmap().WithZone("").String()
+		list := &next.Allowlist
+		if act == "blocklist" {
+			list = &next.Blocklist
+		}
+		if shared.InAnyEntry(addr.Unmap().WithZone(""), *list) {
+			return "blocked_refused_already"
+		}
+		*list = append(slices.Clone(*list), entry)
+		ruleType, payload, done = act, *list, "blocked_staged_"+act
+
+	case "open":
+		proto := r.FormValue("proto")
+		port, err := strconv.ParseUint(r.FormValue("port"), 10, 16)
+		if (proto != "tcp" && proto != "udp") || err != nil || port == 0 {
+			return "blocked_refused_invalid"
+		}
+		rules := &next.TCP
+		if proto == "udp" {
+			rules = &next.UDP
+		}
+		for _, pr := range *rules {
+			if pr.FiltersHost() && len(pr.Sources) == 0 && shared.PortInRule(pr.Port, uint16(port)) {
+				return "blocked_refused_already"
+			}
+		}
+		loc := NewLocalizer(s.bundle, r, s.cfg.Language)
+		*rules = append(slices.Clone(*rules), shared.PortRule{
+			Port:        strconv.FormatUint(port, 10),
+			Description: T(loc, "blocked_port_description"),
+		})
+		ruleType, payload, done = proto, *rules, "blocked_staged_port"
+
+	case "country":
+		return s.stageCountryFromLog(r.FormValue("cc"), state.Staged.Feeds)
+
+	default:
+		return "blocked_refused_invalid"
+	}
+
+	if refusal := s.lockoutRefusal(r, state.Staged, next); refusal != "" {
+		return refusal
+	}
+	if err := s.client.SaveRules(ruleType, payload); err != nil {
+		slog.Warn("could not stage a row action", "type", ruleType, "error", err)
+		return "save_error"
+	}
+	return done
+}
+
+// stageCountryFromLog is the Countries card's Add, from a row (2.27, spec
+// D6): the same cap and the same refusal, and the first fetch at once. No
+// lockout question here, as the card asks none: /apply's verdict names a
+// country that would cut the operator off, and an apply waits until the
+// country's copy has loaded.
+func (s *Server) stageCountryFromLog(cc string, staged []string) string {
+	id := shared.CountryFeedID(cc)
+	if !shared.IsCountryFeedID(id) {
+		return "blocked_refused_invalid"
+	}
+	if slices.Contains(staged, id) {
+		return "blocked_refused_already"
+	}
+	next, refused := countriesNext(staged, id, "")
+	if refused != "" {
+		return refused
+	}
+	if err := s.client.SaveRules("feeds", next); err != nil {
+		slog.Warn("could not stage a country from the log", "error", err)
+		return "save_error"
+	}
+	s.refreshFeedNow(id)
+	return "blocked_staged_country"
+}
+
+// lockoutRefusal answers whether staging after instead of before would take
+// the operator's way in away, and names why. Empty means go ahead.
+//
+// It asks the same question reachVerdict answers for the apply screen — same
+// address resolution through trusted_proxies, same feed lookup — twice, for
+// before and after. The two share the request's address and, for every row
+// action this handler stages, the same staged.Feeds (only the allow/block/port
+// lists change here), so the feed hits are fetched once and handed to both:
+// GET_FEEDS asked twice for the identical address would be the same answer
+// paid for twice. Then it asks the one thing reachVerdict cannot: whether the
+// TCP peer is being blocklisted. Behind a proxy the address in the log is the
+// proxy's, and the verdict about the operator's own address stays open while
+// everyone who comes through that proxy is cut off.
+func (s *Server) lockoutRefusal(r *http.Request, before, after shared.Rules) string {
+	opts, oErr := s.client.GetOptions()
+	nets, nErr := s.client.GetSettings()
+	if oErr != nil || nErr != nil {
+		slog.Warn("cannot ask the lockout question, so the row action is not staged",
+			"options", oErr, "settings", nErr)
+		return "blocked_refused_unknown"
+	}
+	addr, port, proxied, fallback := s.requestAddrAndPort(r)
+	was, now := fallback, fallback
+	if fallback == nil {
+		hits, unknown := s.feedHits(addr, before)
+		was = s.verdictFor(r, before, *opts, *nets, addr, port, proxied, hits, unknown)
+		now = s.verdictFor(r, after, *opts, *nets, addr, port, proxied, hits, unknown)
+	}
+	if now.Verdict == shared.ReachBlocked && was.Verdict != shared.ReachBlocked {
+		return "blocked_refused_lockout"
+	}
+	// Behind a trusted proxy there is no verdict to flip — the port is the
+	// proxy's — but a blocklist entry drops every port, so blocklisting the
+	// client the proxy named needs no port to refuse. The verdict used to be
+	// computed for webPort, and when only the proxy's port was open it read
+	// "blocked" before and after, so this click went through unrefused.
+	if fallback != nil && fallback.Reason == shared.ReasonTrustedProxy &&
+		shared.InAnyEntry(addr, after.Blocklist) && !shared.InAnyEntry(addr, before.Blocklist) {
+		return "blocked_refused_lockout"
+	}
+
+	peer, err := netip.ParseAddr(peerIP(r))
+	if err != nil {
+		return ""
+	}
+	peer = peer.Unmap().WithZone("")
+	if shared.InAnyEntry(peer, after.Blocklist) && !shared.InAnyEntry(peer, before.Blocklist) {
+		// "Proxy" only when the peer is a configured trusted proxy — with or
+		// without a header naming a client behind it. Not clientAddr's proxied:
+		// that is header presence, and any untrusted caller can send a header
+		// about itself. "The client resolved past the peer" needs no second
+		// test: resolveClient only reads the header from a trusted peer.
+		if shared.InAnyEntry(peer, s.cfg.TrustedProxies) {
+			return "blocked_refused_proxy"
+		}
+		return "blocked_refused_lockout"
+	}
+	return ""
+}
+
+// blockedRuleOption is the /options card behind each rule a /blocked row can
+// name, by the card's toml key — its anchor is opt-<key> (options.html). Every
+// rule in shared.PacketLogRules has an entry, and an empty one is a decision:
+// the blocklist and the final drop are not switches, so no card refused those
+// packets. A feed is not a switch on /options either: its chip leads to the
+// feed's own row on the blocklist page instead (blocked.html).
+// TestEveryBlockedRuleLeadsToItsOption holds all of it.
+var blockedRuleOption = map[string]string{
+	"ssh":        "ssh_brute_force",
+	"icmp_flood": "icmp_flood",
+	"syn_flood":  "syn_flood",
+	"tcp_rst":    "tcp_rst_flood",
+	"portscan":   "port_scan",
+	"invalid":    "drop_invalid_packets",
+	"fragment":   "drop_fragments",
+	"bogon":      "bogon_filter",
+	"blocklist":  "",
+	"feed":       "",
+	"drop":       "",
+}

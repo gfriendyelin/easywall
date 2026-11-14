@@ -1,0 +1,1184 @@
+package web
+
+import (
+	"bytes"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/BurntSushi/toml"
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// Config is the runtime configuration for easywall-web.
+//
+// Read on every request — the language, the demo flag, and the password hash
+// that every authenticated request compares its session against — and written
+// when the operator changes their password or completes the first-run wizard.
+// Those are different goroutines, and without the lock below that is a data
+// race on a string header: the reader can observe the new length with the old
+// pointer. The race detector never saw it because no test changed a password
+// while another request was in flight.
+type Config struct {
+	shared.WebConfig
+
+	// mu guards WebConfig. Use the accessors rather than the embedded fields.
+	mu         sync.RWMutex
+	configPath string
+
+	// fileConfig is the parsed file as it stood before the environment overlay.
+	// encode() renders this rather than the live struct, so a variable set for
+	// the process cannot become content of the operator's file. Only the twelve
+	// managedKeys are taken from the live struct — those are the keys the
+	// interface deliberately maintains.
+	fileConfig shared.WebConfig
+
+	// provenance records, for each key an environment variable names, what that
+	// variable said and whether the file beat it. Captured at load; the stored
+	// half is recomputed from fileConfig on read, so a save cannot leave the
+	// marker beside a control disagreeing with the file it describes.
+	provenance map[string]shared.Provenance
+}
+
+// Credentials returns the username and password hash in force right now.
+func (c *Config) Credentials() (string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Username, c.Password
+}
+
+// PasswordHash returns the stored hash.
+func (c *Config) PasswordHash() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Password
+}
+
+// TOTPSecret returns the enrolled second-factor secret, or "" when there is none.
+func (c *Config) TOTPSecret() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.WebConfig.TOTPSecret
+}
+
+// TOTPEnabled reports whether a second factor is enrolled.
+func (c *Config) TOTPEnabled() bool { return c.TOTPSecret() != "" }
+
+// RecoveryCodes returns a copy of the stored hashes.
+//
+// A copy, because the caller consumes one and hands the rest back, and handing
+// out the slice the config holds would let that edit land without the lock.
+func (c *Config) RecoveryCodes() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, len(c.WebConfig.RecoveryCodes))
+	copy(out, c.WebConfig.RecoveryCodes)
+	return out
+}
+
+// retiredWebKeys are keys an older web.toml may still hold and the docs call
+// "read by nothing": ignored without a warning, which would otherwise repeat on
+// every start and every -healthcheck for a file that is not wrong.
+var retiredWebKeys = []string{"csrf_key"}
+
+// LoadConfig reads and parses the TOML config at path.
+func LoadConfig(path string) (*Config, error) {
+	// #nosec G304 -- path is the --config argument this process was started with,
+	// never anything a request supplied.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	var cfg Config
+	meta, err := toml.Decode(string(data), &cfg.WebConfig)
+	if err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	// A switch that ships on is on for a file that predates it: the package
+	// never replaces web.toml, and an absent bool decodes to false (the 2.25.0
+	// trap). Before fileConfig and the overlay, so both see the default.
+	// A key that landed in the wrong table (country_lookup after [tls] becomes
+	// tls.country_lookup) is not decoded into anything: say so, do not refuse.
+	for _, k := range meta.Undecoded() {
+		if slices.Contains(retiredWebKeys, k.String()) {
+			continue
+		}
+		slog.Warn("web.toml: key not recognised and ignored; check its table", "key", k.String())
+	}
+	if !meta.IsDefined("country_lookup") {
+		cfg.CountryLookup = shared.WebDefault().CountryLookup
+	}
+	cfg.configPath = path
+	cfg.fileConfig = cfg.WebConfig // before the overlay, deliberately
+
+	// health_allow absent is not health_allow empty.
+	//
+	// An operator upgrading from 2.16 has a web.toml written before this key
+	// existed, and the container's HEALTHCHECK asks /healthz. Treating the
+	// absent key as "nobody" would report every upgraded container unhealthy —
+	// the failure docker/entrypoint.sh:12-18 records, arriving from the other
+	// direction. An explicitly empty list still means nobody, which is the only
+	// way an operator has of turning the endpoint off, and TOML keeps the two
+	// apart: an absent key leaves the field nil, `health_allow = []` does not.
+	//
+	// Before the overlay, so applyEnv sees an absent key as the default it
+	// stands for — and only `= []` as an empty list, which beats
+	// EASYWALL_WEB_HEALTH_ALLOW like any stored value.
+	if cfg.HealthAllow == nil {
+		cfg.HealthAllow = shared.WebDefault().HealthAllow
+	}
+	prov, err := shared.ApplyWebEnv(&cfg.WebConfig)
+	if err != nil {
+		return nil, fmt.Errorf("environment: %w", err)
+	}
+	cfg.provenance = prov
+	return &cfg, nil
+}
+
+// Validate checks all required fields and returns a descriptive error if invalid.
+func (c *Config) Validate() error {
+	if c.BindAddr == "" {
+		return fmt.Errorf("bind_addr is required")
+	}
+	// Demo mode runs without a core daemon, so the socket path is irrelevant.
+	if c.SocketPath == "" && !c.DemoMode {
+		return fmt.Errorf("socket_path is required")
+	}
+	// The environment's copy was checked when it was parsed; this covers the
+	// other half — a malformed entry written into web.toml by hand, which the
+	// overlay never touches because a stored value wins.
+	if err := shared.ValidateAddressList("trusted_proxies", c.TrustedProxies); err != nil {
+		return err
+	}
+	// Same reason, and it matters more here: a typo in this list is silently one
+	// entry short, and the operator meets it as a monitoring check that has been
+	// getting 404 since the upgrade.
+	if err := shared.ValidateAddressList("health_allow", c.HealthAllow); err != nil {
+		return err
+	}
+	// The schema and the /notify handler both restrict notify_kind to this set;
+	// Validate did not, so a value hand-written into web.toml that the overlay
+	// never touches reached the notifier, where anything other than "ntfy" is
+	// treated as a webhook and posted to notify_url. A typo became a silent
+	// webhook; the same reasoning as the address lists above, caught at load.
+	switch c.NotifyKind {
+	case "", "webhook", "ntfy":
+	default:
+		return fmt.Errorf("notify_kind is %q; it must be \"webhook\", \"ntfy\", or empty for off", c.NotifyKind)
+	}
+	if c.SSLDir == "" {
+		return fmt.Errorf("ssl_dir is required")
+	}
+	if c.DataDir == "" {
+		c.DataDir = "/var/lib/easywall"
+	}
+	if err := c.ensureSessionKey(); err != nil {
+		return err
+	}
+	if c.Language == "" {
+		c.Language = "en"
+	}
+	// Both halves of a custom certificate, or neither.
+	//
+	// With only one set, easywall generated its own pair into ssl_dir and then
+	// served the generated certificate with the configured key — or the other
+	// way round. TLS refuses the mismatch, and the operator got "private key
+	// does not match public key" from a certificate they never configured.
+	switch {
+	case c.TLS.CertFile != "" && c.TLS.KeyFile == "":
+		return fmt.Errorf("tls.cert is set but tls.key is not; set both, or neither for a self-signed certificate")
+	case c.TLS.KeyFile != "" && c.TLS.CertFile == "":
+		return fmt.Errorf("tls.key is set but tls.cert is not; set both, or neither for a self-signed certificate")
+
+	// The same reasoning one step out: a configuration that names two sources
+	// of one certificate has not said which one to serve.
+	case c.TLS.ACME && c.TLS.CertFile != "":
+		return fmt.Errorf("tls.acme is on and tls.cert is set; a certificate comes from one place — " +
+			"clear tls.cert and tls.key to let ACME issue it, or turn tls.acme off to keep your own")
+	case c.TLS.ACME && c.TLS.Hostname == "":
+		return fmt.Errorf("tls.acme is on but tls.hostname is empty; ACME issues for a name, " +
+			"and a certificate authority will not issue for an IP address")
+	case c.TLS.ACME && !c.TLS.ACMEAgreeTOS:
+		return fmt.Errorf("tls.acme is on but acme_agree_tos is false; issuing a certificate means " +
+			"agreeing to the certificate authority's subscriber agreement, and easywall does not " +
+			"agree to it on your behalf — set acme_agree_tos = true when you have read it")
+	}
+	return nil
+}
+
+// sessionKeyPlaceholder is the value config/web.toml ships with. It is a
+// placeholder in the sense that a reader is expected to replace it — and it was
+// not enforced, so `docker compose up`, which bind-mounts that very file,
+// started a firewall administration interface whose session cookies were signed
+// with a key published in the repository. A forged cookie built from it was
+// accepted on /dashboard with no password at all.
+const sessionKeyPlaceholder = "CHANGE_ME"
+
+// minSessionKeyLen is the shortest key worth signing with. The documented
+// recipe is `openssl rand -hex 32`, which produces 64 characters.
+const minSessionKeyLen = 32
+
+// ensureSessionKey guarantees the cookie signing key is one nobody else knows.
+//
+// An unusable key — empty, the shipped placeholder, or too short to be worth
+// forging against — is replaced with a fresh one and written back to the config
+// file, so the next start keeps the same sessions. Refusing to start instead
+// would be defensible, but it would also break `docker compose up` out of the
+// box, and an operator who has just been told to edit a file inside a container
+// image is an operator who reaches for the fastest way past the message.
+func (c *Config) ensureSessionKey() error {
+	if c.SessionKey != "" &&
+		!strings.Contains(c.SessionKey, sessionKeyPlaceholder) &&
+		len(c.SessionKey) >= minSessionKeyLen {
+		return nil
+	}
+
+	key, err := generateSecret(32)
+	if err != nil {
+		return fmt.Errorf("generate session key: %w", err)
+	}
+	c.SessionKey = key
+
+	if c.configPath == "" {
+		return nil // constructed in memory; nothing to persist to
+	}
+	if err := c.saveLocked(); err != nil {
+		return fmt.Errorf("no usable session_key, and the generated one could not be "+
+			"saved to %s (%w). Set session_key yourself: openssl rand -hex 32",
+			c.configPath, err)
+	}
+	slog.Warn("session_key was missing or still the shipped placeholder; " +
+		"generated a new one and saved it. Existing sessions are invalidated.")
+	return nil
+}
+
+// IsFirstRun returns true when no password hash is set (first-run wizard needed).
+func (c *Config) IsFirstRun() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Password == ""
+}
+
+// CertPath returns the effective TLS certificate path.
+func (c *Config) CertPath() string {
+	if c.TLS.CertFile != "" {
+		return c.TLS.CertFile
+	}
+	return c.SSLDir + "/cert.pem"
+}
+
+// KeyPath returns the effective TLS key path.
+func (c *Config) KeyPath() string {
+	if c.TLS.KeyFile != "" {
+		return c.TLS.KeyFile
+	}
+	return c.SSLDir + "/key.pem"
+}
+
+// Hostname returns the name this installation is reached by, or "" when the
+// operator has not set one.
+func (c *Config) Hostname() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.TLS.Hostname
+}
+
+// ACMEEnabled reports whether autocert should supply the certificate.
+func (c *Config) ACMEEnabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.TLS.ACME
+}
+
+// ACMEEmail returns the contact address registered with the CA, possibly "".
+func (c *Config) ACMEEmail() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.TLS.ACMEEmail
+}
+
+// CustomCertConfigured reports whether the operator supplied their own
+// certificate file, as opposed to leaving TLSConfig's third source — a
+// self-signed pair easywall generates and renews itself — in force. Neither
+// this nor ACMEEnabled tells the server what a particular *browser* trusts;
+// together they are what it can know about itself: a hostname with neither
+// ACME nor an operator-supplied certificate is a self-signed installation,
+// which is the one case passkeyUnavailableReason (handler_passkey.go) can
+// name with certainty.
+func (c *Config) CustomCertConfigured() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.TLS.CertFile != ""
+}
+
+// ACMEDirectory returns the directory URL override; "" means the CA autocert
+// defaults to.
+func (c *Config) ACMEDirectory() string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.TLS.ACMEDirectory
+}
+
+// ACMEAgreedTOS reports whether the operator has agreed to the CA's terms.
+func (c *Config) ACMEAgreedTOS() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.TLS.ACMEAgreeTOS
+}
+
+// LocalesDir returns the locales directory path.
+func (c *Config) LocalesDir() string {
+	return "locales"
+}
+
+// TemplatesDir returns the templates directory path.
+func (c *Config) TemplatesDir() string {
+	return "web/templates"
+}
+
+// StaticDir returns the static assets directory path.
+func (c *Config) StaticDir() string {
+	return "web/static"
+}
+
+// UpdateCheckEnabled reports whether the dashboard may contact the GitHub
+// releases API. An absent key means yes, so an existing config keeps behaving
+// as it did.
+func (c *Config) UpdateCheckEnabled() bool {
+	return c.UpdateCheck == nil || *c.UpdateCheck
+}
+
+// TelemetryEnabled reports whether the operator agreed to be counted. Unset
+// means no — consent is asked for, never assumed.
+func (c *Config) TelemetryEnabled() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Telemetry != nil && *c.Telemetry
+}
+
+// Provenance reports where the value in force for one TOML key came from, or
+// false when no environment variable is currently set for that key — an unset
+// variable leaves no entry for LoadConfig to have recorded, the same as one
+// that never existed.
+//
+// The stored half is recomputed from fileConfig rather than returned as it was
+// captured at load: a save changes the file, and a marker that still described
+// the file as it was at startup would tell the operator their override does not
+// exist seconds after they made it.
+func (c *Config) Provenance(tomlKey string) (shared.Provenance, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	p, ok := c.provenance[tomlKey]
+	if !ok {
+		return shared.Provenance{}, false
+	}
+	// c.provenance is built by LoadConfig from shared.ApplyWebEnv, which only
+	// ever records a key that is also one of shared.WebEnvVars' TOMLKeys — so a
+	// hit above always has a matching entry here too.
+	v, _ := shared.WebEnvVar(tomlKey)
+	file := c.fileConfig
+	def := shared.WebDefault()
+	if stored := v.Get(&file); stored != v.Get(&def) {
+		p.Stored = stored
+	} else {
+		p.Stored = ""
+	}
+	return p, true
+}
+
+// StateDir is <data_dir>/web, the one directory this process writes its state
+// in — see statedir.go for why it is not data_dir itself.
+func (c *Config) StateDir() string {
+	return filepath.Join(c.DataDir, stateSubdir)
+}
+
+// VersionCachePath returns the path for the version check cache file.
+func (c *Config) VersionCachePath() string {
+	if c.DataDir != "" {
+		return c.StateDir() + "/version_cache.json"
+	}
+	return c.SSLDir + "/../version_cache.json"
+}
+
+// TelemetryStatePath returns the path for the installation identifier and the
+// last-reported stamp.
+func (c *Config) TelemetryStatePath() string {
+	if c.DataDir != "" {
+		return c.StateDir() + "/telemetry.json"
+	}
+	return c.SSLDir + "/../telemetry.json"
+}
+
+// FeedStatePath returns the path for the feeds' fetch state and own feeds.
+//
+// Not feeds.json, which the spec first named it: stateFiles is also the list
+// prepareStateDir moves out of data_dir, and <data_dir>/feeds.json is the
+// core's copy of every feed. On a data_dir this process can write — the demo,
+// a manual install run as one user — the move would take the core's file.
+func (c *Config) FeedStatePath() string {
+	if c.DataDir != "" {
+		return c.StateDir() + "/feed_fetch.json"
+	}
+	return c.SSLDir + "/../feed_fetch.json"
+}
+
+// CountryTablePath is where the country lookup keeps ipverse's archive as it
+// was last downloaded (2.27), so a restart reads it instead of fetching again.
+func (c *Config) CountryTablePath() string {
+	if c.DataDir != "" {
+		return c.StateDir() + "/countries.tar.gz"
+	}
+	return c.SSLDir + "/../countries.tar.gz"
+}
+
+// TOTPReplayPath returns the path for the last accepted TOTP step.
+//
+// In <data_dir>/web and not in web.toml: this changes once per login, and
+// web.toml is rewritten in place on a directory the packaged layout does not
+// let this process create a temp file in.
+func (c *Config) TOTPReplayPath() string {
+	if c.DataDir != "" {
+		return c.StateDir() + "/totp_replay.json"
+	}
+	return c.SSLDir + "/../totp_replay.json"
+}
+
+// PasskeysPath returns the path for the enrolled passkey store.
+//
+// In <data_dir>/web for the same reason as TOTPReplayPath, and more so: the
+// signature counter changes on every passkey login, so this file is written
+// far more often than the TOTP replay step is.
+func (c *Config) PasskeysPath() string {
+	if c.DataDir != "" {
+		return c.StateDir() + "/passkeys.json"
+	}
+	return c.SSLDir + "/../passkeys.json"
+}
+
+// SaveTelemetry records the operator's answer to being counted.
+//
+// Separate from every other save on purpose: withdrawing consent must work
+// when nothing else does. It touches only web.toml, so it does not depend on
+// the core being reachable.
+//
+// Rolled back on a failed write like every Save* below: otherwise a transient
+// failure leaves consent looking withdrawn until the next restart quietly
+// brings back whatever disk still holds.
+func (c *Config) SaveTelemetry(enabled bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev, prevFile := c.Telemetry, c.fileConfig.Telemetry
+	// Both: the live value is what is in force from this moment, and the file
+	// value is what render writes and what the next start reads back as stored.
+	c.Telemetry = &enabled
+	c.fileConfig.Telemetry = &enabled
+	if err := c.saveLocked(); err != nil {
+		c.Telemetry, c.fileConfig.Telemetry = prev, prevFile
+		return err
+	}
+	return nil
+}
+
+// ResetTelemetry removes the stored answer, handing the key back to
+// EASYWALL_WEB_TELEMETRY — or, with no variable set, to the built-in default,
+// which is that nobody has answered.
+//
+// Removing rather than writing the default: for a *bool whose absence is a
+// state, "write the default" and "clear the answer" are different files.
+//
+// Rolled back on a failed write like every Save* above.
+func (c *Config) ResetTelemetry() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	prev, prevFile := c.Telemetry, c.fileConfig.Telemetry
+	c.fileConfig.Telemetry = nil
+	// What is in force once the stored answer is gone: the variable, if there is
+	// one, and otherwise nothing.
+	c.Telemetry = nil
+	if p, ok := c.provenance["telemetry"]; ok {
+		if b, err := strconv.ParseBool(p.Env); err == nil {
+			c.Telemetry = &b
+		}
+	}
+	if err := c.saveLocked(); err != nil {
+		c.Telemetry, c.fileConfig.Telemetry = prev, prevFile
+		return err
+	}
+	return nil
+}
+
+// SaveCredentials persists updated username and password hash to the config file.
+//
+// Rolled back on a failed write, the same shape as SaveTOTP: setting the
+// fields first and saving second would make currentCredential() report the
+// new password the instant a full disk refused the write meant to make it so.
+// RequireAuth compares every request's session fingerprint against that
+// value, so the operator's own session would be evicted, the internal_error
+// flash would never reach them because the redirect it fires on is keyed to
+// the credential that just changed under them, and the new password would
+// work while the old one — the one actually on disk — was refused until a
+// restart flipped the in-memory value back.
+func (c *Config) SaveCredentials(username, passwordHash string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prevUsername, prevPassword := c.Username, c.Password
+	c.Username = username
+	c.Password = passwordHash
+	if err := c.saveLocked(); err != nil {
+		c.Username, c.Password = prevUsername, prevPassword
+		return err
+	}
+	return nil
+}
+
+// SaveTOTP writes the second-factor secret and its recovery hashes in one write.
+//
+// One write and not two: between them sits a file with a secret and no way back,
+// or eight codes for a factor that is not enrolled. Passing an empty secret and
+// a nil slice switches the factor off, and that clears both — a secret that
+// survived "turn it off" would be a factor still enforced after the interface
+// said it was not.
+//
+// The in-memory fields are rolled back when the write fails. Setting them first
+// and saving second — the shape every other Save* method here uses — would
+// leave TOTPEnabled() reporting a factor is enrolled the instant a full disk
+// refused the write that was supposed to make it so, before the operator's own
+// request had even finished. Enrolment is the one path that checks its own
+// write for exactly that reason: a pending secret is worth keeping only because
+// nothing else believes it is confirmed yet.
+func (c *Config) SaveTOTP(secret string, recoveryHashes []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prevSecret := c.WebConfig.TOTPSecret
+	prevCodes := c.WebConfig.RecoveryCodes
+	c.WebConfig.TOTPSecret = secret
+	c.WebConfig.RecoveryCodes = append([]string(nil), recoveryHashes...)
+	if err := c.saveLocked(); err != nil {
+		c.WebConfig.TOTPSecret = prevSecret
+		c.WebConfig.RecoveryCodes = prevCodes
+		return err
+	}
+	return nil
+}
+
+// SaveRecoveryCodes replaces the stored hashes and leaves the secret alone. It
+// is what consuming a code and regenerating the set both come down to.
+//
+// Rolled back on a failed write, the same shape as SaveTOTP: without it, the
+// worst case is regenerating a set — the operator is holding eight new codes
+// that were never written, the write fails, and the eight the process now
+// believes in are ones nobody has ever seen. With a lost phone that is a
+// lockout until a restart discards the unsaved in-memory copy.
+//
+// The snapshot is a plain slice-header copy, safe for the same reason
+// SaveTOTP's is: the field below is always reassigned a freshly allocated
+// slice (append([]string(nil), ...) never writes into the old backing array),
+// so prevCodes keeps pointing at untouched data through the rollback.
+func (c *Config) SaveRecoveryCodes(hashes []string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prevCodes := c.WebConfig.RecoveryCodes
+	c.WebConfig.RecoveryCodes = append([]string(nil), hashes...)
+	if err := c.saveLocked(); err != nil {
+		c.WebConfig.RecoveryCodes = prevCodes
+		return err
+	}
+	return nil
+}
+
+// RemoveRecoveryCode deletes one stored hash, if it is still stored, and writes
+// the set — the lookup and the write under one lock. remaining is how many are
+// left (as written, or as they would have been when the write fails); removed
+// is false when the hash was not there, because a concurrent request spent it
+// first or the set was regenerated.
+//
+// Consuming a code used to be RecoveryCodes, argon2 against all eight (~300 ms),
+// then SaveRecoveryCodes(the other seven), with no lock across them. Two codes
+// used at once both read the same eight, so the second write put the first code
+// back: both logins were accepted, the file said 7 where 6 were left, and one
+// spent code worked again. The same code twice at once opened two sessions.
+// The argon2 runs outside the lock; only this compare-and-remove is inside it.
+//
+// Rolled back on a failed write, as SaveRecoveryCodes is.
+func (c *Config) RemoveRecoveryCode(hash string) (remaining int, removed bool, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prevCodes := c.WebConfig.RecoveryCodes
+	i := slices.Index(prevCodes, hash)
+	if i < 0 {
+		return len(prevCodes), false, nil
+	}
+	c.WebConfig.RecoveryCodes = slices.Delete(slices.Clone(prevCodes), i, i+1)
+	if err := c.saveLocked(); err != nil {
+		c.WebConfig.RecoveryCodes = prevCodes
+		return len(prevCodes) - 1, true, err
+	}
+	return len(c.WebConfig.RecoveryCodes), true, nil
+}
+
+// ErrAlreadySetUp is returned when the wizard is asked to create an account on
+// an installation that already has one.
+var ErrAlreadySetUp = errors.New("the account has already been created")
+
+// FirstRunAccount is everything the wizard decides about the account, in one
+// value, so the write that persists it cannot be called with the username and
+// the hash swapped — they are adjacent strings, and two of the five fields are
+// optional.
+//
+// It lives here beside Config rather than in shared: it is not protocol, and the
+// core never sees any of it.
+type FirstRunAccount struct {
+	Username     string
+	PasswordHash string
+	Telemetry    bool
+
+	// Empty and nil when no second factor was set up. They are written together
+	// with the account or not at all — there is no path that stores one without
+	// the other, which is what keeps a secret from existing for an account that
+	// does not.
+	TOTPSecret     string
+	RecoveryHashes []string
+}
+
+// SaveFirstRun persists everything the setup wizard decides, in one write.
+//
+// One write rather than several, because a failure halfway through the first run
+// is the worst moment to leave a half-configured file behind: the wizard closes
+// as soon as a password exists, and whatever did not land cannot be asked again.
+//
+// The "is it still the first run" test happens here, under the same lock as the
+// write. The handler checks too, but that check and this write are two moments:
+// two POSTs arriving together both passed it, both wrote, and the second one
+// decided who owns the firewall. The window is small and it sits on a machine
+// that is, by definition, freshly exposed and not yet protected.
+//
+// The in-memory fields are restored when the write fails, for the reason the
+// sibling savers record: a transient failure that left c.Password set would send
+// the operator's retry into the ErrAlreadySetUp branch above, dead-ending the
+// wizard with nothing on disk.
+func (c *Config) SaveFirstRun(a FirstRunAccount) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Password != "" {
+		return ErrAlreadySetUp
+	}
+
+	prevUser, prevPass := c.Username, c.Password
+	prevTelemetry := c.Telemetry
+	prevFileTelemetry := c.fileConfig.Telemetry
+	prevSecret, prevCodes := c.WebConfig.TOTPSecret, c.WebConfig.RecoveryCodes
+
+	c.Username = a.Username
+	c.Password = a.PasswordHash
+	telemetry := a.Telemetry
+	fileTelemetry := a.Telemetry
+	c.Telemetry = &telemetry
+	c.fileConfig.Telemetry = &fileTelemetry
+	c.WebConfig.TOTPSecret = a.TOTPSecret
+	c.WebConfig.RecoveryCodes = append([]string(nil), a.RecoveryHashes...)
+
+	if err := c.saveLocked(); err != nil {
+		c.Username, c.Password = prevUser, prevPass
+		c.Telemetry = prevTelemetry
+		c.fileConfig.Telemetry = prevFileTelemetry
+		c.WebConfig.TOTPSecret, c.WebConfig.RecoveryCodes = prevSecret, prevCodes
+		return err
+	}
+	return nil
+}
+
+// SaveNotifications stores the notification settings and writes web.toml.
+//
+// Rolled back on a failed write like every other Save* here, and for a sharper
+// reason than most: the caller rebuilds the live notifier from these fields the
+// moment this returns. Left in place after a failed write, the process would be
+// posting to a URL that is not in the file — and the next restart would read
+// the old one back and quietly start posting somewhere else.
+func (c *Config) SaveNotifications(kind, url string, rolledBack, accepted, panicMode, failedLogins bool) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev, prevFile := c.WebConfig, c.fileConfig
+	c.NotifyKind, c.NotifyURL = kind, url
+	c.NotifyOnRolledBack, c.NotifyOnAccepted = rolledBack, accepted
+	c.NotifyOnPanic, c.NotifyOnFailedLogins = panicMode, failedLogins
+	c.fileConfig.NotifyKind, c.fileConfig.NotifyURL = kind, url
+	c.fileConfig.NotifyOnRolledBack, c.fileConfig.NotifyOnAccepted = rolledBack, accepted
+	c.fileConfig.NotifyOnPanic, c.fileConfig.NotifyOnFailedLogins = panicMode, failedLogins
+	if err := c.saveLocked(); err != nil {
+		c.restoreNotifications(prev, prevFile)
+		return err
+	}
+	return nil
+}
+
+// NotifyDestination returns the kind and URL the notifier posts to.
+//
+// Under the lock, like every other accessor here, and for a new reason: from
+// 2.20 these fields are read by a goroutine that is not serving a request —
+// runNotifier — while the settings page writes them from one that is.
+func (c *Config) NotifyDestination() (string, string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.NotifyKind, c.NotifyURL
+}
+
+// Demo reports whether this process runs against the in-memory mock.
+//
+// Under the lock like every other accessor here, though nothing writes the
+// field after load — shared/env.go's overlay is the only writer and it runs
+// before the server exists. It exists so the runtime readers, which sit beside
+// NotifyDestination and NotifyEnabled in functions whose stated rule is *use the
+// accessors*, do not have to be the one bare field access in the paragraph.
+// Validate and NewServer still read it directly: both run before there is a
+// second goroutine.
+func (c *Config) Demo() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.DemoMode
+}
+
+// NotifyEnabled reports whether the operator asked to hear about this event.
+// An unknown event is not a switch anyone can have turned on, so it is off.
+func (c *Config) NotifyEnabled(event string) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	switch event {
+	case "rolled_back":
+		return c.NotifyOnRolledBack
+	case "accepted":
+		return c.NotifyOnAccepted
+	case "panic":
+		return c.NotifyOnPanic
+	case "failed_logins":
+		return c.NotifyOnFailedLogins
+	}
+	return false
+}
+
+// restoreNotifications puts the six notification fields back as they were,
+// touching nothing else in either struct: a concurrent SaveTelemetry cannot
+// have run — c.mu is held — but a wholesale `c.WebConfig = prev` would still
+// undo whatever else changed between the snapshot and here if this function
+// ever grows. Six fields, named, is the assignment that stays correct.
+func (c *Config) restoreNotifications(prev, prevFile shared.WebConfig) {
+	c.NotifyKind, c.NotifyURL = prev.NotifyKind, prev.NotifyURL
+	c.NotifyOnRolledBack, c.NotifyOnAccepted = prev.NotifyOnRolledBack, prev.NotifyOnAccepted
+	c.NotifyOnPanic, c.NotifyOnFailedLogins = prev.NotifyOnPanic, prev.NotifyOnFailedLogins
+	c.fileConfig.NotifyKind, c.fileConfig.NotifyURL = prevFile.NotifyKind, prevFile.NotifyURL
+	c.fileConfig.NotifyOnRolledBack, c.fileConfig.NotifyOnAccepted = prevFile.NotifyOnRolledBack, prevFile.NotifyOnAccepted
+	c.fileConfig.NotifyOnPanic, c.fileConfig.NotifyOnFailedLogins = prevFile.NotifyOnPanic, prevFile.NotifyOnFailedLogins
+}
+
+// saveLocked persists the configuration. c.mu must be held for writing, so the
+// file write cannot reorder against the field update.
+//
+// Written atomically where the directory permits it, and in place where it does
+// not. The packaged layout is the second case on purpose: /etc/easywall belongs
+// to root and holds easywall.toml, the configuration the *root* daemon reads.
+// Making that directory writable by the unprivileged web user so it could
+// create a temp file there would hand a network-facing process the ability to
+// rewrite what root loads — the one thing the two-process split exists to
+// prevent. web.toml itself belongs to the web user, so an in-place rewrite
+// works and nothing else in that directory is reachable.
+func (c *Config) saveLocked() error {
+	// Read before write: the file on disk is what carries the comments, and
+	// what this save has to preserve. A file that has gone missing or become
+	// unreadable is not an error here — render falls back to the encoder.
+	existing, readErr := os.ReadFile(c.configPath) // #nosec G304 -- the daemon's own config path
+	if readErr != nil {
+		existing = nil
+	}
+	data, err := c.render(existing)
+	if err != nil {
+		return err
+	}
+
+	dir := filepath.Dir(c.configPath)
+	tmp, err := os.CreateTemp(dir, "web-*.toml.tmp")
+	if err != nil {
+		if !errors.Is(err, fs.ErrPermission) {
+			return fmt.Errorf("create temp config: %w", err)
+		}
+		// No write access to the directory: rewrite the file itself. It is a few
+		// hundred bytes and rewritten only when credentials change.
+		//
+		// #nosec G703 -- configPath is the -config argument this process was
+		// started with, and the read above is what makes gosec call it tainted.
+		// Nothing from a request reaches it.
+		if err := os.WriteFile(c.configPath, data, 0600); err != nil {
+			return fmt.Errorf("write config: %w", err)
+		}
+		return nil
+	}
+
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("write temp config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, c.configPath)
+}
+
+// configHeader is written above a config file easywall has had to rebuild from
+// the struct, which happens only when the file on disk could not be edited in
+// place — see mergeConfig.
+const configHeader = `# easywall web configuration
+#
+# Rebuilt by easywall: the file it replaced could not be edited in place, so the
+# comments that were in it are gone. Every key is documented at
+# https://easywall-project.org/configuration/
+
+`
+
+// managedKeys are the only keys easywall ever writes. Everything else in
+// web.toml is read and never touched, so an edit in place has to reach these
+// twelve and no others.
+//
+// Ordered as config/web.toml orders them, so a key that has to be appended
+// lands somewhere a reader expects it.
+//
+// keyLineRe below lists the same names; the two are read together, and adding
+// a key to one without the other means the file gets a second copy appended
+// rather than the one it has rewritten.
+var managedKeys = []string{
+	"session_key", "username", "password", "telemetry", "totp_secret", "recovery_codes",
+	"notify_kind", "notify_url", "notify_on_rolled_back", "notify_on_accepted",
+	"notify_on_panic", "notify_on_failed_logins",
+}
+
+// encode renders the whole configuration as TOML, comments and all discarded.
+// The fallback path — see mergeConfig for when it is taken. c.mu must be held.
+//
+// #nosec G117 -- the struct being encoded *is* web.toml, and session_key belongs
+// in it: easywall generates one on first start and writes it back here, which is
+// the only place it is kept. The file is 0600 and owned by the web user. There is
+// nothing to redact from a value whose destination is the file it came from.
+func (c *Config) encode() ([]byte, error) {
+	out := c.fileConfig
+	// Eleven of the twelve keys the interface owns come from the live struct;
+	// everything else — including telemetry, the twelfth — is left as fileConfig
+	// already has it. See the note on fileConfig for the general rule, and
+	// mergeSource for why telemetry is the one exception to it.
+	out.SessionKey = c.SessionKey
+	out.Username = c.Username
+	out.Password = c.Password
+	// Spelled through the embedded struct because Config has a TOTPSecret() and
+	// a RecoveryCodes() method: c.TOTPSecret is the method value, not the field.
+	out.TOTPSecret = c.WebConfig.TOTPSecret
+	out.RecoveryCodes = c.WebConfig.RecoveryCodes
+	out.NotifyKind = c.NotifyKind
+	out.NotifyURL = c.NotifyURL
+	out.NotifyOnRolledBack = c.NotifyOnRolledBack
+	out.NotifyOnAccepted = c.NotifyOnAccepted
+	out.NotifyOnPanic = c.NotifyOnPanic
+	out.NotifyOnFailedLogins = c.NotifyOnFailedLogins
+
+	buf := bytes.NewBufferString(configHeader)
+	if err := toml.NewEncoder(buf).Encode(out); err != nil {
+		return nil, fmt.Errorf("encode config: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// mergeSource is the configuration mergeConfig is asked to express: everything
+// in force, except that telemetry comes from the file rather than from the live
+// struct.
+//
+// The live value is whatever is in force, and after EASYWALL_WEB_TELEMETRY that
+// is the variable's. Writing it back would turn a deployment setting into a
+// stored one — which, under 2.12's precedence, then beats the very variable it
+// came from, permanently, from the next password change onwards. The operator's
+// own answer reaches this through fileConfig, which SaveTelemetry updates.
+//
+// c.mu must be held.
+func (c *Config) mergeSource() shared.WebConfig {
+	out := c.WebConfig
+	out.Telemetry = c.fileConfig.Telemetry
+	return out
+}
+
+// render produces the bytes to write: the existing file with the twelve managed
+// values replaced, or a fresh encoding when that cannot be done safely.
+//
+// The file the package installs is three kilobytes of comments explaining what
+// each key does. The encoder serialises a struct, so the first save replaced all
+// of it with fourteen bare lines — and on a container installation the first
+// save is the first *start*, because the shipped session_key is a placeholder
+// that ensureSessionKey replaces and writes back. configuration.md still sends
+// operators to this file to configure easywall, and they arrived at one that no
+// longer said anything.
+//
+// c.mu must be held.
+func (c *Config) render(existing []byte) ([]byte, error) {
+	if merged, ok := mergeConfig(existing, c.mergeSource()); ok {
+		return merged, nil
+	}
+	return c.encode()
+}
+
+// removeLine is what managedValues maps a key to when the file must stop stating
+// it. Distinct from "leave the line alone": a telemetry line reading false is
+// indistinguishable from an operator who answered no, and that difference is
+// exactly what the precedence rule turns on.
+const removeLine = "\x00remove"
+
+// tomlValue renders a Go value as the TOML scalar for one of the managed keys.
+func tomlValue(v interface{}) (string, bool) {
+	switch t := v.(type) {
+	case string:
+		return strconv.Quote(t), true
+	case *bool:
+		if t == nil {
+			return removeLine, true // unset: the file must stop stating this key
+		}
+		return strconv.FormatBool(*t), true
+	case bool:
+		// Distinct from *bool above: there, unset and false are different
+		// answers (telemetry consent). Here off is off.
+		return strconv.FormatBool(t), true
+	case []string:
+		// Always rendered, including as [], because clearing the second factor
+		// has to remove the previous codes rather than leave them in the file.
+		parts := make([]string, len(t))
+		for i, v := range t {
+			parts[i] = strconv.Quote(v)
+		}
+		return "[" + strings.Join(parts, ", ") + "]", true
+	default:
+		return "", false
+	}
+}
+
+// managedValues pairs each managed key with the value to write, skipping the
+// ones that are unset and therefore have nothing to say.
+func managedValues(cfg shared.WebConfig) map[string]string {
+	out := make(map[string]string, len(managedKeys))
+	for key, v := range map[string]interface{}{
+		"session_key":    cfg.SessionKey,
+		"username":       cfg.Username,
+		"password":       cfg.Password,
+		"telemetry":      cfg.Telemetry,
+		"totp_secret":    cfg.TOTPSecret,
+		"recovery_codes": cfg.RecoveryCodes,
+
+		"notify_kind":             cfg.NotifyKind,
+		"notify_url":              cfg.NotifyURL,
+		"notify_on_rolled_back":   cfg.NotifyOnRolledBack,
+		"notify_on_accepted":      cfg.NotifyOnAccepted,
+		"notify_on_panic":         cfg.NotifyOnPanic,
+		"notify_on_failed_logins": cfg.NotifyOnFailedLogins,
+	} {
+		if rendered, ok := tomlValue(v); ok {
+			out[key] = rendered
+		}
+	}
+	return out
+}
+
+// trailingComment returns whatever follows the value on an assignment line —
+// a note the operator wrote beside the setting, which has no business being
+// deleted because the value next to it changed.
+//
+// A quoted value is skipped to its closing quote first, so a "#" inside the
+// string is not mistaken for the start of a comment.
+func trailingComment(rest string) string {
+	i := 0
+	if strings.HasPrefix(rest, `"`) {
+		for i = 1; i < len(rest); i++ {
+			if rest[i] == '\\' {
+				i++
+				continue
+			}
+			if rest[i] == '"' {
+				i++
+				break
+			}
+		}
+	}
+	if hash := strings.Index(rest[min(i, len(rest)):], "#"); hash >= 0 {
+		return rest[min(i, len(rest))+hash-countSpacesBefore(rest, min(i, len(rest))+hash):]
+	}
+	return ""
+}
+
+// countSpacesBefore returns how many spaces or tabs immediately precede index i,
+// so the gap between the value and its comment is kept as it was written.
+func countSpacesBefore(s string, i int) int {
+	n := 0
+	for i-n-1 >= 0 && (s[i-n-1] == ' ' || s[i-n-1] == '\t') {
+		n++
+	}
+	return n
+}
+
+// keyLineRe matches an assignment to one of the managed keys, capturing the
+// indentation, the key, the spacing around "=" and anything trailing.
+var keyLineRe = regexp.MustCompile(`^(\s*)(session_key|username|password|telemetry|totp_secret|recovery_codes|` +
+	`notify_kind|notify_url|notify_on_rolled_back|notify_on_accepted|notify_on_panic|notify_on_failed_logins)(\s*=\s*)(.*)$`)
+
+// mergeConfig replaces the managed values inside the existing file text,
+// keeping every comment, blank line and alignment around them. It reports false
+// when it cannot be sure of the result, and the caller re-encodes instead.
+//
+// Only assignments above the first table header are considered: a key of the
+// same name inside [tls] is a different key, and rewriting it would move a value
+// into a section it does not belong to.
+//
+// What makes this safe enough to write credentials with is the last step. The
+// merged text is decoded again and compared against the configuration it was
+// supposed to express; any difference at all, and the whole attempt is thrown
+// away in favour of the encoder. There is no path on which a file this function
+// half understood reaches disk.
+func mergeConfig(existing []byte, cfg shared.WebConfig) ([]byte, bool) {
+	if len(bytes.TrimSpace(existing)) == 0 {
+		return nil, false
+	}
+
+	want := managedValues(cfg)
+	lines := strings.Split(string(existing), "\n")
+	seen := make(map[string]bool, len(want))
+	drop := make(map[int]bool)
+	inTable := false
+	lastTopLevel := -1
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "[") {
+			inTable = true
+			continue
+		}
+		if inTable {
+			continue
+		}
+		m := keyLineRe.FindStringSubmatch(line)
+		if m == nil {
+			if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				lastTopLevel = i
+			}
+			continue
+		}
+		key := m[2]
+		if seen[key] {
+			return nil, false // said twice; which one wins is not ours to decide
+		}
+		seen[key] = true
+		lastTopLevel = i
+		if value, ok := want[key]; ok {
+			if value == removeLine {
+				drop[i] = true
+				continue
+			}
+			lines[i] = m[1] + key + m[3] + value + trailingComment(m[4])
+		}
+	}
+
+	// A key the file never had is appended after the last top-level assignment,
+	// which keeps it out of whatever table follows.
+	var missing []string
+	for _, key := range managedKeys {
+		if value, ok := want[key]; ok && !seen[key] && value != removeLine {
+			missing = append(missing, key+" = "+value)
+		}
+	}
+	if len(missing) > 0 {
+		if lastTopLevel < 0 {
+			return nil, false
+		}
+		rest := append([]string(nil), lines[lastTopLevel+1:]...)
+		lines = append(lines[:lastTopLevel+1], append(missing, rest...)...)
+	}
+
+	// Safe against the splice above only because every dropped index is a
+	// top-level assignment line, and lastTopLevel is set to that same index
+	// immediately before drop[i] is (line ~781) — so every drop[i] is <=
+	// lastTopLevel, and missing keys are inserted strictly after it. No
+	// dropped index can move before this loop reads it.
+	if len(drop) > 0 {
+		kept := make([]string, 0, len(lines))
+		for i, line := range lines {
+			if !drop[i] {
+				kept = append(kept, line)
+			}
+		}
+		lines = kept
+	}
+	merged := []byte(strings.Join(lines, "\n"))
+
+	// The guard. Decode what we are about to write and insist it says exactly
+	// what the caller asked for.
+	var check shared.WebConfig
+	if _, err := toml.Decode(string(merged), &check); err != nil {
+		return nil, false
+	}
+	if !sameManagedValues(check, cfg) {
+		return nil, false
+	}
+	return merged, true
+}
+
+// sameManagedValues reports whether two configurations agree on every value
+// easywall writes.
+func sameManagedValues(a, b shared.WebConfig) bool {
+	if a.SessionKey != b.SessionKey || a.Username != b.Username || a.Password != b.Password {
+		return false
+	}
+	if a.TOTPSecret != b.TOTPSecret {
+		return false
+	}
+	if len(a.RecoveryCodes) != len(b.RecoveryCodes) {
+		return false
+	}
+	for i := range a.RecoveryCodes {
+		if a.RecoveryCodes[i] != b.RecoveryCodes[i] {
+			return false
+		}
+	}
+	if a.NotifyKind != b.NotifyKind || a.NotifyURL != b.NotifyURL {
+		return false
+	}
+	if a.NotifyOnRolledBack != b.NotifyOnRolledBack ||
+		a.NotifyOnAccepted != b.NotifyOnAccepted ||
+		a.NotifyOnPanic != b.NotifyOnPanic ||
+		a.NotifyOnFailedLogins != b.NotifyOnFailedLogins {
+		return false
+	}
+	switch {
+	case a.Telemetry == nil && b.Telemetry == nil:
+		return true
+	case a.Telemetry == nil || b.Telemetry == nil:
+		return false
+	default:
+		return *a.Telemetry == *b.Telemetry
+	}
+}
+
+// There is deliberately no WriteDefaultWebConfig here, for the same reason as
+// on the core side: config/web.toml is what the package installs, and a second
+// default in the binary only drifts from it.
+
+// generateSecret generates a cryptographically random hex string of byteLen bytes.
+func generateSecret(byteLen int) (string, error) {
+	b := make([]byte, byteLen)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
+}

@@ -1,0 +1,487 @@
+# Threat model, in detail
+
+The operator-facing version is [`docs/security.md`](../docs/security.md). This page
+holds the reasoning and the internals behind it — the parts that matter when
+changing the code, not when running it.
+
+The design follows from one decision: **the process reachable from the network
+holds no privilege worth stealing.** A flaw in form parsing or template rendering
+cannot reach the kernel, because the process holding that flaw has no kernel
+access to misuse.
+
+## Sessions
+
+| | |
+|---|---|
+| Cookie | `easywall`, signed with `session_key`, `HttpOnly` · `Secure` · `SameSite=Lax` |
+| Lifetime | `SessionLifetime` = 600 s after last use, in `internal/web/auth.go`. `RequireAuth` re-signs the cookie on every request that is not `backgroundRequest` (an htmx or `fetch` GET); `/apply/status` also renews while a window is pending |
+| Constructed by | `newSessionStore` — the **only** place a store is built |
+| Password change | every other session is refused at once |
+| Logout | `POST /logout` — that session's identifier is recorded as revoked |
+
+`newSessionStore` exists because getting this right is not obvious.
+`sessions.NewCookieStore` sets the codec's maximum age from its own default —
+thirty days — and **assigning a fresh `Options` struct afterwards does not change
+it.** Every call site did exactly that, so the browser dropped the cookie after ten
+minutes while the server kept accepting it for thirty days.
+
+The consequence was worse than the arithmetic. A logged-out session is remembered
+as revoked for one lifetime and then forgotten, on the stated ground that the
+cookie has expired by then. It had not: replaying the same cookie eleven minutes
+after signing out signed you straight back in to a firewall's administration
+interface, with nothing to see. Measured before the fix: `/dashboard` answered 200
+with a cookie 29 days old, and 200 again after the logout record had been swept.
+
+`store.MaxAge()` sets both halves. Write that, never `Options.MaxAge`.
+
+Renewal on use (2.25.1; before it, only a flash renewed, so a session browsed
+with GETs ended 600 s after sign-in) renews only a session `sessionUser`
+accepted — **when the request began**. That was offered here as proof that a
+revoked cookie is never re-signed, and it was not: a request in flight at the
+logout re-signed the session as its response started, same `user` and `sid`,
+age zero, alive one lifetime past the revocation record. The password and
+second-factor re-stamps and `/apply/status`'s renewal had the same gap.
+
+**That closed the cookie-age half and only that half**, and this page claimed the
+whole failure closed for three releases. The retention rests on a second
+assumption — that nothing refreshes a cookie the server has not authenticated —
+and three paths did: `setFlash`, `setFlashN` and `render` clearing a flash each
+saved the session the *request* presented, re-signing `user` and `sid` with the
+clock back at zero. A revoked cookie posted to `POST /login` with a deliberately
+wrong password came back working, and one such request every few minutes stays
+inside the login rate limit. No retention closes that, because the refresh
+resets the cookie's own age too.
+
+`sessionForWrite` in `sessionrevoke.go` drops `user` and `sid` before those
+three saves when the session's id is revoked. Reproduced against `fbac69f`, so it
+predates the branch.
+
+Both halves are now held in one place: the session store is `sessionStore`,
+whose `Save` strips a revoked `user` and `sid` under the revocation lock. A
+logout is therefore either before a save — which then signs nobody — or after
+it, and then the cookie's stamp is no later than the logout. **The invariant: no
+session is saved except through `sessionStore.Save`**, and the revocation record
+is kept `SessionLifetime + 1 s` (`revocationRetention`), because securecookie
+stamps whole seconds and accepts a cookie while `now − stamp ≤ SessionLifetime`.
+
+Signing out is a `POST` for a related reason. `CrossOriginProtection` checks the
+`Origin` and `Sec-Fetch-Site` headers of **unsafe methods only** — `GET`, `HEAD`
+and `OPTIONS` are exempt, because a safe method is not supposed to change
+anything. `/logout` was a `GET`, so it sat outside that protection entirely and
+any page the operator had open could end their session with an `<img>` tag.
+Measured before the change:
+
+```
+GET  /logout    Origin: https://evil.example, Sec-Fetch-Site: cross-site  → 303
+GET  /dashboard with the same cookie                                      → 303  (signed out)
+POST /settings  Origin: https://evil.example                              → 403
+```
+
+The rule that follows: **a route that changes state is never a `GET`**, however
+convenient a link would be. The sidebar control is a form styled as one.
+
+A session also carries `SessionCredentialKey`: a non-reversible fingerprint of the
+password hash it was issued under. There is nothing to revoke server-side in a
+signed cookie, so this is how "changing the password ends every other session"
+works — a session whose fingerprint no longer matches is refused.
+
+The revocation record is in memory. A restart inside the same ten minutes forgets
+it, which is stated on the operator page rather than hidden.
+
+## Two pieces of login state, two different decisions
+
+| | Where | Why not the other way |
+|---|---|---|
+| The login's intermediate state (`easywall_pending`) | a signed cookie, `Path=/login`, 180 s, 3 attempts | **Unauthenticated** requests create it. A server-side map any stranger can fill is memory any stranger occupies |
+| The enrolment's unconfirmed secret | an in-memory table keyed by session id, 10 minutes | Enrolment is **authenticated** and there is exactly one account, so the table never holds more than a handful. And `gorilla/sessions` with only a hash key **signs but does not encrypt** — a cookie value is readable plaintext, so an unconfirmed secret has no business in one |
+
+`sessionUser()` never reads the pending cookie, and cannot: it is not the session
+cookie. That is the structural version of the rule the redirect loop taught —
+see the comment above `sessionUser` in `middleware.go`.
+
+The pending store is built with `store.MaxAge(180)`, never `Options.MaxAge`.
+`newSessionStore`'s comment records what the other one cost: a logged-out cookie
+that stayed valid to the server for thirty days.
+
+## Passwords
+
+Argon2id, 64 MiB, 3 iterations, parallelism 4, a 16-byte salt per password.
+Minimum length 12, in one constant (`minPasswordLen`) because the interface also
+states the rule in words.
+
+There is no default password and no recovery path — no mail, no outside service.
+Editing `web.toml` on the host is the way back. A hash easywall cannot parse is
+refused with a log line rather than failing the login page silently, and the parser
+never puts anything it read into that line: ten constant `errHash*` values exist so
+that no attacker-influenced text reaches the journal, and `maxHashPart` bounds what
+is decoded.
+
+### Open question: was the deployed demo ever actually lockable?
+
+`POST /password` had no demo test anywhere in a handler until the credential-
+writing guard was added — `s.client.IsDemo()` now refuses every route that
+would call `SaveCredentials`, `SaveTOTP` or `SaveRecoveryCodes`. Before that
+fix, a visitor to the public demo submitting that form called `SaveCredentials`
+for real, which writes `web.toml`.
+
+Nobody who worked on this could reach the deployed demo host to find out
+whether its `web.toml` is actually writable by the process. Both answers are
+plausible and the difference matters for how bad the pre-existing bug was:
+
+| If `web.toml` was writable | If it was read-only |
+|---|---|
+| Any visitor could overwrite the published demo password and lock out everyone else, including whoever publishes it, until the process was restarted | `SaveCredentials` would have failed on the write and returned an error, which the handler would have shown as `internal_error` rather than "Changes saved." — a confusing page, not a lockout |
+| The bug was a real, exploitable denial of service | The bug was real code with no working path to harm, which is also why nobody reported a lockout that never happened |
+
+Left open. Whoever next has shell access to the demo host can settle it with
+`ls -l web.toml` and a permission bit; until then, treat the fix as necessary
+regardless of which answer turns out to be true — the code should not have
+depended on the deployment's file permissions to be safe.
+
+## The first run
+
+Before 2.22 whoever finished `/firstrun` first owned the firewall: the routes
+were public, the handler checked only `IsFirstRun`, and `SaveFirstRun`'s lock
+picked a winner, not a legitimate one. Of six projects read at pinned tags, only
+Jupyter (a token in the log) and Nextcloud (a file on disk) make the claimant
+prove host access; easywall now does the former.
+
+| | |
+|---|---|
+| Token | 160 bits from `newTOTPSecret()`, shown in fours (`formatTOTPSecret`) |
+| Made | in `NewServer`, only while `IsFirstRun()`; held in `Server.setupToken`. Never on disk, never in the environment |
+| Printed | once, `slog.Warn`, with the phrase `setup token` — the docs and CI grep for it |
+| Checked | at the top of `handleFirstRunPOST`, before `HashPassword`: `decodeTOTPSecret` on both sides, then `subtle.ConstantTimeCompare`. `PostFormValue`, so never from a query string |
+| Covers | confirm and recover as well: both need step 1's pending entry, which only a checked step 1 mints |
+| Never stashed | a refused submission keeps every answer except the passwords and the token — the session cookie is signed, not encrypted |
+| Why the web process | account creation is already the web process's alone; in the core it would need a protocol command and an authentication duty the core has none of |
+
+Checking before the hash also removed an unauthenticated 64 MiB Argon2id run
+per `POST /firstrun`. `TestFirstRunRefusesAMissingOrWrongSetupToken` counts the
+calls through `firstRunHash`.
+
+Not defended, one line each:
+- Anyone who can read the journal (`adm`, `systemd-journal`) or `docker logs` (the `docker` group — root-equivalent anyway) can claim.
+- A man in the middle on the first visit, against the self-signed certificate, sees the token as it is typed.
+
+## Why `X-Forwarded-For` is ignored
+
+`buildRouter` deliberately does **not** use `middleware.RealIP`:
+
+```go
+// easywall-web terminates TLS itself and isn't assumed to sit behind a trusted
+// reverse proxy, so X-Forwarded-For/X-Real-IP/True-Client-IP are
+// attacker-controlled. Trusting them would let a client spoof its IP and bypass
+// the per-IP login rate limiter.
+// See GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp, GHSA-9g5q-2w5x-hmxf.
+```
+
+`r.RemoteAddr` — the actual TCP peer — stays authoritative. This is the right
+default for a service that expects to be reached directly.
+
+It has a cost that the operator documentation now states: **behind a reverse
+proxy, every request appears to come from the proxy**, so the login limiter's five
+attempts per ten minutes are shared by everyone. One attacker exhausts the budget
+and nobody can sign in until it refills.
+
+2.13 made it configurable, and kept the condition this section set: `trusted_proxies`
+is **a list of addresses and networks**, never a boolean. A boolean that says
+"trust the header" is the vulnerability GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp
+and GHSA-9g5q-2w5x-hmxf describe, and no configuration of easywall can express
+one.
+
+Empty is the default and means what this section always meant: `r.RemoteAddr` is
+authoritative, no header's value is read.
+`TestTheEmptyListIsTwoPointTwelve` holds the two paths byte-identical.
+
+### What the list defends, and what being on it costs
+
+| | |
+|---|---|
+| Decided by | the TCP peer — the one field on a request nobody can write |
+| Read when the peer is on the list | `X-Forwarded-For`, and nothing else |
+| The client | the rightmost hop that is not itself on the list; the peer when there is none |
+| `via-proxy` | false only when the walk **named** a client |
+| The limiter | keys on the resolved client, so the shared budget above is gone for anyone who configures the list |
+
+`via-proxy` is true for an untrusted peer sending any of the four headers, same
+as before 2.13 — and true for a trusted peer too, whenever its header names
+nobody and the walk falls back to the peer as a stand-in.
+
+**Being on the list is total trust in that peer.** It chooses the address the
+audit log records, the address the blocked-traffic page refuses to blocklist,
+and the key the login limiter counts against. Not the apply screen's verdict:
+that reads `trusted_proxy`, *cannot tell*, because the client's SYN goes to the
+proxy's port — or to another host — and `webPort` is only where the proxy
+forwards. 2.13 computed it for `webPort` anyway and was wrong both ways. Two ways to give that away:
+
+- listing a proxy that is not actually in front of easywall;
+- listing a **network** wider than the proxies it holds — anything that can
+  reach the port from inside that range then picks its own identity.
+
+The rightmost-untrusted walk is what stops the smaller version of the same
+attack: a caller writing its proxy's own address into the header and being
+handed that identity. `TestIntegration_TheCallerCannotNameATrustedProxyAsItself`
+measures it against a real peer address, because a unit test sets `RemoteAddr`
+itself and that is the one field a real request does not get from its caller.
+
+A third way costs more than either: a trusted proxy that does **not** sanitise
+an incoming `X-Forwarded-For` — one that passes a client's own header through
+instead of appending to it — hands that client a fresh rate-limit bucket on
+every request it sends, by naming a different address each time. The walk
+named a client, so `proxied` reads false and nothing marks the request —
+unlike listing a non-proxy or an over-wide network, which at least tend to
+surface as `via-proxy` when the "proxy" sends no header of its own. Inherent
+to total trust in the peer, not a defect in the walk.
+
+### Presence, not value
+
+This subsection describes the **untrusted** branch only — the peer is not on
+`trusted_proxies`, so the header's value is never read, only whether it is
+there at all.
+
+2.10 reads whether `X-Forwarded-For`, `X-Real-IP`, `True-Client-IP` or `Forwarded`
+is **present**, and never what it says. That flag does two things: it marks a login
+in the audit log with `via-proxy`, and it moves the apply screen's lockout verdict
+to *cannot tell*, because the peer address is then the proxy's and no amount of
+rule evaluation fixes that.
+
+A client that forges one of those headers can therefore reach exactly one outcome:
+its own verdict becomes *cannot tell* and its own login line says `via-proxy`. It
+cannot insert an address, cannot change what `peerIP` recorded, and can move
+*its own* verdict to *cannot tell* and achieve nothing else — not anyone else's
+verdict, not anyone else's login line. That asymmetry is the whole argument for
+reading an untrusted header here, and it is why nothing else in the process does.
+
+### `/healthz` reads the peer, and `resolveClient` is not what it calls
+
+2.17 adds `GET /healthz`, the one route that answers without a session — an
+orchestrator holds none. What keeps it closed is `health_allow`, loopback by
+default, and it is matched against `peerIP` alone.
+
+`resolveClient` must not be used there, and the reason is the asymmetry above
+read in reverse. Everything that walk feeds is a *record* — the audit log's
+address, the lockout verdict, the rate-limit bucket — where believing a trusted
+proxy's header is the point. `health_allow` is a *decision about access*, and
+run through the walk, `X-Forwarded-For: 127.0.0.1` from anything behind a listed
+proxy would resolve to loopback and open the endpoint. The helper is one call
+away from `handleHealthz` and looks like the obvious thing to reuse, so the
+guard is a test rather than a comment: `TestHealthzIgnoresForwardingHeaders`
+asserts both directions — a forged loopback header from a remote peer stays 404,
+and a real loopback peer is not talked out of it by a header naming someone else.
+
+2.22 admits one more peer: the connection's own local address
+(`http.LocalAddrContextKey`). A completed handshake whose source is our own
+address is a process on this host, as trusted as loopback, and it is what
+`easywall-web -healthcheck` is on a specific bind — it dials from the target
+address so the kernel's source choice cannot change that. Not when the list is
+empty. `TestHealthzAdmitsItsOwnAddressAndNoOther` holds both edges.
+
+The rule is not scoped to loopback, and `health_allow` stops being the
+complete set of admitted peers once it is non-empty: any process on this
+host — including a same-host reverse proxy relaying a remote caller's
+traffic — reaches the bound address as its own peer and is admitted, whether
+or not it, or loopback, appears in the list. Only `health_allow = []` closes
+the endpoint to everyone on this host as well.
+
+404 and not 403, because not confirming the endpoint exists costs nothing when
+whoever is allowed gets the real answer. `degraded` answers 200: a `HEALTHCHECK`
+that restarted the container for it would restart a working firewall.
+
+**What the body carries is part of the gate.** `HealthResult` is a reduced type
+because this route is unauthenticated: no rule detail, no counter values, no
+finding text. The reduction was one field short until the 2.17 review — a live
+container answered `"kernel":"7.2.3-ogc3.1.fc44.x86_64"`, the host's exact
+release, to anyone on `health_allow`. `writeHealth` now drops it at the
+endpoint, so the field survives for the authenticated dashboard and leaves the
+unauthenticated reply. That matters because the documented `health_allow`
+examples widen the list to a monitoring subnet: an operator following them
+would otherwise publish the release a hardening guide exists to hide, to a
+whole /24, with no credential.
+
+## Rate limiting
+
+`LoginRateLimit`: a token bucket per resolved client, 5 tokens refilling one every
+10 minutes — at most 5 in any ten minutes, the number the second factor's bound of
+fifteen rests on. Until 2.25.1 it refilled one every 2 minutes: 9 rounds and 27
+code attempts in ten minutes, invisible to a test that never moved the clock.
+Buckets unused for 15 minutes are swept by a goroutine started once per
+process; longer than the window, so a sweep never hands out more than five.
+An IPv6 client is keyed by its /64 — a subscriber picks any address in it, and
+keyed per address 200 attempts from one /64 all passed. The price is the NAT
+one IPv4 always had: whoever shares the /64 shares the budget.
+
+The map holds at most 65,536 buckets (~12 MB). At the ceiling a new key is
+**refused**, never let in by evicting another. Random eviction was the first
+version, and cycling ten times the ceiling's worth of keys reset an exhausted
+budget every time (`TestFloodingTheLimiterDoesNotResetABudget`). Only the
+sweep frees a slot, every minute, and only a bucket that limits nobody: back to
+the full budget, or idle 15 minutes. The price: a source not yet tracked waits
+while 65,536 others are live.
+
+Each attempt that passes costs a 64 MiB Argon2id run. `argon2Slots` lets one run
+at a time; the rest wait as goroutines, not allocations: ten parallel attempts
+took the process to 668 MiB before, ~200 MB peak after (the Go heap holds about
+three runs' worth between collections). A sign-in waits at most
+`loginHashWait` (5 s) or until its client leaves, then gets `503`, so a flood
+leaves no backlog behind it. The price: during one, the operator's sign-in can
+be the `503`, and it has already spent a token. A cap is the only alternative to
+a flood that ends in the OOM killer.
+
+"Five in any ten minutes" means a half-open window: a sixth at exactly +600 s
+gets through, which is the next window.
+
+Only the login path is limited. The rest of the interface is behind
+authentication, and the protection modules in the firewall itself are what limit
+unauthenticated traffic — those are counted per source address in the kernel, in a
+set whose entries expire when a source goes quiet. Four of them held a single
+counter for the whole machine until 2.5.0, which meant the module meant to prevent
+a lockout produced one from a single attacker at negligible cost.
+
+## The one place a string reaches a command
+
+Everything typed reaches the kernel as a Go struct over netlink. Custom rules are
+the exception: the netlink library takes typed expressions, not text, so a raw
+nftables statement is applied by writing `add rule inet easywall input <rule>` into
+`nft -f -`.
+
+`nft` reads a newline and a semicolon as the end of one command and the start of
+the next, so a rule carrying either is a second command run by the root daemon —
+demonstrated against a real kernel, where an imported rule containing a newline
+wrote into a neighbouring table.
+
+Both characters are refused **on the shape of the input**, before anything is
+stored, on save, on import, and again inside the core. Deliberately not by parsing:
+the check must not depend on nft's grammar, on a subprocess being available, or on
+the syntax-check wrapper happening to be balanced. There is also a ceiling of 256
+statements per check.
+
+## Content Security Policy
+
+```
+default-src 'self'; script-src 'self' 'nonce-<per-request>'; style-src 'self';
+font-src 'self'; img-src 'self' data:; connect-src 'self'
+```
+
+No external origin at all: an administrative interface should not report a visit
+to anyone, and easywall often runs on hosts with no outbound route, where a
+third-party font request simply fails and leaves the typography broken.
+
+`style-src` has no `'unsafe-inline'`, which constrains contributions: assigning
+`element.style.*` from JavaScript, or letting a library inject a `<style>` block,
+is blocked. Scripts toggle a class.
+
+htmx was configured through a listener for an `htmx:config` event, which htmx does
+not emit. The listener never ran, so `allowEval` stayed `true` and the script nonce
+was never applied. It is configured through the `meta[name=htmx-config]` tag now —
+found by tightening `style-src`, which surfaced the inline `<style>` block htmx had
+been injecting unnoticed.
+
+## Why the rollback button exists and the panic banner has no control
+
+Two refusals that look alike and are not.
+
+| | Panic banner | Rollback button |
+|---|---|---|
+| Direction | would **re-arm** a firewall a human disarmed at the console | **restores** the last confirmed rule set |
+| What a stolen session gains | the ability to undo a deliberate teardown | nothing — waiting 120 seconds reaches the same state |
+| Therefore | no control on the network-facing side; `easywall-core resume` at the console | `POST /apply/rollback`, session-authenticated like every other write |
+
+"No control" is enforced at the socket, not only in the interface: the core
+answers `PANIC` and `RESUME` only to a peer whose kernel-reported uid is 0
+(`peerCred` in `internal/core/daemon.go`). Until 2.25.1 it took them from any
+client, and the socket's group is exactly what lets `easywall-web` in — so a
+compromised web process could have disarmed the firewall, and the audit log
+would have said `console`.
+
+The button grants no capability. It saves the wait. Anything that could reach it
+could reach the identical outcome by doing nothing, which is why this is not the
+panic button pointed the other way.
+
+## `data_dir` is root's
+
+| Directory | Written by | Mode since 2.22 |
+|---|---|---|
+| `/var/lib/easywall` | the core: `rules.json`, `last_apply`, `applied-config.json`, `usage.json`, `selftest.json`, `panic` | `root:easywall 0750` |
+| `/var/lib/easywall/web` | the web process: `passkeys.json`, `totp_replay.json`, `version_cache.json`, `telemetry.json` | `easywall:easywall 0700` |
+
+Until 2.22 both sets lived in one `root:easywall 0770` directory with no sticky
+bit. Write permission on a directory is permission to replace, unlink and create
+any name in it, whoever owns the file. So the web user could:
+
+- point `last_apply` at any file. `setLastApply` used `os.WriteFile`, which
+  follows a link, so the next accepted apply was a root write to that file;
+- replace `rules.json`, which the core restores at boot with no acceptance window;
+- create `panic`, which `PanicState` reads as panic mode engaged — and the core
+  then leaves the firewall alone.
+
+Three walls now, outside in:
+
+| Wall | Where | Covers |
+|---|---|---|
+| the mode | `debian/postinst`, `Dockerfile`, `docker/entrypoint.sh` | every layout the package or the image sets up. Both scripts also take an old layout apart: a link is removed unfollowed, the web's own files are copied in root's directory and renamed into `web/`, a `panic` not owned by root is removed, an entry that is not a regular file is removed, anything else not owned by root is replaced by a root-owned copy |
+| `ReadWritePaths=/var/lib/easywall/web` | `easywall-web.service` | a packaged host whatever the mode says: under `ProtectSystem=strict` the parent is read-only to the web process |
+| the core itself | `writeLastApply`, `readLastApply`, `dataDirIsShared` | a layout neither controls. Every data file is written by temporary file and rename, which replaces a link instead of following it; `last_apply` is read with `O_NOFOLLOW`; a group- or world-writable `data_dir`, or one the core does not own, is logged as an error at every start |
+
+The web process's own `prepareStateDir` copies its files from the old location
+rather than renaming them. Once `data_dir` is `0750` a rename fails, and a
+`passkeys.json` left behind reads as no passkeys: for a passkey-only account,
+the password alone.
+
+## What is not defended
+
+- A compromised root account. Root owns the core.
+- A kernel nftables vulnerability. That is below easywall.
+- A legitimate administrator writing a bad rule. The audit log records it; nothing
+  prevents it.
+- Anyone holding `session_key`. It signs the cookies, so it is a login. easywall
+  generates one on first start if the key is missing, too short, or still the
+  placeholder — that placeholder is published in this repository.
+- `CAP_NET_BIND_SERVICE` on the web process. 2.18 added it for ACME's port-80
+  listener, and a compromise there can now bind any free port below 1024 — 443,
+  or 22 if sshd is down — for squatting or phishing. It still opens no path to
+  netlink, so the two-process split holds in the same kind, just not the same
+  degree.
+- A stolen authenticator, exactly as much as a stolen phone with the
+  authenticator app already unlocked on it. A passkey narrows what a stolen
+  *password* buys — `/login/passkey/begin` and `/finish` both refuse without a
+  `pendingLogin` behind them, so the assertion alone opens nothing — but it does
+  not change what a stolen *second factor* buys, which was already true of a
+  code copied off an unlocked phone. What it does add: a challenge answers
+  once. `spendChallenge` in `passkeyreplay.go` remembers the spent ones, and
+  that is what refuses a captured assertion resent with its cookies — clearing
+  the ceremony cookie with `MaxAge: -1` instructs a browser and nobody else.
+  The signature counter is checked too, and one that did not advance is refused
+  (`passkey_clone_suspected`) rather than granted with the fact merely logged —
+  but it is no backstop for the replay: `go-webauthn`'s `UpdateCounter` exempts
+  `authDataCount == 0 && SignCount == 0`, which is what iCloud Keychain and most
+  platform passkeys report on *every* assertion, so for those the check has
+  never fired and cannot. TOTP has no equivalent tell either way.
+- What an attack before the upgrade already did to `data_dir`. postinst and the
+  entrypoint replace a replaced `rules.json` with a root-owned copy and name it
+  on stderr; they cannot tell it from yours. A manual install keeps its mode
+  until the operator runs the two commands in `installation/manual.md`, and the
+  core says so at every start until then.
+- What an own feed can reach. It is a GET from the web process's position:
+  `https://` to any host the web process can reach, LAN included, and `http://`
+  to any loopback port. A session holder reads back what fails to parse: five
+  lines of at most 80 bytes, 400 bytes a refresh. Its password is stored in plain
+  text in `<data_dir>/web/feed_fetch.json`, `easywall` 0600 — the web process has
+  to send it, so it cannot be hashed. Redirects and userinfo URLs are refused, so
+  the credentials go to the URL the operator typed and nowhere else. The row
+  shows only the host, but the edit form carries the full stored URL back into
+  the page for a signed-in session — path and query included, where a key may
+  sit (CrowdSec's integration id is one). The password is never written back.
+- What the country archive says (2.27, on by default). A hostile or broken
+  release on ipverse, or on either of the two hosts the download may be
+  redirected to, can name the wrong country on /blocked and on a *Block
+  country* button. That is the whole reach: the table is a label in the web
+  process, never a rule, and staging a country still goes through /apply's
+  verdict and window. The download is bounded — 8 MiB fetched, 64 MiB
+  unpacked, 2 MiB per country, 524 288 prefixes — and follows redirects only
+  to `github.com` and `release-assets.githubusercontent.com`, over HTTPS on
+  the default port with no user in the URL, three at most.
+- A descriptor the web process held open across the upgrade. It is stopped by
+  `prerm`, and every non-root file is replaced by a new root-owned inode, so
+  none survives a package upgrade. A host process running as uid 100 beside a
+  bind mount is outside this model.

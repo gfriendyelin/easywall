@@ -1,0 +1,506 @@
+package core
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// Why the reason a restore happened is a constant and not free text: it reaches
+// the audit log, the audit log is rendered through auditActionLabels in the web
+// process, and a detail string assembled at the call site is one refactor away
+// from carrying something that has no translation.
+const (
+	// RestoreReasonBoot is the daemon starting up.
+	RestoreReasonBoot = "daemon start"
+	// RestoreReasonResume is an operator ending panic mode.
+	RestoreReasonResume = "panic mode ended"
+	// RestoreReasonDockerBridge is a Docker bridge appearing after the boot
+	// restore has already run. The reason reaches the audit entry's detail and
+	// not its action, so a third constant costs nothing to register, colour or
+	// translate — and reusing RestoreReasonBoot told an operator that a restore
+	// at 09:14 happened at "daemon start".
+	RestoreReasonDockerBridge = "a docker bridge appeared"
+)
+
+// PanicEngaged reports whether this installation is deliberately unfiltered.
+func (f *Firewall) PanicEngaged() bool {
+	return PanicEngaged(f.cfg.PanicMarkerPath())
+}
+
+// RestoreCurrent puts the stored Current rule set back into the kernel, with no
+// acceptance window.
+//
+// The missing window looks like a breach of easywall's central promise and is
+// not one. Current is a rule set that has already survived an acceptance
+// window: it got there through PromoteStaged, which runs only inside an apply,
+// and an apply that was not confirmed rolls Current back. Restoring it changes
+// nothing about the machine's intended state. Refusing to restore it is what
+// changes something.
+//
+// That used to be stated as "by definition", and it was false for one case: a
+// core that died inside the window never rolled Current back, so this function
+// enforced the unconfirmed set permanently. The unconfirmed marker is what now
+// makes the claim true — revertUnconfirmed below puts Backup back first
+// whenever the previous run left a window open.
+//
+// A window here could not work even if it were wanted. Nobody is present at boot
+// to confirm, so it would expire; the rollback would install `backup`, which
+// nobody confirmed either; and there is no second window to catch that. A loop
+// with no exit.
+//
+// Before this existed, nftables was simply empty after a reboot and the machine
+// stayed unfiltered until somebody opened the interface and pressed Apply. The
+// dashboard reported it correctly — Status asks the kernel — but only to
+// somebody who was looking.
+// restoreSlotWait is how long RestoreCurrent waits for the apply slot: a feed
+// refresh holds it well under a second. A var so the tests can shorten it.
+var restoreSlotWait = 5 * time.Second
+
+// waitForApplySlot claims the apply slot, trying again every 50 ms until d has
+// passed.
+func (f *Firewall) waitForApplySlot(d time.Duration) bool {
+	deadline := time.Now().Add(d)
+	for !f.beginApply() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
+func (f *Firewall) RestoreCurrent(reason string) error {
+	if f.PanicEngaged() {
+		slog.Warn("panic mode is engaged, so the stored rules are not being restored; "+
+			"this machine is deliberately unfiltered — run `easywall-core resume` to end it",
+			"reason", reason)
+		return nil
+	}
+
+	// The same slot an apply takes, so a restore and an apply can never both be
+	// writing table inet easywall. At boot nothing competes; RESUME can arrive at
+	// any time.
+	//
+	// A feed refresh takes it too, for under a second (final review I1): the
+	// restore waits restoreSlotWait for it rather than failing on it, which after
+	// a reboot left the Docker reconciler's one attempt refused and containers
+	// unreachable. An apply's acceptance window holds it for minutes, so the
+	// wait still ends in ErrApplyInProgress there, as before.
+	if !f.waitForApplySlot(restoreSlotWait) {
+		return ErrApplyInProgress
+	}
+	defer f.endApply()
+	// The wait is long enough for a console `panic` to land in it.
+	if f.PanicEngaged() {
+		return nil
+	}
+
+	// A window the previous run of the core never closed: Current holds a set
+	// nobody confirmed, so it goes back to Backup before anything is restored.
+	// See unconfirmed.go. Refusing on an error, rather than restoring, because
+	// what would be restored is exactly the set that may have locked the
+	// operator out.
+	before, reverted, err := f.revertUnconfirmed()
+	if err != nil {
+		WriteAuditLog(f.cfg.AuditLogPath(), "boot_enforce_failed", "all",
+			fmt.Sprintf("%s: %s", reason, err.Error()), "core")
+		return err
+	}
+
+	state, err := f.rules.GetState()
+	if err != nil {
+		// The audit log is what the operator looks at when the interface says
+		// the firewall is off; a failure that only reaches the journal is invisible.
+		WriteAuditLog(f.cfg.AuditLogPath(), "boot_enforce_failed", "all",
+			fmt.Sprintf("%s: %s", reason, err.Error()), "core")
+		return fmt.Errorf("get rules: %w", err)
+	}
+
+	// Nothing has ever been applied here, so there is nothing to put back.
+	//
+	// RestoreCurrent's contract above rests on Current being "a rule set that has
+	// already survived an acceptance window". On a host that has never been
+	// configured that is not true: RulesStore initialises rules.json with
+	// emptyState(), and enforcing an empty set means an input chain at policy
+	// drop with no port open at all — SSH closed, and the web interface that
+	// would have opened it closed with it. The first-run wizard cannot be
+	// reached to fix it, because it is behind the door it exists to unlock.
+	//
+	// That is not theoretical. `docker compose up -d` and `dpkg -i` both start
+	// the core before the operator can open a single port, and a report of a VPS
+	// cut off "immediately after docker compose up -d" is what found it. It went
+	// unseen because the documented first step is to open https://localhost:12227,
+	// and loopback is accepted.
+	//
+	// So the machine is left exactly as it was one second before easywall was
+	// installed, and filtering starts at the first deliberate apply — which has
+	// the acceptance window to undo it, where one is configured.
+	// applyFirstRunChoices already reasons this way in as many words: rules
+	// are staged, never applied, because "the first run is the worst moment
+	// to make an exception".
+	if !f.everConfigured(state) {
+		WriteAuditLog(f.cfg.AuditLogPath(), "boot_not_configured", "all", reason, "core")
+		// The first half is true either way; the undo is only promised where
+		// one exists. With acceptance.enabled false this sentence told a host
+		// it had a window to undo its first apply with, at every start, for two
+		// days, and it never had one.
+		msg := "nothing has ever been applied on this installation, so this machine " +
+			"is not filtering: the stored rule set is empty, and enforcing an empty set " +
+			"at policy drop would close SSH and the web interface with it. Open the web " +
+			"interface and finish the first run — the first apply is what starts filtering"
+		if f.cfg.SystemSettings().Acceptance.Enabled {
+			msg += ", and it has the acceptance window to undo it"
+		}
+		slog.Warn(msg, "reason", reason)
+		return nil
+	}
+
+	// What this apply is about to bake in, so reconcileDockerBridges can tell
+	// "no bridges yet" from "no bridges at all". Guarded, not a plain field
+	// write, because reconcileDockerBridges reads the same field from the
+	// goroutine Daemon.Start launches.
+	//
+	// This started as hardening ahead of Resume being wired up and is now load
+	// bearing: daemon.go's CmdResume case calls Firewall.Resume, which calls this
+	// function, so a RESUME arriving while the reconciler is still polling really
+	// does put this write and that read in two goroutines at once. Start's own
+	// boot restore remains sequential — it finishes before the reconciler is
+	// launched — but it is no longer the only caller.
+	f.setBootBridges(detectDockerBridges())
+
+	// The counters, before the write below flushes them. A restore is not only a
+	// boot: RESUME reaches here, and so does the Docker-bridge reconciler on a
+	// machine that has been up and filtering for weeks. At boot there is usually
+	// nothing to book — the table was not there — and on those other two paths
+	// there is everything since the last tick.
+	f.collectUsageBeforeWrite()
+
+	opts, nets := f.cfg.FirewallOptions(), f.cfg.NetworkSettings()
+	if reverted {
+		// The configuration in force before the apply that was never confirmed,
+		// not f.cfg, which already holds the options that apply was trying out.
+		// This used to rebuild the reverted rules with those options — a restart
+		// inside the window kept ipv6.mode=block live after reverting the rules.
+		// See configToRestore.
+		opts, nets = f.configToRestore(before)
+	} else if applied := f.appliedConfig(); applied.Recorded {
+		// What was applied, not what was saved since. A restore is a boot, a
+		// RESUME or the Docker reconciler — none of them an apply, and none with
+		// an acceptance window — yet it used to read f.cfg, so an option saved
+		// on /options and never applied went live at the next one. The saved
+		// value stays configured and /apply shows it as pending, like a staged
+		// rule edit. An installation with no record yet keeps f.cfg: there is
+		// nothing else to enforce.
+		opts, nets = applied.Config.Firewall, applied.Config.Network
+	}
+	if err := f.nft.ApplyWithFeeds(state, opts, nets, f.feedContents(state.Current)); err != nil {
+		// Recorded, not just returned. This is the line an operator needs when
+		// the machine came up unfiltered and nobody can say why.
+		WriteAuditLog(f.cfg.AuditLogPath(), "boot_enforce_failed", "all",
+			fmt.Sprintf("%s: %s", reason, err.Error()), "core")
+		// The marker on the failure path too, and it is not belt-and-braces.
+		// nft.Apply returns an error from two places *after* the ruleset has
+		// been committed — the custom-rules subprocess and the final-log flush
+		// — so "the restore failed" and "there are live rules in the kernel"
+		// are not mutually exclusive. A panic landing in that window would
+		// otherwise leave the marker on disk, the machine filtering, and no
+		// teardown anywhere: exactly the defect the success path below was
+		// written to close.
+		f.panicLandedDuringWrite(
+			f.PanicEngaged(),
+			"boot_enforce_failed",
+			fmt.Sprintf("%s: panic mode was engaged while a failing restore was writing, "+
+				"and rules can reach the kernel before nft.Apply reports an error", reason),
+			"core",
+		)
+		return fmt.Errorf("restore rules: %w", err)
+	}
+
+	// The table has been rebuilt, so every baseline in usage.json describes
+	// counters that are no longer in the kernel. Same call and placement as
+	// apply's — see resetUsageBaselines, and Amendment A4 in the 2.15 plan for
+	// why it is after the call rather than between the collect and the call —
+	// but not the same coverage. apply's error branch always has rollback to
+	// fall through to, and rollback resets the baselines as its own last step.
+	// This function's error branch above has no such fallback: it returns
+	// straight after panicLandedDuringWrite, so a post-commit nft.Apply failure
+	// here leaves a rebuilt table with every baseline still describing the
+	// counters that used to be in it.
+	//
+	// Left uncovered rather than mirrored, because there is nothing to fall
+	// back to: RestoreCurrent only ever writes what is already stored, so a
+	// failed write has no second state for a rollback to restore instead. What
+	// this costs is bounded — Collect's below-baseline branch (see usage.go)
+	// catches most of it on its own, and what slips past is a one-time
+	// mis-booking of Packets and Bytes on a rule whose kernel counter climbs
+	// past the stale baseline before the next collect. Accepted rather than
+	// fixed: RuleUsage's own doc comment and handler_dashboard.go's
+	// unusedForThirtyDays both read LastSeen and nothing else, so nothing wrong
+	// reaches a screen.
+	f.resetUsageBaselines()
+
+	// The marker again, now that the rules are actually in the kernel. The check
+	// at the top of this function was made before two file reads and a netlink
+	// write; `panic` can have landed in between, from the console, in the very
+	// window where this daemon has no socket for it to reach — see
+	// panicLandedDuringWrite.
+	if f.panicLandedDuringWrite(
+		f.PanicEngaged(),
+		"boot_enforce_failed",
+		fmt.Sprintf("%s: panic mode was engaged while the rules were being restored", reason),
+		"core",
+	) {
+		// Not an error: the machine is in the state the console asked for. The
+		// caller logs a failure and tells the operator to apply, which is the
+		// wrong advice for a deliberately unfiltered machine.
+		return nil
+	}
+
+	// Also what establishes the file on an installation upgrading to 2.10: the
+	// first daemon start restores, so the snapshot exists after the upgrade's
+	// service restart. opts and nets are what nft.Apply above was actually
+	// given, not a fresh read taken after it returned.
+	f.recordAppliedConfig(opts, nets)
+
+	WriteAuditLog(f.cfg.AuditLogPath(), "boot_enforced", "all", reason, "core")
+	slog.Info("the stored rules are in force again", "reason", reason)
+	return nil
+}
+
+// everConfigured reports whether this installation has ever had a rule set put
+// into the kernel on purpose.
+//
+// Two signals, because neither alone covers every installation:
+//
+//   - A non-empty Current. Somebody wrote rules and applied them; only
+//     PromoteStaged puts anything there, and only an apply runs it.
+//   - A last-apply marker on disk. This is what keeps an operator who
+//     deliberately applied an *empty* rule set — which is their choice, made
+//     through an acceptance window that let them undo it — enforcing that empty
+//     set across a reboot. It also covers an installation upgrading from a
+//     release before this check existed, where Current may legitimately be empty
+//     and the machine has been filtering for months.
+//
+// The failure mode to avoid is the second one reading false on a configured
+// host: that would quietly stop enforcing rules somebody wrote. Both signals
+// therefore say "configured", and only their absence together says otherwise.
+func (f *Firewall) everConfigured(state shared.RulesState) bool {
+	if !state.Current.IsEmpty() {
+		return true
+	}
+	f.lastApplyMu.Lock()
+	defer f.lastApplyMu.Unlock()
+	return !f.lastApply.IsZero()
+}
+
+// panicLandedDuringWrite tears the table down again when panic mode was engaged
+// while a write to the kernel was in flight, and reports whether it did. Call it
+// immediately after nft.Apply returns; requested and situation are what to
+// record.
+//
+// engaged is what the *caller* read, and the helper does not look again. Three
+// stats of one marker in a single rollback is three chances for them to
+// disagree: the gate reads PanicState — which distinguishes "not engaged" from
+// "cannot tell", because withdrawing the acceptance window's undo on a
+// permission fault is the worse failure — and the helper then used PanicEngaged,
+// which answers "cannot tell" with "engaged". A marker that became unreadable
+// between the two put the inversion straight back, one statement further on.
+//
+// Callers that have not already looked pass f.PanicEngaged() at the call site,
+// which keeps that fail-safe default exactly where it belongs: at a write that
+// is about to start filtering.
+//
+// Every other panic check in this package runs *before* a write and none ran
+// after one, under a comment in cmd/easywall-core/subcommands.go asserting that
+// "every daemon-side writer of the table checks it first" made a direct teardown
+// survivable. Checking first is necessary and it is not sufficient, for two
+// separate reasons.
+//
+// In-process, the gap is not small. Between apply's marker check and its
+// nft.Apply sit two reads of the rules file, two atomic rewrites and a full
+// Snapshot() — netlink list calls plus a file write. On the Raspberry Pi class
+// of machine this product is written for that is tens to hundreds of
+// milliseconds, not microseconds, and a `panic` at the console lands inside it
+// often enough to matter.
+//
+// Cross-process, no mutex can help. `easywall-core panic` falls back to tearing
+// the table down itself whenever the socket refuses, and there are two windows
+// where a live daemon writes the kernel with no socket present: startup, because
+// the boot restore deliberately runs before net.Listen, and shutdown, because
+// Stop closes and unlinks the listener before CancelAcceptance() and wg.Wait().
+// If the daemon's Flush lands after the CLI's teardown, the machine is filtering
+// with the marker on disk — and every surface says the opposite, because
+// runStatus tests status.Panic before status.Active and the web banner reads the
+// same flag. That is the migration scenario exactly: somebody upgrading from
+// 2.6, who reboots to escape their own rules, finds the rules restored, and
+// reaches for `panic` while the machine is coming up.
+//
+// It also removes an audit-log lie. A panic landing mid-restore used to log
+// panic_engaged and then boot_enforced — "the stored rules are in force again"
+// as the last word on an unfiltered machine.
+// The caller passes the *situation* — what was being written when the marker
+// turned up — and this function appends what came of it. Neither half asserts an
+// outcome it did not observe: Reset() can fail, and a detail reading "the table
+// was taken down again" on a machine that is still filtering would be the same
+// class of untrue sentence this release has spent a fortnight removing from
+// comments.
+//
+// requested is the action to record if the teardown works. If it does not, the
+// entry is written as boot_enforce_failed instead, whatever the caller asked for.
+// A failed teardown leaves the machine filtering while the marker, the banner and
+// `easywall-core status` all report panic mode, which is the worst state in this
+// release — and it is the same state boot_enforce_failed already describes on the
+// restore path, where it is coloured crit. The alternative was one machine state
+// rendered in two colours depending on which code path reached it. No new action,
+// so nothing to register, translate or re-screenshot.
+func (f *Firewall) panicLandedDuringWrite(engaged bool, requested, situation, user string) bool {
+	if !engaged {
+		return false
+	}
+	// The counters, before the teardown below deletes the table they live in.
+	//
+	// No matching baseline reset, and that is not an oversight: Reset deletes the
+	// table without rebuilding one, so there is nothing for a baseline to
+	// describe. RuleCounters answers a missing table with an empty map and a nil
+	// error, so every later collect books nothing and leaves the stored baselines
+	// exactly as this call left them — correct, because they describe the last
+	// table that existed. Whichever write brings a table back — an apply, or the
+	// RestoreCurrent a `resume` runs — resets them itself as its own last step.
+	f.collectUsageBeforeWrite()
+
+	action, detail := requested, situation
+	if err := f.nft.Reset(); err != nil {
+		slog.Error("panic mode was engaged while the rules were being written and the "+
+			"table could not be torn down again; this machine may be filtering while "+
+			"panic mode is recorded — run `nft delete table inet easywall`",
+			"error", err)
+		action = "boot_enforce_failed"
+		detail += "; the table could not be torn down (" + err.Error() + "), so this " +
+			"machine may still be filtering while panic mode is recorded"
+	} else {
+		detail += "; the table was taken down again"
+	}
+	WriteAuditLog(f.cfg.AuditLogPath(), action, "all", detail, user)
+	slog.Warn("panic mode was engaged while the rules were being written",
+		"outcome", detail)
+	return true
+}
+
+// Panic tears the firewall down and records that it was done on purpose.
+//
+// The order is the whole design. The marker is written first and the table torn
+// down second, because the failure that matters is the one where the operator
+// runs this, believes it worked, reboots, and meets the rules that made them run
+// it. A marker without a teardown leaves a machine that is still filtered and
+// says so; a teardown without a marker leaves a machine that filters again at
+// the next restart, silently.
+//
+// The same order also settles a race this function used to lose. An apply can
+// be sitting in its acceptance window when this runs, blocked in Wait() on
+// another goroutine. Cancelling that window does not stop its rollback —
+// cancelling is what *starts* it: Wait() sees the cancel and returns false,
+// and the caller runs rollback() as if the window had simply timed out. What
+// stops that rollback from flushing the previous rules back into the kernel
+// on top of the teardown below is Firewall.rollback refusing to act once the
+// marker is set. For that guard to be reliable, the marker has to already be
+// on disk by the time the cancel below can wake anything up — which is why
+// EngagePanic and the audit entry that follows come first, and
+// CancelAcceptance comes after them, never before.
+func (f *Firewall) Panic(user string) error {
+	f.panicMu.Lock()
+	defer f.panicMu.Unlock()
+
+	if err := EngagePanic(f.cfg.PanicMarkerPath()); err != nil {
+		return fmt.Errorf("engage panic mode: %w", err)
+	}
+	WriteAuditLog(f.cfg.AuditLogPath(), "panic_engaged", "all",
+		"the firewall was taken down from the console", user)
+
+	// Now that the marker rollback checks for is in place, ending an open
+	// window is safe: whatever goroutine Wait() wakes up will find
+	// PanicEngaged() true and refuse to touch the rules. Not cancelling here
+	// would instead leave that window running for up to an hour, after which
+	// the very rollback this ordering protects against would still run — just
+	// late.
+	f.CancelAcceptance()
+
+	// The counters, before the teardown deletes the table. An operator who
+	// panics, fixes the rule that locked them out and resumes should not find
+	// that the machine forgot which ports were in use in between — that history
+	// is part of what they need in order to decide.
+	//
+	// No baseline reset after it, for the reason spelled out in
+	// panicLandedDuringWrite: a deleted table is not a rebuilt one, and the write
+	// that brings a table back resets the baselines itself.
+	//
+	// Safe under panicMu, which this function holds. The collect takes the nft
+	// mutex (RuleCounters), the rules-store mutex and the usage mutex, in that
+	// order, and none of the three is ever held by anything that then waits for
+	// panicMu — nft.Apply releases its own mutex before returning, and no caller
+	// of RulesStore or UsageStore takes panicMu at all.
+	f.collectUsageBeforeWrite()
+
+	if err := f.nft.Reset(); err != nil {
+		slog.Error("panic mode is recorded but the table could not be torn down; "+
+			"the machine may still be filtering", "error", err)
+		return fmt.Errorf("tear down the table: %w", err)
+	}
+
+	slog.Warn("panic mode: this machine is now unfiltered", "user", user)
+	return nil
+}
+
+// Resume ends panic mode and puts the stored rules back, and reports which of
+// the two it actually did.
+//
+// The marker is cleared before the restore is attempted, so a restore that fails
+// does not leave a machine that is unfiltered *and* claims to be in panic mode —
+// two different problems reported as one.
+//
+// It used to report neither: a RESUME with nothing engaged still audited
+// "panic mode was ended" (and the web process turns that line into a
+// Panic-mode-ended notification), and the console printed "the stored rules are
+// back in force" on an installation where RestoreCurrent writes nothing because
+// nothing was ever applied.
+func (f *Firewall) Resume(user string) (shared.ResumeResult, error) {
+	f.panicMu.Lock()
+	defer f.panicMu.Unlock()
+
+	// Unreadable counts as engaged: the clear below is attempted either way, and
+	// an audit line too many is the better error than one missing.
+	engaged, known, _ := PanicState(f.cfg.PanicMarkerPath())
+	res := shared.ResumeResult{WasEngaged: engaged || !known}
+
+	if err := ClearPanic(f.cfg.PanicMarkerPath()); err != nil {
+		return res, fmt.Errorf("end panic mode: %w", err)
+	}
+	if res.WasEngaged {
+		WriteAuditLog(f.cfg.AuditLogPath(), "panic_resumed", "all",
+			"panic mode was ended from the console", user)
+	}
+
+	// RestoreCurrent returns nil without writing on a host never configured;
+	// that is the case Restored has to tell apart.
+	state, stateErr := f.rules.GetState()
+	configured := stateErr == nil && f.everConfigured(state)
+
+	err := f.RestoreCurrent(RestoreReasonResume)
+	if errors.Is(err, ErrApplyInProgress) {
+		// RestoreCurrent takes the same slot an apply does and refuses rather
+		// than wait for it, which is correct — but until now that refusal
+		// wrote nothing here. The operator was left with a log that said
+		// panic mode had ended and no line anywhere saying the rules it was
+		// supposed to bring back never arrived: the marker was gone, an apply
+		// still held the slot, and the machine stayed unfiltered with nothing
+		// on record to explain why.
+		WriteAuditLog(f.cfg.AuditLogPath(), "resume_restore_skipped", "all",
+			"an apply held the slot; the stored rules were not restored — resume again once it finishes",
+			user)
+	}
+	res.Restored = err == nil && configured
+	return res, err
+}

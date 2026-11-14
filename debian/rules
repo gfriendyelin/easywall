@@ -1,0 +1,108 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export CGO_ENABLED = 0
+export GOFLAGS = -mod=readonly
+
+VERSION := $(shell dpkg-parsechangelog --show-field Version)
+LDFLAGS := -s -w -X github.com/jp1337/easywall/internal/shared.CurrentVersion=$(VERSION)
+
+%:
+	dh $@
+
+# Built into bin/ and installed below, rather than written straight into
+# debian/easywall.
+#
+# dh_prep runs between these two targets, and emptying debian/easywall is its
+# entire job — so everything the build wrote there was deleted before the
+# package was assembled. "Binaries already placed by build step", this file
+# said, and the .deb that came out held the units, the assets and the config
+# and not one executable.
+#
+# Nothing noticed for as long as the package has existed: CI built the .deb and
+# uploaded it without ever installing it. A downloaded artefact from a green run
+# on main has no /usr/sbin entry at all, and on a host that installed it systemd
+# answers status=203/EXEC — cannot execute — every five seconds, for ever.
+override_dh_auto_build:
+	go build -ldflags "$(LDFLAGS)" -o bin/easywall-core ./cmd/easywall-core
+	go build -ldflags "$(LDFLAGS)" -o bin/easywall-web  ./cmd/easywall-web
+
+override_dh_auto_install:
+	# The two binaries this package exists to deliver
+	install -d debian/easywall/usr/sbin
+	install -m 0755 bin/easywall-core debian/easywall/usr/sbin/easywall-core
+	install -m 0755 bin/easywall-web  debian/easywall/usr/sbin/easywall-web
+	# Assets
+	install -d debian/easywall/usr/share/easywall
+	cp -r web locales debian/easywall/usr/share/easywall/
+	# Config templates. Neither is installed under its real name, so neither is a
+	# dpkg conffile — because easywall rewrites both of them: the settings pages
+	# write easywall.toml through the core, and the wizard and the password page
+	# write web.toml.
+	#
+	# easywall.toml *was* shipped directly, and dpkg therefore tracked a file a
+	# script rewrites. Any host where a setting had ever been saved had a
+	# "modified" conffile, and an upgrade whose shipped default also changed —
+	# which has happened, config/easywall.toml carried the obsolete ipv6.enabled
+	# for a release — asked about it. Measured in a debian:trixie container,
+	# upgrading 2.5.1 to 2.5.2 with `apt-get install -y`:
+	#
+	#   Configuration file '/etc/easywall/easywall.toml'
+	#    ==> Modified (by you or by a script) since installation.
+	#    end of file on stdin at conffile prompt
+	#   dpkg-query: install ok unpacked 2.5.2
+	#
+	# "unpacked", not "installed": the prompt got EOF, dpkg stopped, and postinst
+	# never ran — so on a real host the new binaries were on disk and the
+	# services were never restarted. Unattended upgrades take that path unless
+	# they also pass --force-confold, which is not something a package may assume.
+	#
+	# 0644, which is what ships: dh_fixperms resets 0640 to it, and the 0640
+	# this said before was never in a package. Nothing in them is secret — the
+	# session key is a placeholder postinst replaces — and /etc/easywall is
+	# 0750 root:easywall, so nobody else reaches them anyway.
+	install -d debian/easywall/etc/easywall
+	install -m 0644 config/easywall.toml debian/easywall/etc/easywall/easywall.toml.template
+	install -m 0644 config/web.toml      debian/easywall/etc/easywall/web.toml.template
+	# systemd units. All three of them: easywall-selftest.service is new in 2.17
+	# and is the one place CAP_SYS_ADMIN is granted, so a package that ships the
+	# other two and not this one boots a core that records "unprovable" for ever
+	# and reads as a firewall whose proof simply never runs.
+	# TestEveryUnitIsInstalledAndManaged walks systemd/*.service against this
+	# file, debian/postinst, debian/prerm and the Makefile, because a unit
+	# missing from any one of the four is silent.
+	install -d debian/easywall/lib/systemd/system
+	install -m 0644 systemd/easywall-core.service     debian/easywall/lib/systemd/system/
+	install -m 0644 systemd/easywall-web.service      debian/easywall/lib/systemd/system/
+	install -m 0644 systemd/easywall-selftest.service debian/easywall/lib/systemd/system/
+	# logrotate
+	install -d debian/easywall/etc/logrotate.d
+	install -m 0644 debian/easywall.logrotate debian/easywall/etc/logrotate.d/easywall
+	# Man page. The console subcommands added in 2.7 replace an escape route
+	# that used to be "reboot", and a command an operator cannot look up on the
+	# machine is half a replacement.
+	install -d debian/easywall/usr/share/man/man1
+	install -m 0644 debian/easywall-core.1 debian/easywall/usr/share/man/man1/easywall-core.1
+
+# Enabling, starting and stopping the units, written into the maintainer
+# scripts by debhelper. deb-systemd-helper remembers a unit the administrator
+# disabled, and the postinst snippets also run on abort-upgrade, so a failed
+# upgrade starts the old version's services again; the hand-written systemctl
+# lines this replaces did neither — see debian/postinst.
+#
+# --no-restart-after-upgrade stops core and web in the new preinst, before its
+# files are unpacked, and starts them in postinst: postinst takes an old data
+# directory apart and needs both stopped while it does. prerm stops them on
+# remove. The self-test unit is enabled and never started here — see
+# debian/postinst for why.
+# TestEveryUnitIsInstalledAndManaged holds every systemd/*.service to one of
+# these two lines.
+override_dh_installsystemd:
+	dh_installsystemd --no-start easywall-selftest.service
+	dh_installsystemd --no-restart-after-upgrade easywall-core.service easywall-web.service
+
+override_dh_auto_test:
+	go test ./cmd/... ./internal/...
+
+override_dh_auto_clean:
+	rm -rf bin

@@ -1,0 +1,1012 @@
+package core
+
+import (
+	"encoding/json"
+	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// auditEntries returns every entry in the test config's audit log, in the order
+// it was written.
+func auditEntries(t *testing.T, cfg *Config) []shared.AuditLogEntry {
+	t.Helper()
+	data, err := os.ReadFile(cfg.AuditLogPath())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	var entries []shared.AuditLogEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e shared.AuditLogEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("audit line is not JSON: %q", line)
+		}
+		entries = append(entries, e)
+	}
+	return entries
+}
+
+// auditActions returns the action of every entry in the test config's audit log.
+func auditActions(t *testing.T, cfg *Config) []string {
+	t.Helper()
+	var actions []string
+	for _, e := range auditEntries(t, cfg) {
+		actions = append(actions, e.Action)
+	}
+	return actions
+}
+
+// Panic mode is the whole point of the marker: a restore must not undo it.
+func TestRestoreCurrent_SkipsWhenPanicIsEngaged(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+
+	if err := fw.RestoreCurrent(RestoreReasonBoot); err != nil {
+		t.Errorf("a restore under panic mode must succeed by doing nothing, got %v", err)
+	}
+	if got := auditActions(t, cfg); len(got) != 0 {
+		t.Errorf("a skipped restore must write no audit entry, got %v", got)
+	}
+}
+
+// Without the marker the restore reaches nftables. The test firewall has a nil
+// netlink connection, so it gets as far as Reset and fails there — which is the
+// evidence that it tried, and the evidence that the failure is recorded rather
+// than swallowed.
+func TestRestoreCurrent_AttemptsAndRecordsFailure(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	// The restore reaches nftables only on a host that has been configured;
+	// an installation where nothing was ever applied is left alone instead.
+	// See TestRestoreCurrent_DoesNotEnforceAnInstallationNobodyConfigured.
+	configureTestFirewall(t, fw)
+
+	err := fw.RestoreCurrent(RestoreReasonBoot)
+	if err == nil {
+		t.Fatal("with no netlink connection the restore must report a failure")
+	}
+	if !strings.Contains(err.Error(), "nftables connection not available") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	got := auditActions(t, cfg)
+	if len(got) != 1 || got[0] != "boot_enforce_failed" {
+		t.Errorf("want exactly one boot_enforce_failed entry, got %v", got)
+	}
+}
+
+// The load-bearing assertion of the release. A restore must never open an
+// acceptance window: nobody is present at boot to confirm it, so a window would
+// expire, roll back to `backup`, and leave a set nobody confirmed either.
+func TestRestoreCurrent_NeverOpensAnAcceptanceWindow(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.Acceptance.Enabled = true
+	cfg.Acceptance.Duration = 3600
+	fw := newTestFirewall(t, cfg)
+
+	_ = fw.RestoreCurrent(RestoreReasonBoot)
+
+	if got := fw.acceptance.Status(); got != shared.AcceptanceIdle {
+		t.Errorf("acceptance status after a restore = %q, want %q", got, shared.AcceptanceIdle)
+	}
+}
+
+// A restore takes the same slot an apply does, so the two cannot both be
+// writing the table.
+func TestRestoreCurrent_RefusedWhileAnApplyHoldsTheSlot(t *testing.T) {
+	shortenRestoreSlotWait(t, 100*time.Millisecond)
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if !fw.beginApply() {
+		t.Fatal("could not claim the apply slot in the test")
+	}
+	defer fw.endApply()
+
+	if err := fw.RestoreCurrent(RestoreReasonBoot); err != ErrApplyInProgress {
+		t.Errorf("want ErrApplyInProgress, got %v", err)
+	}
+}
+
+// shortenRestoreSlotWait sets how long RestoreCurrent waits for the slot, for
+// one test.
+func shortenRestoreSlotWait(t *testing.T, d time.Duration) {
+	t.Helper()
+	was := restoreSlotWait
+	restoreSlotWait = d
+	t.Cleanup(func() { restoreSlotWait = was })
+}
+
+// Final review I1: a feed refresh holds the slot for under a second, and the
+// Docker reconcile and RESUME that meet it wait for it instead of failing —
+// after a reboot that failure left containers unreachable.
+func TestRestoreCurrent_WaitsForASlotReleasedWithinTheWait(t *testing.T) {
+	shortenRestoreSlotWait(t, 2*time.Second)
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if !fw.beginApply() {
+		t.Fatal("could not claim the apply slot in the test")
+	}
+	time.AfterFunc(200*time.Millisecond, fw.endApply)
+
+	if err := fw.RestoreCurrent(RestoreReasonDockerBridge); errors.Is(err, ErrApplyInProgress) {
+		t.Errorf("a slot released after 200 ms of a 2 s wait still refused the restore: %v", err)
+	}
+	if !fw.beginApply() {
+		t.Error("the restore did not release the slot it waited for")
+	}
+	fw.endApply()
+}
+
+func TestFirewall_PanicEngagedReflectsTheMarker(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if fw.PanicEngaged() {
+		t.Error("a fresh install is not in panic mode")
+	}
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+	if !fw.PanicEngaged() {
+		t.Error("the marker is there; PanicEngaged must say so")
+	}
+}
+
+// A restore that cannot read the rules must record the failure. The audit log
+// is what the operator looks at when the interface says the firewall is off.
+func TestRestoreCurrent_RecordsAFailureToReadTheRules(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	// Corrupt the rules file so GetState fails
+	if err := os.WriteFile(cfg.RulesPath(), []byte("not json"), 0600); err != nil {
+		t.Fatalf("corrupt rules file: %v", err)
+	}
+
+	err := fw.RestoreCurrent(RestoreReasonBoot)
+	if err == nil {
+		t.Fatal("with corrupted rules the restore must fail")
+	}
+
+	got := auditActions(t, cfg)
+	if len(got) != 1 || got[0] != "boot_enforce_failed" {
+		t.Errorf("want exactly one boot_enforce_failed entry, got %v", got)
+	}
+}
+
+// An apply that cannot read the rules must record the failure. The audit log
+// is what the operator looks at when the interface says the firewall is off.
+func TestApply_RecordsAFailureToReadTheRules(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.Acceptance.Enabled = false
+	fw := newTestFirewall(t, cfg)
+
+	// Corrupt the rules file so GetState fails
+	if err := os.WriteFile(cfg.RulesPath(), []byte("not json"), 0600); err != nil {
+		t.Fatalf("corrupt rules file: %v", err)
+	}
+
+	err := fw.Apply("test")
+	if err == nil {
+		t.Fatal("with corrupted rules the apply must fail")
+	}
+
+	got := auditActions(t, cfg)
+	if len(got) != 1 || got[0] != "apply_failed" {
+		t.Errorf("want exactly one apply_failed entry, got %v", got)
+	}
+}
+
+// Panic writes the marker even when tearing down the table fails. The order
+// matters: an operator who ran `panic` and then rebooted must not come back to
+// the rules that made them run it.
+func TestPanic_WritesTheMarkerEvenWhenTeardownFails(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg) // nil netlink connection: Reset will fail
+
+	err := fw.Panic("console")
+	if err == nil {
+		t.Fatal("with no netlink connection the teardown must be reported")
+	}
+	if !PanicEngaged(cfg.PanicMarkerPath()) {
+		t.Error("the marker must be written even when the teardown failed")
+	}
+	if got := auditActions(t, cfg); len(got) != 1 || got[0] != "panic_engaged" {
+		t.Errorf("want one panic_engaged entry, got %v", got)
+	}
+}
+
+// Panic during an open acceptance window has to end the window without
+// letting the apply goroutine waiting on it roll back on top of the
+// teardown.
+//
+// The previous version of this test started a window with nothing ever
+// calling Wait() on it, and asserted only that the status changed. That
+// passed because Panic called f.acceptance.Reset() directly — a call with no
+// purpose except making this assertion true, since a plain Reset() sets the
+// status to idle regardless of anything CancelAcceptance did. The assertion
+// would have passed with CancelAcceptance() deleted from Panic entirely, and
+// deleting it is exactly the bug this whole task exists to fix. This version
+// puts a real goroutine in Wait() — the way an apply actually does — and
+// follows it all the way to the rollback that Wait() returning false
+// triggers, which is where the actual protection now lives.
+func TestPanic_EndsAnOpenAcceptanceWindow(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := fw.acceptance.Start(cfg.AcceptanceDuration()); err != nil {
+		t.Fatalf("start acceptance: %v", err)
+	}
+	if got := fw.acceptance.Status(); got != shared.AcceptancePending {
+		t.Fatalf("precondition: acceptance status = %q", got)
+	}
+
+	// Stands in for the tail of Firewall.apply: a goroutine blocked in
+	// Wait(), which on a cancel writes apply_rolledback and calls rollback —
+	// exactly what apply() does when its window is not accepted.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if accepted := fw.acceptance.Wait(); !accepted {
+			WriteAuditLog(cfg.AuditLogPath(), "apply_rolledback", "all", "timeout", "apply-goroutine")
+			fw.rollback(shared.RulesState{}, shared.AppliedConfigResult{}, "apply-goroutine")
+		}
+	}()
+
+	if err := fw.Panic("console"); err == nil {
+		t.Fatal("with no netlink connection Panic's own teardown must be reported as failed")
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the apply goroutine never returned from Wait(); Panic did not end the window")
+	}
+
+	if got := fw.acceptance.Status(); got == shared.AcceptancePending {
+		t.Error("panic must not leave an acceptance window open")
+	}
+
+	actions := auditActions(t, cfg)
+	if len(actions) == 0 || actions[0] != "panic_engaged" {
+		t.Fatalf("want panic_engaged written first, got %v", actions)
+	}
+	var sawSkip bool
+	for _, a := range actions {
+		switch a {
+		case "rollback_skipped":
+			sawSkip = true
+		case "rollback_failed":
+			// rollback_failed would mean the rollback goroutine reached
+			// nft.Apply(previous) and raced Panic's own nft.Reset() on the
+			// same connection — the exact defect this task fixes.
+			t.Errorf("the rollback attempted to touch nftables after panic mode was engaged; got %v", actions)
+		}
+	}
+	if !sawSkip {
+		t.Errorf("want a rollback_skipped entry once panic mode is engaged, got %v", actions)
+	}
+}
+
+// A second apply — another browser tab, a request queued before the console
+// ran `panic`, a client that has not been told yet — must not be able to
+// re-arm a firewall the console just disarmed.
+func TestApply_RefusedWhilePanicIsEngaged(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+
+	err := fw.apply("web")
+	if !errors.Is(err, ErrPanicEngaged) {
+		t.Errorf("apply() during panic mode = %v, want ErrPanicEngaged", err)
+	}
+
+	got := auditActions(t, cfg)
+	if len(got) != 1 || got[0] != "apply_refused_panic" {
+		t.Errorf("want exactly one apply_refused_panic entry, got %v", got)
+	}
+}
+
+// The exported Apply must refuse the same way — beginApply claims the slot
+// and then apply() finds the marker, so the slot has to come back too, or a
+// refused apply would wedge every apply after it.
+func TestApply_ExportedRefusesWhilePanicIsEngagedAndReleasesTheSlot(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+
+	if err := fw.Apply("web"); !errors.Is(err, ErrPanicEngaged) {
+		t.Errorf("Apply() during panic mode = %v, want ErrPanicEngaged", err)
+	}
+	if !fw.beginApply() {
+		t.Error("the apply slot was not released after a refusal; no further apply could ever run")
+	}
+	fw.endApply()
+}
+
+// Resume ends panic mode unconditionally, but the restore that follows can
+// lose the apply slot to a cycle that is already running. That path used to
+// write nothing: the operator was left with a log that said panic mode had
+// ended and no line anywhere saying the rules never came back.
+func TestResume_RecordsWhenAnApplyHoldsTheSlot(t *testing.T) {
+	shortenRestoreSlotWait(t, 100*time.Millisecond)
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+	if !fw.beginApply() {
+		t.Fatal("could not claim the apply slot in the test")
+	}
+	defer fw.endApply()
+
+	_, err := fw.Resume("console")
+	if !errors.Is(err, ErrApplyInProgress) {
+		t.Errorf("Resume() while an apply holds the slot = %v, want ErrApplyInProgress", err)
+	}
+	if PanicEngaged(cfg.PanicMarkerPath()) {
+		t.Error("Resume must clear the marker even when the restore behind it cannot run")
+	}
+
+	got := auditActions(t, cfg)
+	if len(got) != 2 || got[0] != "panic_resumed" || got[1] != "resume_restore_skipped" {
+		t.Errorf("want [panic_resumed resume_restore_skipped], got %v", got)
+	}
+}
+
+// Resume clears the marker first and only then restores, so a restore that fails
+// does not leave the machine claiming to be in panic mode when it is not.
+func TestResume_ClearsTheMarker(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+
+	_, _ = fw.Resume("console") // the restore fails on the nil connection; the clear must not
+
+	if PanicEngaged(cfg.PanicMarkerPath()) {
+		t.Error("resume must clear the marker even when the restore that follows fails")
+	}
+	got := auditActions(t, cfg)
+	if len(got) == 0 || got[0] != "panic_resumed" {
+		t.Errorf("want panic_resumed first, got %v", got)
+	}
+}
+
+// A rollback interrupted by panic mode must still revert the rules file.
+//
+// This is the invariant RestoreCurrent's missing acceptance window rests on:
+// Current is a set that has already survived a window. The panic guard used to
+// return before the file revert as well as before the kernel write, which left
+// Current holding the set the operator had just been cut off by — unconfirmed,
+// equal to Staged so the dashboard reported nothing outstanding, and reinstalled
+// with no window by the next `resume`.
+func TestRollback_UnderPanicStillRevertsTheRulesFile(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	// The state after a confirmed apply: Current is the set that works.
+	works := []shared.PortRule{{Port: "22", Description: "ssh"}}
+	if err := fw.rules.SaveStaged("tcp", works); err != nil {
+		t.Fatalf("stage the working rules: %v", err)
+	}
+	if err := fw.rules.BackupCurrent(); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if err := fw.rules.PromoteStaged(); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+
+	// The apply that cuts the operator off: staged, backed up, promoted, window
+	// open. `previous` is what Firewall.apply captures before promoting.
+	locksMeOut := []shared.PortRule{{Port: "9999", Description: "not ssh"}}
+	if err := fw.rules.SaveStaged("tcp", locksMeOut); err != nil {
+		t.Fatalf("stage the bad rules: %v", err)
+	}
+	previous, err := fw.rules.GetState()
+	if err != nil {
+		t.Fatalf("read the pre-apply state: %v", err)
+	}
+	if err := fw.rules.BackupCurrent(); err != nil {
+		t.Fatalf("backup: %v", err)
+	}
+	if err := fw.rules.PromoteStaged(); err != nil {
+		t.Fatalf("promote: %v", err)
+	}
+
+	// The operator reaches the console and runs `panic`.
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+
+	fw.rollback(previous, shared.AppliedConfigResult{}, "web")
+
+	state, err := fw.rules.GetState()
+	if err != nil {
+		t.Fatalf("read the state after the rollback: %v", err)
+	}
+	if len(state.Current.TCP) != 1 || state.Current.TCP[0].Port != "22" {
+		t.Errorf("Current after a panic-interrupted rollback = %+v, want the pre-apply set "+
+			"(port 22); an unconfirmed set left in Current is restored with no acceptance "+
+			"window at the next boot or resume", state.Current.TCP)
+	}
+
+	pending, err := fw.rules.HasPendingChanges()
+	if err != nil {
+		t.Fatalf("HasPendingChanges: %v", err)
+	}
+	if !pending {
+		t.Error("HasPendingChanges must be true again after the revert — the operator's " +
+			"staged correction is still waiting, and the dashboard has to say so")
+	}
+
+	// The kernel half must not have been attempted: the test firewall has a nil
+	// netlink connection, so an attempt shows up as rollback_failed.
+	var sawSkip bool
+	for _, e := range auditEntries(t, cfg) {
+		switch e.Action {
+		case "rollback_skipped":
+			sawSkip = true
+			if !strings.Contains(e.Detail, cfg.PanicMarkerPath()) {
+				t.Errorf("the rollback_skipped detail must name the marker that caused it, got %q", e.Detail)
+			}
+		case "rollback_failed":
+			t.Errorf("the rollback touched nftables while panic mode was engaged: %q", e.Detail)
+		}
+	}
+	if !sawSkip {
+		t.Error("a rollback that left the kernel torn down must say so in the audit log")
+	}
+}
+
+// lockedMarkerFirewall returns a Firewall whose panic marker cannot be read
+// while its rules file and audit log still can.
+//
+// The three normally live in the same two directories, so a plain chmod would
+// make every one of them unreadable and the test would prove nothing about the
+// marker in particular. The rules store is therefore built from the good path
+// first and DataDir is repointed afterwards: NewRulesStore keeps the path it was
+// given, and DataDir is read again only by PanicMarkerPath.
+func lockedMarkerFirewall(t *testing.T) (*Firewall, *Config) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: a 0000 directory is still traversable")
+	}
+	cfg := newTestConfig(t)
+	store, err := NewRulesStore(cfg.RulesPath())
+	if err != nil {
+		t.Fatalf("NewRulesStore: %v", err)
+	}
+	locked := filepath.Join(t.TempDir(), "locked")
+	if err := os.Mkdir(locked, 0o000); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o750) })
+	cfg.DataDir = locked
+
+	if _, known, _ := PanicState(cfg.PanicMarkerPath()); known {
+		t.Skip("this filesystem lets the marker be stat'ed anyway; nothing to test")
+	}
+	return &Firewall{
+		cfg: cfg,
+		nft: &NftablesManager{},
+		// rollback books the counters before its write and resets the baselines
+		// after it, so a Firewall reaching that path needs a store. It is pointed
+		// at the deliberately unreadable DataDir this helper builds, which is the
+		// truthful fixture: both calls fail, log and are swallowed, because a
+		// bookkeeping file that cannot be read is no reason to abandon a rollback.
+		usage:      NewUsageStore(cfg.UsagePath()),
+		rules:      store,
+		acceptance: NewAcceptance(cfg.AcceptanceDuration()),
+	}, cfg
+}
+
+// An unreadable marker must not withdraw the acceptance window's automatic undo.
+//
+// PanicEngaged reads "cannot tell" as "engaged", which is the safe default for
+// the boot restore and the wrong one here: a permission fault on the data
+// directory would silently turn a firewall that always lets you back in into one
+// that does not, and the audit entry would blame a decision at the console.
+func TestRollback_ProceedsWhenTheMarkerCannotBeRead(t *testing.T) {
+	fw, cfg := lockedMarkerFirewall(t)
+
+	// A host that has been filtering, not a fresh installation: this test is
+	// about the *post-write* panic check, and on an installation where nothing
+	// has ever been applied the rollback takes the first-apply branch and tears
+	// the table down deliberately — a different write, with a boot_enforce_failed
+	// of its own when it fails, which the teardown assertion at the end of this
+	// test would read as the undo it exists to forbid.
+	previous := shared.RulesState{Current: shared.Rules{TCP: []shared.PortRule{{Port: "22"}}}}
+	fw.rollback(previous, shared.AppliedConfigResult{}, "web")
+
+	for _, e := range auditEntries(t, cfg) {
+		if e.Action == "rollback_skipped" {
+			t.Errorf("an unreadable marker must not be reported as an engaged one: %q", e.Detail)
+		}
+	}
+	// The kernel write was attempted: the test firewall has a nil netlink
+	// connection, so the attempt is what produces rollback_failed.
+	var tried bool
+	for _, e := range auditEntries(t, cfg) {
+		if e.Action == "rollback_failed" && strings.Contains(e.Detail, "nftables") {
+			tried = true
+		}
+	}
+	if !tried {
+		t.Error("the rollback must reach nftables when the marker state is unknown")
+	}
+	// And the post-write check must not undo it either. The helper defaults an
+	// unreadable marker to "engaged", so calling it unguarded here would tear down
+	// the rules this rollback just restored — F5's finding, one statement further
+	// on. A teardown shows up as its own entry, under boot_enforce_failed.
+	for _, e := range auditEntries(t, cfg) {
+		// The first-apply branch tears the table down deliberately and writes
+		// its own boot_enforce_failed when that fails, which would otherwise be
+		// read here as the post-write undo this test forbids. Naming it: an
+		// entry about the first apply means everConfigured answered wrongly for
+		// this fixture, not that the panic check ran unguarded.
+		if strings.Contains(e.Detail, "first apply") {
+			t.Errorf("the rollback took the first-apply teardown branch, so everConfigured "+
+				"no longer sees this fixture as a host that has been filtering: %s %q",
+				e.Action, e.Detail)
+			continue
+		}
+		if e.Action == "boot_enforce_failed" || strings.Contains(e.Detail, "torn down") {
+			t.Errorf("an unreadable marker must not trigger a teardown after the rollback: %s %q",
+				e.Action, e.Detail)
+		}
+	}
+}
+
+// The fault is reported once, loudly, where an operator can act on it: an
+// unreadable marker means the machine comes up unfiltered while every surface
+// that shows panic mode shows one boolean and cannot tell the two apart.
+func TestDaemonStart_RecordsAMarkerItCannotRead(t *testing.T) {
+	fw, cfg := lockedMarkerFirewall(t)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	startTestDaemon(t, d)
+
+	entries := auditEntries(t, cfg)
+	if len(entries) == 0 || entries[0].Action != "boot_enforce_failed" {
+		t.Fatalf("want boot_enforce_failed first, got %v", auditActions(t, cfg))
+	}
+	if !strings.Contains(entries[0].Detail, cfg.PanicMarkerPath()) ||
+		!strings.Contains(entries[0].Detail, "cannot read the panic marker") {
+		t.Errorf("the entry must name the marker and the errno, got %q", entries[0].Detail)
+	}
+}
+
+// The post-write marker check, on the two things a unit test can see: the
+// verdict and the audit entry. That a real table actually comes down is the
+// integration half — see TestIntegration_PanicLandingAfterAWriteLeavesNoRules,
+// because this fixture has a nil netlink connection and nft.Apply never gets far
+// enough to reach the check on its own.
+func TestPanicLandedDuringWrite_RecordsAndReportsTheTeardown(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if fw.panicLandedDuringWrite(fw.PanicEngaged(), "boot_enforce_failed", "no marker here", "core") {
+		t.Error("with no marker on disk the write that just happened stands")
+	}
+	if got := auditActions(t, cfg); len(got) != 0 {
+		t.Errorf("a write nobody interrupted must record nothing here, got %v", got)
+	}
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+
+	// apply_refused_panic is what the apply path asks for, and the teardown below
+	// cannot work on this fixture — so this also pins the substitution.
+	if !fw.panicLandedDuringWrite(fw.PanicEngaged(), "apply_refused_panic", "the console got there first", "web") {
+		t.Fatal("a marker that appeared during the write must be reported")
+	}
+	entries := auditEntries(t, cfg)
+	if len(entries) != 1 {
+		t.Fatalf("want exactly one entry, got %v", auditActions(t, cfg))
+	}
+	// The worst state in the release: filtering, with the marker, the banner and
+	// `easywall-core status` all reporting panic mode. It is the same machine
+	// state boot_enforce_failed describes on the restore path, where it is
+	// coloured crit — so a failed teardown is recorded under that action whatever
+	// the caller asked for, rather than rendering one state in two colours.
+	if entries[0].Action != "boot_enforce_failed" {
+		t.Errorf("action = %q, want boot_enforce_failed: a teardown that failed leaves the "+
+			"machine filtering behind a marker that says it is not, and "+
+			"apply_refused_panic is neutral", entries[0].Action)
+	}
+	if !strings.Contains(entries[0].Detail, "the console got there first") {
+		t.Errorf("the caller's situation must survive, got %q", entries[0].Detail)
+	}
+	// The detail says what happened rather than asserting an outcome. "The table
+	// was taken down again" would be false here.
+	if !strings.Contains(entries[0].Detail, "could not be torn down") ||
+		!strings.Contains(entries[0].Detail, "may still be filtering") {
+		t.Errorf("a failed teardown must be named, and its consequence stated, got %q",
+			entries[0].Detail)
+	}
+	if strings.Contains(entries[0].Detail, "was taken down again") {
+		t.Errorf("the detail asserts a teardown that did not happen: %q", entries[0].Detail)
+	}
+	if entries[0].User != "web" {
+		t.Errorf("user = %q, want web", entries[0].User)
+	}
+}
+
+// A revert that failed must not be reported as one that happened.
+//
+// rollback_skipped is the entry that explains why an acceptance rollback did what
+// it did, and its first clause used to say the stored rules "were reverted"
+// unconditionally. f.rules.Rollback() can fail — its error went only into the
+// separate rollback_failed entry — so the log carried two entries for one event
+// of which the explaining one lied.
+func TestRollback_UnderPanicSaysSoWhenTheRevertItselfFailed(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: a read-only directory is still writable")
+	}
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+	// Read and execute but not write: the marker can still be stat'ed and the
+	// rules file read, while the atomic rewrite the revert needs cannot create
+	// its temporary file.
+	if err := os.Chmod(cfg.DataDir, 0o500); err != nil {
+		t.Fatalf("chmod DataDir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(cfg.DataDir, 0o750) })
+
+	fw.rollback(shared.RulesState{}, shared.AppliedConfigResult{}, "web")
+
+	var skipped *shared.AuditLogEntry
+	for i, e := range auditEntries(t, cfg) {
+		if e.Action == "rollback_skipped" {
+			skipped = &auditEntries(t, cfg)[i]
+		}
+	}
+	if skipped == nil {
+		t.Fatalf("want a rollback_skipped entry, got %v", auditActions(t, cfg))
+	}
+	if !strings.Contains(skipped.Detail, "could not be reverted") ||
+		!strings.Contains(skipped.Detail, "Current still holds") {
+		t.Errorf("the entry must say the revert failed and what that leaves behind, got %q",
+			skipped.Detail)
+	}
+	if strings.Contains(skipped.Detail, "were reverted") {
+		t.Errorf("the entry asserts a revert that did not happen: %q", skipped.Detail)
+	}
+}
+
+// RestoreCurrent records the Docker bridges it baked into the rules, and
+// reconcileDockerBridges reads that record to tell "no bridges yet" from "no
+// bridges at all" the one time it looks.
+//
+// All four reconciler tests write the field directly, so deleting
+// setBootBridges from RestoreCurrent left the whole suite green — and that call
+// was the entire subject of the commit that added it. This is the test that was
+// missing.
+//
+// The nft connection is nil, so the restore fails at its kernel write. That is
+// deliberate and sufficient: setBootBridges runs before it, which is the
+// ordering the reconciler depends on — the bridges have to be recorded whether
+// or not the write that would have used them succeeded.
+func TestRestoreCurrent_RecordsTheBridgesItBakedIn(t *testing.T) {
+	origInterfaces, origAddrs := netInterfacesFn, ifaceAddrsFn
+	t.Cleanup(func() { netInterfacesFn, ifaceAddrsFn = origInterfaces, origAddrs })
+
+	netInterfacesFn = func() ([]net.Interface, error) {
+		return []net.Interface{{Index: 1, Name: "br-abc123"}}, nil
+	}
+	ifaceAddrsFn = func(net.Interface) ([]net.Addr, error) {
+		_, n, _ := net.ParseCIDR("172.30.0.0/16")
+		return []net.Addr{n}, nil
+	}
+
+	cfg := newTestConfig(t)
+	f := newTestFirewall(t, cfg)
+	configureTestFirewall(t, f)
+
+	if got := f.getBootBridges(); len(got) != 0 {
+		t.Fatalf("a fresh firewall already records %v", got)
+	}
+
+	// The write fails — there is no netlink connection — and the record is
+	// still expected, because it is made before the write.
+	_ = f.RestoreCurrent(RestoreReasonBoot)
+
+	got := f.getBootBridges()
+	if len(got) != 1 || got[0] != "172.30.0.0/16" {
+		t.Errorf("RestoreCurrent recorded %v, want [172.30.0.0/16]; without this the "+
+			"reconciler cannot tell a host whose bridges were already there from one "+
+			"whose bridges have not appeared yet, and restores a second time on every "+
+			"container host", got)
+	}
+}
+
+// A host that has never been configured is left exactly as easywall found it.
+//
+// The incident: a VPS was cut off from its owner immediately after
+// `docker compose up -d`. RulesStore initialises rules.json with emptyState(),
+// Daemon.Start restores it unconditionally, and an empty rule set at policy drop
+// closes every port — SSH, and the web interface whose first-run wizard is the
+// only thing that would have opened SSH. `dpkg -i` reaches the same place; the
+// documented first step is https://localhost:12227, and loopback is accepted,
+// which is why it was never seen locally.
+//
+// The evidence that nothing was written: the test firewall has a nil netlink
+// connection, so any restore that reaches nftables fails at Reset and records
+// boot_enforce_failed — as TestRestoreCurrent_AttemptsAndRecordsFailure above
+// asserts it does on a configured host. Getting boot_not_configured instead, and
+// a nil error, is proof this one turned back before the kernel.
+func TestRestoreCurrent_DoesNotEnforceAnInstallationNobodyConfigured(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if err := fw.RestoreCurrent(RestoreReasonBoot); err != nil {
+		t.Errorf("restoring an unconfigured installation must succeed by doing nothing, got %v", err)
+	}
+
+	got := auditActions(t, cfg)
+	if len(got) != 1 || got[0] != "boot_not_configured" {
+		t.Fatalf("audit says %v, want exactly one boot_not_configured\n"+
+			"  boot_enforce_failed here means the restore reached nftables and would "+
+			"have installed a drop-all table on a machine nobody has configured", got)
+	}
+}
+
+// An operator who deliberately applied an empty rule set keeps it across a
+// reboot. That choice was made through an acceptance window that let them undo
+// it, which is exactly what a fresh install has never had.
+//
+// Without this the guard above would be "empty means never configured", and a
+// host somebody deliberately left wide open — or one upgrading from a release
+// before the guard existed, where Current may legitimately be empty — would
+// quietly stop being restored at boot.
+func TestRestoreCurrent_EnforcesAnEmptySetSomebodyApplied(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	// The marker an accepted apply leaves behind, and nothing else: Current
+	// stays empty, so the marker is the only thing saying this host is configured.
+	fw.setLastApply(time.Now())
+
+	err := fw.RestoreCurrent(RestoreReasonBoot)
+	if err == nil {
+		t.Fatal("the restore must reach nftables and fail there on the nil connection")
+	}
+
+	got := auditActions(t, cfg)
+	if len(got) != 1 || got[0] != "boot_enforce_failed" {
+		t.Errorf("audit says %v, want exactly one boot_enforce_failed\n"+
+			"  boot_not_configured here means a deliberately-applied empty rule set "+
+			"stopped being enforced across a reboot", got)
+	}
+}
+
+// The two signals are independent: a non-empty Current with no marker is a
+// configured host too. That is the shape an installation has between the
+// first-run apply and the marker being written, and the shape of any host whose
+// marker file was lost.
+func TestEverConfigured_TakesEitherSignal(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	var state shared.RulesState
+	if fw.everConfigured(state) {
+		t.Error("empty Current and no last-apply marker is an unconfigured installation")
+	}
+
+	state.Current.TCP = []shared.PortRule{{Port: "22"}}
+	if !fw.everConfigured(state) {
+		t.Error("a rule in Current means somebody configured this host")
+	}
+
+	state.Current = shared.Rules{}
+	fw.setLastApply(time.Now())
+	if !fw.everConfigured(state) {
+		t.Error("a last-apply marker means somebody applied something, empty or not")
+	}
+}
+
+// The first-apply rollback records what its teardown did, not what it intended.
+//
+// The entry is the line an operator reads to find out what the rollback left
+// behind, and on this path a failed Reset() is the worst outcome there is: the
+// host sits at policy drop with no port open. An entry written before the
+// teardown, or written unconditionally of it, says "the table was taken down and
+// this host is not filtering" about a machine that is filtering an empty set —
+// the same defect the panic branch a few lines above it in rollback records
+// having been fixed once already.
+//
+// newTestFirewall's NftablesManager has a nil netlink connection, so Reset()
+// fails for real rather than through a seam invented for this test.
+func TestRollback_FirstApplyTeardownFailureIsReportedHonestly(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	// A fresh installation: nothing in Current, no last-apply marker.
+	if fw.everConfigured(shared.RulesState{}) {
+		t.Fatal("the fixture is not a fresh installation, so this test proves nothing")
+	}
+
+	fw.rollback(shared.RulesState{}, shared.AppliedConfigResult{}, "web")
+
+	var got *shared.AuditLogEntry
+	entries := auditEntries(t, cfg)
+	for i, e := range entries {
+		if e.Action == "boot_not_configured" {
+			t.Errorf("the teardown failed, and this entry claims it succeeded: %q", e.Detail)
+		}
+		if e.Action == "boot_enforce_failed" {
+			got = &entries[i]
+		}
+	}
+	if got == nil {
+		t.Fatalf("want a boot_enforce_failed entry for a teardown that could not be "+
+			"carried out, got %v", auditActions(t, cfg))
+	}
+	if !strings.Contains(got.Detail, "could not be taken down") ||
+		!strings.Contains(got.Detail, "policy drop") {
+		t.Errorf("the entry must say the teardown failed and what that leaves the host in, "+
+			"got %q", got.Detail)
+	}
+	if strings.Contains(got.Detail, "this host is not filtering") {
+		t.Errorf("the entry asserts a teardown that did not happen: %q", got.Detail)
+	}
+	// One event, one entry. The teardown error is already in the detail above;
+	// a rollback_failed beside it is the second crit record for the same event
+	// that the panic branch in rollback() documents having removed.
+	for _, e := range entries {
+		if e.Action == "rollback_failed" {
+			t.Errorf("a second crit entry for the one event: rollback_failed %q, "+
+				"beside the boot_enforce_failed that already carries the error", e.Detail)
+		}
+	}
+	if !strings.Contains(got.Detail, "could not be taken down (") {
+		t.Errorf("the folded entry must carry the error it folded in, got %q", got.Detail)
+	}
+}
+
+// Resume reports what it did, and audits only an end that happened. A RESUME
+// with nothing engaged used to write panic_resumed — which the web process sends
+// as a Panic-mode-ended notification — and the console promised restored rules
+// on a host where nothing had ever been applied.
+func TestResume_ReportsWhatItActuallyDid(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg) // never configured: RestoreCurrent writes nothing
+
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatal(err)
+	}
+	res, err := fw.Resume("console")
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if !res.WasEngaged || res.Restored {
+		t.Errorf("engaged, never configured: got %+v, want WasEngaged and not Restored", res)
+	}
+
+	res, err = fw.Resume("console")
+	if err != nil {
+		t.Fatalf("second Resume: %v", err)
+	}
+	if res.WasEngaged || res.Restored {
+		t.Errorf("not engaged, never configured: got %+v, want neither", res)
+	}
+	n := 0
+	for _, a := range auditActions(t, cfg) {
+		if a == "panic_resumed" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("panic_resumed written %d times for one engaged and one idle RESUME, want 1", n)
+	}
+}
+
+// A core that died inside an acceptance window must not come back enforcing
+// the set nobody confirmed.
+//
+// apply promotes Staged into Current on disk before the window opens, and only
+// a window that ran to its end ever rolled that back. kill -9, the OOM killer,
+// the systemd watchdog or a power cut inside the window left Current holding
+// the unconfirmed set, and this restore enforced it with no window at all.
+// The file state below is exactly what apply leaves at the moment the window
+// opens; a fresh Firewall over the same data directory is the restarted core.
+func TestRestoreCurrent_RevertsAnApplyAPreviousRunNeverConfirmed(t *testing.T) {
+	cfg := newTestConfig(t)
+	dead := newTestFirewall(t, cfg)
+	configureTestFirewall(t, dead) // confirmed: 22
+
+	if err := dead.rules.SaveStaged("tcp", []shared.PortRule{{Port: "443"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dead.rules.BackupCurrent(); err != nil {
+		t.Fatal(err)
+	}
+	if err := markUnconfirmed(cfg.UnconfirmedMarkerPath(), shared.AppliedConfigResult{}); err != nil {
+		t.Fatal(err)
+	}
+	if err := dead.rules.PromoteStaged(); err != nil {
+		t.Fatal(err)
+	}
+
+	restarted := newTestFirewall(t, cfg)
+	_ = restarted.RestoreCurrent(RestoreReasonBoot) // the nil netlink conn fails the kernel half
+
+	state, err := restarted.rules.GetState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Current.TCP) != 1 || state.Current.TCP[0].Port != "22" {
+		t.Errorf("Current after restart = %+v, want the confirmed 22 back", state.Current.TCP)
+	}
+	if len(state.Staged.TCP) != 1 || state.Staged.TCP[0].Port != "443" {
+		t.Errorf("Staged after restart = %+v, want the operator's 443 kept", state.Staged.TCP)
+	}
+	if _, err := os.Stat(cfg.UnconfirmedMarkerPath()); !os.IsNotExist(err) {
+		t.Errorf("the marker is still there after the revert (stat: %v)", err)
+	}
+	st := restarted.Status()
+	if st.Acceptance != shared.AcceptanceRolledBack || st.AcceptanceReason != ReasonCoreStopped {
+		t.Errorf("status = %s/%q, want rolled_back/%q", st.Acceptance, st.AcceptanceReason, ReasonCoreStopped)
+	}
+	var found bool
+	for _, e := range auditEntries(t, cfg) {
+		if e.Action == "apply_rolledback" && e.Detail == ReasonCoreStopped {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no apply_rolledback/%q entry; got %v", ReasonCoreStopped, auditActions(t, cfg))
+	}
+}
+
+// Without the marker nothing is reverted: a Current that went through a whole
+// window is restored as it stands.
+func TestRestoreCurrent_LeavesAConfirmedCurrentAlone(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	configureTestFirewall(t, fw)
+	if err := fw.rules.BackupCurrent(); err != nil { // Backup == Current; make them differ
+		t.Fatal(err)
+	}
+	_ = fw.rules.SaveStaged("tcp", []shared.PortRule{{Port: "443"}})
+	_ = fw.rules.PromoteStaged() // confirmed 443 over a backup of 22, no marker
+
+	_ = newTestFirewall(t, cfg).RestoreCurrent(RestoreReasonBoot)
+	state, _ := fw.rules.GetState()
+	if len(state.Current.TCP) != 1 || state.Current.TCP[0].Port != "443" {
+		t.Errorf("a confirmed Current was reverted: %+v", state.Current.TCP)
+	}
+}

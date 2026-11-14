@@ -1,0 +1,695 @@
+package core
+
+import (
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/BurntSushi/toml"
+	"github.com/jp1337/easywall/config"
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// Config is the runtime configuration for easywall-core.
+//
+// It is read and written from different goroutines: an apply runs
+// asynchronously so the socket stays responsive, and while its acceptance
+// window is open the operator can save a setting on another page. Apply reads
+// the firewall options, the IPv6 mode and the Docker section; the save writes
+// them. Without the lock below that is a data race on a slice header and a
+// string — and the race detector never saw it, because no test applied and
+// saved at the same time until one dispatched every command in a row.
+type Config struct {
+	shared.CoreConfig
+
+	// mu guards CoreConfig. Take it for writing in the Save* methods and for
+	// reading through the accessors; nothing outside this file should touch the
+	// embedded struct directly.
+	mu sync.RWMutex
+
+	// Derived fields (not in TOML)
+	configPath string
+
+	// fileConfig is the parsed file as it stood before the environment overlay.
+	// saveLocked puts its socket_path, data_dir and log_dir back before
+	// encoding, so a variable set for this process cannot become content of the
+	// file the root daemon reads. Same purpose as web's field of the same name,
+	// and simpler for one reason: web's encode() has to copy six managed keys
+	// forward from the live struct, while nothing here writes a path — the
+	// interface saves the firewall, acceptance, ipv6, docker and routing
+	// sections and nothing else.
+	fileConfig shared.CoreConfig
+}
+
+// FirewallOptions returns a copy of the [firewall] section.
+func (c *Config) FirewallOptions() shared.FirewallOptions {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Firewall
+}
+
+// NetworkSettings returns a copy of the [ipv6] and [docker] sections.
+//
+// CustomNetworks is copied rather than shared: handing out the backing array
+// would put the race straight back, one indirection further away.
+func (c *Config) NetworkSettings() shared.NetworkSettings {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	docker := c.Docker
+	docker.CustomNetworks = append([]string(nil), c.Docker.CustomNetworks...)
+	routing := c.Routing
+	routing.Networks = append([]string(nil), c.Routing.Networks...)
+	return shared.NetworkSettings{IPv6: c.IPv6, Docker: docker, Routing: routing}
+}
+
+// SystemSettings returns a copy of the [acceptance] section.
+func (c *Config) SystemSettings() shared.SystemSettings {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return shared.SystemSettings{Acceptance: c.Acceptance}
+}
+
+// LoadConfig reads and parses the TOML config at path.
+// Returns a descriptive error if the file cannot be read or parsed.
+func LoadConfig(path string) (*Config, error) {
+	// #nosec G304 -- path is the --config argument this daemon was started with.
+	// Nothing from a request reaches it; there is no other way to name a file here.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config %s: %w", path, err)
+	}
+
+	// The shipped file first, then the operator's over it: a key the file does
+	// not name is its shipped default, for every key at once. This decoded into
+	// a zero Config until 2.29.1 and backfilled the keys somebody remembered —
+	// the limits, icmp_allow_echo_request, acceptance.duration — so a
+	// hand-written or templated file without acceptance.enabled ran with no
+	// rollback window, without docker.enabled lost container networking, and
+	// without the ICMPv6 keys broke IPv6, all while the schema said true.
+	// Decoded from the bytes rather than copied from shared.CoreDefault(), whose
+	// pointer fields alias the package default the decoder would write through.
+	var cfg Config
+	if _, err := toml.Decode(string(config.Core), &cfg.CoreConfig); err != nil {
+		return nil, fmt.Errorf("built-in default configuration: %w", err)
+	}
+	meta, err := toml.Decode(string(data), &cfg.CoreConfig)
+	if err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	// A file from before 2.5.0 names ipv6.enabled and no mode. Left at the
+	// shipped "filter", migrateIPv6Mode would never tell its operator the old
+	// key did nothing.
+	if meta.IsDefined("ipv6", "enabled") && !meta.IsDefined("ipv6", "mode") {
+		cfg.IPv6.Mode = ""
+	}
+	if err := readOldLogKeys(data, &cfg.CoreConfig); err != nil {
+		return nil, fmt.Errorf("parse config %s: %w", path, err)
+	}
+	cfg.configPath = path
+	cfg.fileConfig = cfg.CoreConfig // before the overlay, deliberately
+	// Before the caller's Validate(), which main runs next: an environment value
+	// has to face the same checks a file value does.
+	//
+	// The map is discarded: the core has no interface to show provenance in, and
+	// the web process is the only reader. The error is not — an unparseable
+	// variable stops this daemon exactly as it stops the other one.
+	if _, err := shared.ApplyCoreEnv(&cfg.CoreConfig); err != nil {
+		return nil, fmt.Errorf("environment: %w", err)
+	}
+	return &cfg, nil
+}
+
+// readOldLogKeys reads the two [firewall] keys easywall.toml carried until
+// 2.22, log_blacklist_connections and log_blacklist_connections_limit, into
+// their 2.23 fields. The package generates this file once from a template and
+// never replaces it (docs-tech/packaging.md), so every upgraded host keeps the
+// old spelling until its next save; it is read here and nowhere else, so
+// FirewallOptions carries no second field that DiffConfig, the schema and the
+// documentation guards would each have to be taught to ignore. The next save
+// from the interface writes the new keys (saveLocked encodes the struct).
+//
+// A new key that is present wins over its old one, and the warning says so.
+func readOldLogKeys(data []byte, c *shared.CoreConfig) error {
+	var old struct {
+		Firewall struct {
+			Log   *bool `toml:"log_blacklist_connections"`
+			Limit *int  `toml:"log_blacklist_connections_limit"`
+		} `toml:"firewall"`
+	}
+	meta, err := toml.Decode(string(data), &old)
+	if err != nil {
+		return err
+	}
+	var read, ignored []string
+	if v := old.Firewall.Log; v != nil {
+		if meta.IsDefined("firewall", "log_blocklist_connections") {
+			ignored = append(ignored, "log_blacklist_connections")
+		} else {
+			c.Firewall.LogBlocklist = *v
+			read = append(read, "log_blacklist_connections")
+		}
+	}
+	if v := old.Firewall.Limit; v != nil {
+		if meta.IsDefined("firewall", "log_blocklist_connections_limit") {
+			ignored = append(ignored, "log_blacklist_connections_limit")
+		} else {
+			c.Firewall.LogBlocklistLimit = *v
+			read = append(read, "log_blacklist_connections_limit")
+		}
+	}
+	if len(read)+len(ignored) > 0 {
+		slog.Warn("easywall.toml uses the [firewall] key names from before 2.23; "+
+			"rename log_blacklist_connections to log_blocklist_connections and "+
+			"log_blacklist_connections_limit to log_blocklist_connections_limit",
+			"read", read, "ignored_because_the_new_key_is_set", ignored)
+	}
+	return nil
+}
+
+// Validate checks all required fields and returns a descriptive error if
+// something is missing or invalid. No silent defaults for security-critical values.
+func (c *Config) Validate() error {
+	if c.SocketPath == "" {
+		return fmt.Errorf("socket_path is required")
+	}
+	if c.DataDir == "" {
+		return fmt.Errorf("data_dir is required")
+	}
+	if c.LogDir == "" {
+		return fmt.Errorf("log_dir is required")
+	}
+	// A file written by hand, or by an older version that accepted anything, is
+	// brought into range rather than kept from starting: the daemon refusing to
+	// come up is a worse outcome than a window of a different length. That
+	// includes 0 and below, which were refused until 2.25.1 although
+	// configuration.md said every out-of-range value is clamped. Clamping them
+	// up to the minimum is the safe direction: a short window rolls back.
+	if !shared.ValidAcceptanceDuration(c.Acceptance.Duration) {
+		clamped := min(max(c.Acceptance.Duration, shared.AcceptanceDurationMin), shared.AcceptanceDurationMax)
+		slog.Warn("acceptance.duration is out of range; using the nearest permitted value",
+			"configured", c.Acceptance.Duration, "using", clamped,
+			"min", shared.AcceptanceDurationMin, "max", shared.AcceptanceDurationMax)
+		c.Acceptance.Duration = clamped
+	}
+	// Absent reads as false, and this is the only place that says so. A file
+	// naming only `duration` reads like one that configures a window and
+	// configures the length of a window that never opens — the duration above
+	// is refused and clamped out loud, this switch said nothing at all, and a
+	// real host ran its first apply with no way back because of the difference.
+	// Validate also runs from Reload, so this re-fires on every SIGHUP rather
+	// than only at start. That is deliberate: a reload that switches the window
+	// off is exactly the moment somebody needs telling, and a warning that only
+	// ever appeared at boot would be silent for the change that caused it.
+	if !c.Acceptance.Enabled {
+		// No "configured" attribute, unlike the clamps around it: the branch
+		// requires the value, so it could only ever print configured=false —
+		// a field that carries no information and reads as though it might.
+		slog.Warn("acceptance.enabled is false or absent: applies take effect immediately " +
+			"and nothing will undo them — there is no confirmation window and no automatic rollback")
+	}
+
+	// A negative interval is a typo, not an instruction, and it is clamped
+	// rather than refused for the same reason the acceptance duration is: a
+	// daemon that will not start because of one number in one optional section
+	// is the worse failure. Zero — deliberately off — is left alone.
+	if c.Usage.Interval != nil && *c.Usage.Interval < 0 {
+		slog.Warn("usage.interval is negative; the counter ticker is switched off",
+			"configured", *c.Usage.Interval)
+		off := 0
+		c.Usage.Interval = &off
+	}
+
+	// The group is bound as a uint16. A value outside it cannot be one, so it
+	// stops the daemon with the key named rather than being wrapped into some
+	// other program's group.
+	if g := c.PacketLog.Group; g != nil && (*g < 0 || *g > 65535) {
+		return fmt.Errorf("packet_log.nflog_group must be between 0 and 65535, got %d", *g)
+	}
+	// Clamped, like usage.interval: an out-of-range buffer size is not worth
+	// refusing to start a firewall over.
+	if e := c.PacketLog.Entries; e != nil && (*e < shared.PacketLogEntriesMin || *e > shared.PacketLogEntriesMax) {
+		clamped := min(max(*e, shared.PacketLogEntriesMin), shared.PacketLogEntriesMax)
+		slog.Warn("packet_log.entries is outside the permitted range; using the nearest permitted value",
+			"configured", *e, "using", clamped,
+			"min", shared.PacketLogEntriesMin, "max", shared.PacketLogEntriesMax)
+		c.PacketLog.Entries = &clamped
+	}
+
+	for _, l := range shared.FirewallLimits {
+		enabled, value := l.Enabled(&c.Firewall), l.Value(&c.Firewall)
+		if !*enabled || l.InRange(*value) {
+			continue
+		}
+		// Substituted rather than refused, for the same reason the acceptance
+		// duration is clamped: a firewall daemon that will not start is worse
+		// than one running a documented default. But it is said out loud —
+		// configuration.md promised "never a silent fallback", and this was five
+		// of them.
+		//
+		// Both ends now. Only the lower one was checked, and a value above the
+		// range is the more dangerous half: these numbers reach 32-bit nftables
+		// fields, so `connection_limit_max = 4294967296` wrapped to `ct count
+		// over 0` — a rule that drops every connection from every source — with
+		// nothing logged and the interface reporting the number the operator
+		// typed.
+		switch {
+		case *value <= 0:
+			slog.Warn("firewall limit is not a positive number; using the default",
+				"key", l.Key, "configured", *value, "using", l.Default)
+			*value = l.Default
+		default:
+			clamped := l.Clamp(*value)
+			slog.Warn("firewall limit is outside the permitted range; using the nearest permitted value",
+				"key", l.Key, "configured", *value, "using", clamped, "min", l.Min, "max", l.Max)
+			*value = clamped
+		}
+	}
+
+	c.migrateIPv6Mode()
+	if !c.IPv6.Mode.Valid() {
+		return fmt.Errorf("ipv6.mode must be one of %q, %q or %q, got %q",
+			shared.IPv6Filter, shared.IPv6Passthrough, shared.IPv6Block, c.IPv6.Mode)
+	}
+
+	// An absent [routing] section means closed, which is what every config
+	// written before this key existed was already getting. Unset is filled in;
+	// set-and-wrong is refused, because the three answers open and close a
+	// router and guessing between them is not something to do quietly.
+	if c.Routing.Mode == "" {
+		c.Routing.Mode = shared.RoutingClosed
+	}
+	if !c.Routing.Mode.Valid() {
+		return fmt.Errorf("routing.mode must be one of %q, %q or %q, got %q",
+			shared.RoutingClosed, shared.RoutingNetworks, shared.RoutingOpen, c.Routing.Mode)
+	}
+
+	// The two network lists, checked here and not only on the way in from the
+	// interface. Nothing looked at them when they arrived in the file, and
+	// system-settings.md tells operators to edit easywall.toml and send SIGHUP —
+	// so a mistyped network reached the kernel as nothing at all. Measured
+	// against a real kernel with routing.mode = "networks" and
+	// networks = ["10.8.0.0/24", "10.9.0.0-24"]: the daemon started with three
+	// INFO lines and no warning, and the forward chain came up holding the accept
+	// for 10.8.0.0/24 and none for the other — a network the operator had listed
+	// as routable, destroyed by the drop policy without a word.
+	//
+	// Refused rather than skipped, because configuration.md's rule is that a
+	// value which cannot be interpreted stops the daemon with the key named,
+	// while one that is merely out of range is clamped. A network that will not
+	// parse is the first kind. Stopping is safe here: the rules already in the
+	// kernel stay exactly as they are, which is the same thing an invalid
+	// ipv6.mode has always done.
+	if err := checkNetworkLists(c.Docker.CustomNetworks, c.Routing.Networks); err != nil {
+		return err
+	}
+
+	// A value nothing recognises is refused rather than read as "open".
+	// FiltersPublishedPorts compares against one constant, so
+	// published_ports = "filter" — the word ipv6.mode takes, and the obvious
+	// thing to type — filters nothing while the operator believes it does. This
+	// release's own defect class, in this release's own key.
+	//
+	// The leniency the builder keeps is about *rendering*: a typo must never
+	// close every published port on a host, which would be 2.5.0 with a spelling
+	// mistake in front of it. Refusing here closes nothing. It stops a daemon
+	// that has not started, or refuses a SIGHUP reload and keeps the running
+	// configuration — the safe direction both times.
+	switch c.Docker.PublishedPorts {
+	case "", shared.PublishedPortsOpen, shared.PublishedPortsFiltered:
+	default:
+		return fmt.Errorf("docker.published_ports must be %q or %q, got %q",
+			shared.PublishedPortsOpen, shared.PublishedPortsFiltered, c.Docker.PublishedPorts)
+	}
+
+	// Filtering published container ports on a host that manages no container
+	// networks is a contradiction, not a preference: with docker.enabled = false
+	// nothing detects a bridge, so the forward chain would be asked to filter
+	// traffic to addresses it has been told not to look for. Refused by name and
+	// in the same register as a custom_networks entry that is not a CIDR — a
+	// value that cannot be interpreted stops the daemon with the key named.
+	//
+	// Only the static contradiction is refused here. "enabled, but no bridge
+	// detected" is a legitimate transient — a host whose containers have not
+	// started — and it is handled at apply, in addForwardPortRules.
+	if c.Docker.FiltersPublishedPorts() && !c.Docker.Enabled {
+		return fmt.Errorf("docker.published_ports = %q needs docker.enabled = true: "+
+			"there are no container networks to filter traffic to. Set docker.enabled = true, "+
+			"or docker.published_ports = %q",
+			shared.PublishedPortsFiltered, shared.PublishedPortsOpen)
+	}
+	return nil
+}
+
+// The table that used to live here — key, module switch, value, fallback — is
+// now shared.FirewallLimits, and it carries the permitted range as well. It
+// moved because three places had an opinion about these numbers and only two of
+// them were in the repository's own reach: the JSON Schemas an operator's editor
+// enforces, and the `max` attribute on the options page. Neither is the daemon.
+// A guard test now derives both from the Go table.
+//
+// It also gained the two log limits it never had: ssh_brute_force_log_limit and
+// icmp_flood_log_limit were the only numeric options nothing validated at all.
+
+// migrateIPv6Mode fills in ipv6.mode for a config written before 2.5.0.
+//
+// The old key was ipv6.enabled, and it did not mean what it said. `false`
+// removed the ICMPv6 exemptions and left every other rule applying to IPv6, so
+// the effect was a filtered but non-functional IPv6 stack — not the
+// "unfiltered" the documentation promised, and not "blocked" either. There is
+// no faithful translation of that, so both old values map to `filter`: it is
+// the safe direction, it is what the majority already had, and for anyone who
+// set `false` it repairs an IPv6 stack that was quietly broken.
+//
+// Someone who genuinely wanted IPv6 out of the way now has two settings that
+// actually do it, and the release notes point at them.
+func (c *Config) migrateIPv6Mode() {
+	if c.IPv6.Mode != "" {
+		return
+	}
+	c.IPv6.Mode = shared.IPv6Filter
+	if !c.IPv6.Enabled {
+		slog.Warn("ipv6.enabled is obsolete and did not do what it said; " +
+			"using ipv6.mode = \"filter\". Set ipv6.mode to \"passthrough\" or " +
+			"\"block\" if you want IPv6 left alone or dropped")
+	}
+}
+
+// Reload re-reads the config file and adopts the sections that can change
+// while the daemon runs: [firewall], [acceptance], [usage], [ipv6], [docker],
+// and [routing].
+//
+// features/system-settings.md has always told operators to edit easywall.toml
+// and send SIGHUP. Nothing handled that signal, and an unhandled SIGHUP
+// terminates the process — so following the documentation shut the firewall
+// manager down.
+//
+// The paths are deliberately not reloaded: socket_path, data_dir and log_dir
+// are bound at startup, and swapping them under a running daemon would leave
+// the socket and the rules file pointing at different places. A change to one
+// is reported and ignored.
+//
+// A file that does not parse or does not validate leaves the running
+// configuration exactly as it was. A typo must never disarm anything.
+func (c *Config) Reload() error {
+	fresh, err := LoadConfig(c.configPath)
+	if err != nil {
+		return err
+	}
+	if err := fresh.Validate(); err != nil {
+		return fmt.Errorf("refusing to reload: %w", err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, p := range []struct{ name, old, new string }{
+		{"socket_path", c.SocketPath, fresh.SocketPath},
+		{"data_dir", c.DataDir, fresh.DataDir},
+		{"log_dir", c.LogDir, fresh.LogDir},
+	} {
+		if p.old != p.new {
+			slog.Warn("ignoring changed path on reload; it takes effect on restart",
+				"key", p.name, "running", p.old, "in_file", p.new)
+		}
+	}
+
+	// [packet_log] is bound at start — the group is a socket this process holds.
+	// A change is reported and ignored, the same as a path.
+	if fresh.PacketLogGroup() != c.packetLogGroupLocked() ||
+		fresh.PacketLogEntries() != c.packetLogEntriesLocked() ||
+		fresh.PacketLog.Persist != c.PacketLog.Persist {
+		slog.Warn("ignoring changed [packet_log] on reload; it takes effect on restart")
+	}
+	// Not applied to the running c.PacketLog — that is what "ignored" means —
+	// but recorded as the file's current view, the same as the three paths.
+	// Without this, saveLocked (below) would restore the running, stale value
+	// on the next Save from any page and silently erase an edit the operator
+	// made directly in the file for the next restart.
+	c.fileConfig.PacketLog = fresh.fileConfig.PacketLog
+
+	c.Firewall = fresh.Firewall
+	c.Acceptance = fresh.Acceptance
+	c.Usage = fresh.Usage
+	c.IPv6 = fresh.IPv6
+	c.Docker = fresh.Docker
+	c.Routing = fresh.Routing
+	return nil
+}
+
+// AcceptanceDuration returns the acceptance window as a time.Duration.
+func (c *Config) AcceptanceDuration() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return time.Duration(c.Acceptance.Duration) * time.Second
+}
+
+// UsageInterval returns how often the per-rule counters are read. Unset is the
+// shipped default; zero stops the ticker — see UsageConfig.
+func (c *Config) UsageInterval() time.Duration {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.Usage.Interval == nil {
+		return shared.UsageIntervalDefault * time.Second
+	}
+	return time.Duration(*c.Usage.Interval) * time.Second
+}
+
+// PacketLogGroup is the NFLOG group the core binds. Unset is the default.
+func (c *Config) PacketLogGroup() uint16 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.packetLogGroupLocked()
+}
+
+// PacketLogEntries is the ring's capacity. Unset is the default; Validate
+// clamps a set value into range.
+func (c *Config) PacketLogEntries() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.packetLogEntriesLocked()
+}
+
+// PacketLogPersist reports whether the ring is also written to PacketLogPath.
+func (c *Config) PacketLogPersist() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.PacketLog.Persist
+}
+
+// PacketLogPath is the spill file. In log_dir, which the unit already lists in
+// ReadWritePaths, and deliberately absent from debian/easywall.logrotate: it
+// rotates itself, and a rotation from outside would break the replay.
+func (c *Config) PacketLogPath() string {
+	return c.LogDir + "/packets.log"
+}
+
+func (c *Config) packetLogGroupLocked() uint16 {
+	if c.PacketLog.Group == nil {
+		return shared.PacketLogGroupDefault
+	}
+	return uint16(*c.PacketLog.Group) // #nosec G115 -- Validate refuses anything outside 0–65535
+}
+
+func (c *Config) packetLogEntriesLocked() int {
+	if c.PacketLog.Entries == nil {
+		return shared.PacketLogEntriesDefault
+	}
+	return *c.PacketLog.Entries
+}
+
+// RulesPath returns the absolute path to rules.json.
+func (c *Config) RulesPath() string {
+	return c.DataDir + "/rules.json"
+}
+
+// AuditLogPath returns the absolute path to the audit log.
+func (c *Config) AuditLogPath() string {
+	return c.LogDir + "/audit.log"
+}
+
+// LastApplyPath returns the path of the file recording when rules were last
+// applied and accepted. It is kept on disk because the dashboard shows it, and
+// a value held only in memory reset to "never" on every daemon restart while
+// the rules it referred to were still live.
+func (c *Config) LastApplyPath() string {
+	return c.DataDir + "/last_apply"
+}
+
+// AppliedConfigPath returns the path of the snapshot recording the configuration
+// that went into the kernel with the rules that are in it. See appliedconfig.go
+// for why it exists and why a missing file claims nothing.
+func (c *Config) AppliedConfigPath() string {
+	return c.DataDir + "/applied-config.json"
+}
+
+// UsagePath returns the path of the per-rule usage counters. See usage.go for
+// why the baseline in it is persisted rather than held in memory.
+func (c *Config) UsagePath() string {
+	return c.DataDir + "/usage.json"
+}
+
+// SelftestStampPath returns the path of the file recording what the self-test
+// last proved and against what version and kernel. See selftest_stamp.go.
+func (c *Config) SelftestStampPath() string {
+	return c.DataDir + "/selftest.json"
+}
+
+// FeedsPath returns the path of the core's own copy of every feed. See
+// feedstore.go.
+func (c *Config) FeedsPath() string {
+	return c.DataDir + "/feeds.json"
+}
+
+// PanicMarkerPath returns the path of the file that records panic mode.
+//
+// In the data directory rather than in this config file for two reasons, neither
+// of them about start-up ordering — the path is derived from DataDir here, so it
+// is only knowable once this config has parsed. A console command must not
+// rewrite the TOML the daemon owns and rewrites itself, and the web process must
+// never be able to engage or clear panic mode, which a settings key reachable
+// over the socket would let it do. See panicmode.go.
+func (c *Config) PanicMarkerPath() string {
+	return c.DataDir + "/panic"
+}
+
+// UnconfirmedMarkerPath returns the path of the file that says the stored
+// Current holds a set no acceptance window has confirmed yet. See unconfirmed.go.
+func (c *Config) UnconfirmedMarkerPath() string {
+	return c.DataDir + "/unconfirmed"
+}
+
+// SaveNetworkSettings updates the [ipv6] and [docker] sections and atomically persists the config.
+func (c *Config) SaveNetworkSettings(s shared.NetworkSettings) error {
+	// Unset means filter, the same as everywhere else — a caller that omits the
+	// field gets the safe disposition rather than an error. A value that is set
+	// and wrong is a different matter: guessing which of open or closed the
+	// caller meant is not something to do quietly.
+	if s.IPv6.Mode == "" {
+		s.IPv6.Mode = shared.IPv6Filter
+	}
+	if !s.IPv6.Mode.Valid() {
+		return fmt.Errorf("unknown ipv6 mode %q", s.IPv6.Mode)
+	}
+	if s.Routing.Mode == "" {
+		s.Routing.Mode = shared.RoutingClosed
+	}
+	if !s.Routing.Mode.Valid() {
+		return fmt.Errorf("unknown routing mode %q", s.Routing.Mode)
+	}
+	// Every entry has to be a network the apply step can turn into a rule.
+	// addCIDRAccept returns quietly on anything it cannot parse, so an unchecked
+	// entry was listed here as allowlisted and never reached the kernel — the
+	// same silent skip the blocklist had, in the direction where the operator
+	// finds out because something they expected to work does not.
+	if err := checkNetworkLists(s.Docker.CustomNetworks, s.Routing.Networks); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.IPv6 = s.IPv6
+	c.Docker = s.Docker
+	c.Routing = s.Routing
+	return c.saveLocked()
+}
+
+// checkNetworkLists refuses a pair of lists holding anything the apply step
+// could not turn into a rule. The two lists on the Network page go through one
+// function so they cannot come to disagree about what a network is, and the
+// definition itself lives in shared so the web process and the demo enforce the
+// same one — see shared.ValidateNetworkList.
+func checkNetworkLists(dockerNetworks, routingNetworks []string) error {
+	if err := shared.ValidateNetworkList("docker custom network", dockerNetworks); err != nil {
+		return err
+	}
+	return shared.ValidateNetworkList("routing network", routingNetworks)
+}
+
+// SaveFirewallOptions updates the [firewall] section and atomically persists the config.
+//
+// A limit arriving here is being chosen now, so a value that cannot work is
+// refused rather than replaced. Storing 100 when the operator asked for 0 leaves
+// the file and the interface disagreeing about what the firewall is doing.
+func (c *Config) SaveFirewallOptions(opts shared.FirewallOptions) error {
+	for _, l := range shared.FirewallLimits {
+		if v := *l.Value(&opts); *l.Enabled(&opts) && !l.InRange(v) {
+			return fmt.Errorf("%s must be between %d and %d, got %d", l.Key, l.Min, l.Max, v)
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Firewall = opts
+	return c.saveLocked()
+}
+
+// SaveSystemSettings updates the [acceptance] section and atomically persists the config.
+//
+// Unlike Validate, a value arriving here is being chosen right now, so it is
+// rejected rather than adjusted — silently storing something other than what
+// was asked for is how a setting comes to disagree with what it says.
+func (c *Config) SaveSystemSettings(s shared.SystemSettings) error {
+	if !shared.ValidAcceptanceDuration(s.Acceptance.Duration) {
+		return fmt.Errorf("acceptance duration %d is outside %d–%d seconds",
+			s.Acceptance.Duration, shared.AcceptanceDurationMin, shared.AcceptanceDurationMax)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.Acceptance = s.Acceptance
+	return c.saveLocked()
+}
+
+// saveLocked persists the configuration. c.mu must be held for writing.
+//
+// The write happens under the same lock as the field update, and deliberately
+// so. Taking a snapshot under a read lock and writing it afterwards left the
+// two saves free to reorder: an older snapshot could reach the file after a
+// newer one and undo it. Measured at 20 of 100 concurrent saves of two
+// different sections. The file is small and saves are rare; holding the lock
+// across the write costs nothing worth having.
+func (c *Config) saveLocked() error {
+	snapshot := c.CoreConfig
+	snapshot.Docker.CustomNetworks = append([]string(nil), c.Docker.CustomNetworks...)
+	snapshot.Routing.Networks = append([]string(nil), c.Routing.Networks...)
+
+	// The three paths shared.CoreEnvVars can override go back to what the file
+	// said. Without this, saving any section wrote the environment overlay into
+	// easywall.toml permanently: EASYWALL_CORE_DATA_DIR=/data-from-env and one
+	// press of Save on the Options page left the file naming a directory the
+	// operator never configured, and the next start — without the variable —
+	// looked for rules.json, the apply state and the panic marker there.
+	// TestEnvOverlayNeverReachesTheConfigFile walks CoreEnvVars and fails on a
+	// variable this list has not caught up with.
+	snapshot.SocketPath = c.fileConfig.SocketPath
+	snapshot.DataDir = c.fileConfig.DataDir
+	snapshot.LogDir = c.fileConfig.LogDir
+	snapshot.PacketLog = c.fileConfig.PacketLog
+
+	dir := filepath.Dir(c.configPath)
+	tmp, err := os.CreateTemp(dir, "core-*.toml.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp config: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	enc := toml.NewEncoder(tmp)
+	if err := enc.Encode(snapshot); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("encode config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return os.Rename(tmpPath, c.configPath)
+}
+
+// There is deliberately no WriteDefaultCoreConfig here. One existed until this
+// release and nothing but its own test ever called it: the configuration that
+// actually ships is config/easywall.toml, installed by the package. Two
+// definitions of "the default" is one too many, and they had already drifted —
+// the dead one carried ipv6.mode while the shipped one still had the obsolete
+// ipv6.enabled.

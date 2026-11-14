@@ -1,0 +1,133 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+
+	"github.com/jp1337/easywall/config"
+	"github.com/jp1337/easywall/internal/core"
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+func main() {
+	// The self-test's peer, re-executed into a fresh network namespace by
+	// internal/core's harness. It parses no flags and reads no config: it is
+	// this binary used as a process that can hold a namespace and open a
+	// socket. First, so that neither a subcommand nor a flag can be reached on
+	// the way — the peer is started with no arguments at all, and anything this
+	// branch let through would be a config read inside a namespace with no
+	// network. See internal/core/netns.go for the protocol.
+	if os.Getenv(core.PeerEnvVar) != "" {
+		os.Exit(core.RunPeer(os.Stdin, os.Stdout))
+	}
+
+	// A subcommand is a first argument that is not a flag. Checked before
+	// flag.Parse, which would otherwise reject it: the flags this binary has
+	// always taken — -config, -version, -write-config — keep working exactly as
+	// they did, because they all start with a dash.
+	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+		os.Exit(runSubcommand(os.Args[1], os.Args[2:], os.Stdout, os.Stderr))
+	}
+
+	configPath := flag.String("config", "/etc/easywall/easywall.toml", "path to core config file")
+	// So a build can be checked rather than assumed. The version is written in
+	// by the linker, and when that silently did nothing there was no way to see
+	// it from outside the binary.
+	showVersion := flag.Bool("version", false, "print the version and exit")
+	// The documentation described this flag for a long time before it existed,
+	// and the command it published exited 2. It exists now: the commented
+	// default is embedded, so a host with nothing but this binary can produce
+	// one. It never overwrites.
+	writeConfig := flag.String("write-config", "",
+		"write a commented default configuration to this path and exit")
+	flag.Usage = func() {
+		fmt.Fprint(os.Stderr, subcommandUsage)
+		fmt.Fprintln(os.Stderr, "\nflags:")
+		flag.PrintDefaults()
+	}
+	flag.Parse()
+
+	// Anything left over is a subcommand written after a flag. It was ignored, so
+	// `easywall-core -config X panic` started a second daemon, which restored the
+	// rules and took over the live core's socket.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "easywall-core: unexpected argument %q; a subcommand comes first: "+
+			"easywall-core %s -config <path>\n", flag.Arg(0), flag.Arg(0))
+		os.Exit(exitFailed)
+	}
+
+	if *showVersion {
+		fmt.Println("easywall-core", shared.CurrentVersion)
+		return
+	}
+
+	if *writeConfig != "" {
+		if err := shared.WriteDefaultConfig(*writeConfig, config.Core); err != nil {
+			fmt.Fprintln(os.Stderr, "easywall-core:", err)
+			os.Exit(1)
+		}
+		fmt.Println("wrote", *writeConfig)
+		return
+	}
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	}))
+	slog.SetDefault(logger)
+
+	cfg, err := core.LoadConfig(*configPath)
+	if err != nil {
+		slog.Error("failed to load config", "path", *configPath, "error", err)
+		os.Exit(1)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		slog.Error("invalid config", "error", err)
+		os.Exit(1)
+	}
+
+	daemon, err := core.NewDaemon(cfg)
+	if err != nil {
+		slog.Error("failed to initialize daemon", "error", err)
+		os.Exit(1)
+	}
+
+	go func() {
+		if err := daemon.Start(); err != nil {
+			slog.Error("daemon error", "error", err)
+			os.Exit(1)
+		}
+	}()
+
+	slog.Info("easywall-core started", "socket", cfg.SocketPath, "version", shared.CurrentVersion)
+
+	// SIGHUP reloads the configuration, which is what the documentation has
+	// always said it does. Until it was handled here the default disposition
+	// applied and the signal terminated the daemon.
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGTERM, syscall.SIGINT)
+
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+
+	for {
+		select {
+		case <-reload:
+			if err := cfg.Reload(); err != nil {
+				slog.Error("config reload failed; keeping the running configuration",
+					"path", *configPath, "error", err)
+				continue
+			}
+			slog.Info("configuration reloaded", "path", *configPath)
+		case <-quit:
+			slog.Info("shutting down easywall-core")
+			daemon.Stop()
+			return
+		}
+	}
+}

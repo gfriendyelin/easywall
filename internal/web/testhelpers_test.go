@@ -1,0 +1,779 @@
+package web
+
+import (
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/nicksnyder/go-i18n/v2/i18n"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// waitUntil polls cond until it holds or the deadline passes. For the notifier,
+// whose work happens on its own goroutine's schedule rather than on the
+// request's.
+func waitUntil(t *testing.T, within time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("condition did not hold within %v", within)
+}
+
+// fakeCore is a minimal Unix socket server that returns canned responses.
+type fakeCore struct {
+	socketPath  string
+	listener    net.Listener
+	mu          sync.Mutex
+	responses   map[shared.CommandType]shared.Response
+	defaultResp shared.Response
+	lastCmd     *shared.Command
+	observers   map[shared.CommandType]func(shared.Command)
+	responders  map[shared.CommandType]func(shared.Command) shared.Response
+}
+
+func newFakeCore(t *testing.T) *fakeCore {
+	t.Helper()
+	dir := t.TempDir()
+	socketPath := dir + "/core.sock"
+
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("fakeCore listen: %v", err)
+	}
+
+	fc := &fakeCore{
+		socketPath:  socketPath,
+		listener:    ln,
+		responses:   make(map[shared.CommandType]shared.Response),
+		defaultResp: shared.Response{Success: true},
+	}
+	go fc.serve()
+	t.Cleanup(func() { ln.Close() })
+	return fc
+}
+
+func (fc *fakeCore) SetResponse(cmdType shared.CommandType, resp shared.Response) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.responses[cmdType] = resp
+}
+
+func (fc *fakeCore) SetDefaultResponse(resp shared.Response) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.defaultResp = resp
+}
+
+// OnCommand registers an observer for one command type, so a test can inspect
+// what the web process actually sent rather than only what came back.
+func (fc *fakeCore) OnCommand(cmdType shared.CommandType, fn func(shared.Command)) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.observers == nil {
+		fc.observers = make(map[shared.CommandType]func(shared.Command))
+	}
+	fc.observers[cmdType] = fn
+}
+
+// Respond answers one command type from fn, consulted before the canned
+// responses: for a test whose answer depends on what was asked.
+func (fc *fakeCore) Respond(cmdType shared.CommandType, fn func(shared.Command) shared.Response) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.responders == nil {
+		fc.responders = make(map[shared.CommandType]func(shared.Command) shared.Response)
+	}
+	fc.responders[cmdType] = fn
+}
+
+func (fc *fakeCore) LastCommand() *shared.Command {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if fc.lastCmd == nil {
+		return nil
+	}
+	cp := *fc.lastCmd
+	return &cp
+}
+
+func (fc *fakeCore) serve() {
+	for {
+		conn, err := fc.listener.Accept()
+		if err != nil {
+			return
+		}
+		go fc.handleConn(conn)
+	}
+}
+
+func (fc *fakeCore) handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	data, err := io.ReadAll(io.LimitReader(conn, shared.MaxMessageBytes+1))
+	if err != nil {
+		return
+	}
+
+	var cmd shared.Command
+	if err := json.Unmarshal(data, &cmd); err != nil {
+		resp := shared.Response{Success: false, Error: "invalid JSON"}
+		out, _ := json.Marshal(resp)
+		_, _ = conn.Write(out)
+		return
+	}
+
+	fc.mu.Lock()
+	fc.lastCmd = &cmd
+	resp, ok := fc.responses[cmd.Type]
+	if !ok {
+		resp = fc.defaultResp
+	}
+	observer := fc.observers[cmd.Type]
+	responder := fc.responders[cmd.Type]
+	fc.mu.Unlock()
+
+	if observer != nil {
+		observer(cmd)
+	}
+	if responder != nil {
+		resp = responder(cmd)
+	}
+
+	out, _ := json.Marshal(resp)
+	_, _ = conn.Write(out)
+}
+
+// repoTemplates returns the real web/templates directory.
+//
+// The handler tests used to render one-line stubs from testdata/templates/, which
+// meant no test ever exercised the markup that ships — a template naming a class
+// that no longer existed, or a fragment built with the wrong variant, was
+// invisible to the suite. Rendering the real templates costs nothing here and
+// closes that gap.
+func repoDir(t *testing.T, parts ...string) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := filepath.Join(parts...)
+	for i := 0; i < 5; i++ {
+		candidate := filepath.Join(dir, rel)
+		if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+			return candidate
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatalf("could not locate %s above the package directory", rel)
+	return ""
+}
+
+func repoTemplates(t *testing.T) string { return repoDir(t, "web", "templates") }
+
+// repoFile2 returns the contents of a file above the package directory,
+// walking up the same way repoDir does — repoDir stops at the first directory
+// on the path, which a file target like docs/_docs/features/audit-log.md is
+// not.
+func repoFile2(t *testing.T, parts ...string) string {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel := filepath.Join(parts...)
+	for i := 0; i < 5; i++ {
+		candidate := filepath.Join(dir, rel)
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			raw, err := os.ReadFile(candidate)
+			if err != nil {
+				t.Fatalf("read %s: %v", rel, err)
+			}
+			return string(raw)
+		}
+		dir = filepath.Dir(dir)
+	}
+	t.Fatalf("could not locate %s above the package directory", rel)
+	return ""
+}
+
+// The real locale files too, so a handler test sees the copy that ships rather
+// than a bare message id.
+func repoLocales(t *testing.T) string { return repoDir(t, "locales") }
+
+// One bundle and one template set for the whole test binary.
+//
+// What this fixed: Test (ubuntu-24.04) died with exit 143 — a SIGTERM from the
+// runner's OOM killer — after internal/core and internal/shared had passed.
+// newTestServer is called 251 times, and every call used to build its own
+// NewBundle (en, de, fr and status, ~1500 messages parsed from disk) and its
+// own loadTemplates (a ParseGlob over all 17 templates). Under -race, which
+// shadows every allocation, 251 re-parses accumulated in one process: 11.7 GB
+// peak RSS on main, 15.6 GB on this branch, against a runner with 16 GB.
+// -parallel is not the lever and makes it worse; there is no t.Parallel()
+// anywhere in this package.
+//
+// Sharing is safe because production shares both the same way. *i18n.Bundle is
+// read-only once loaded and NewLocalizer builds a localizer per request;
+// render() and renderPartial() Clone s.tmpl before injecting the per-request T,
+// so the parsed set is never executed or mutated in place. The two tests that
+// assign s.tmpl (server_test.go's nil-template and testdata cases) replace the
+// pointer on one Server, not the shared value.
+var (
+	sharedBundleOnce sync.Once
+	sharedBundle     *i18n.Bundle
+
+	sharedTmplOnce sync.Once
+	sharedTmpl     *template.Template
+	sharedTmplErr  error
+)
+
+// testBundle returns the shared bundle, loading it on first use.
+func testBundle(t *testing.T) *i18n.Bundle {
+	t.Helper()
+	dir := repoLocales(t)
+	sharedBundleOnce.Do(func() { sharedBundle = NewBundle(dir) })
+	return sharedBundle
+}
+
+// testTemplates returns the shared template set, parsing it on first use.
+func testTemplates(t *testing.T) *template.Template {
+	t.Helper()
+	dir := repoTemplates(t)
+	sharedTmplOnce.Do(func() { sharedTmpl, sharedTmplErr = loadTemplates(dir) })
+	if sharedTmplErr != nil {
+		t.Fatalf("loadTemplates: %v", sharedTmplErr)
+	}
+	return sharedTmpl
+}
+
+// newTestServer creates a Server backed by a fake core for handler testing.
+func newTestServer(t *testing.T, fc *fakeCore) *Server {
+	t.Helper()
+
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	if err := os.MkdirAll(sslDir, 0750); err != nil {
+		t.Fatalf("create ssl dir: %v", err)
+	}
+
+	// Write a minimal web.toml so SaveCredentials works
+	cfgPath := dir + "/web.toml"
+	_ = os.WriteFile(cfgPath, []byte(`
+bind_addr = "127.0.0.1:19999"
+socket_path = "`+fc.socketPath+`"
+ssl_dir = "`+sslDir+`"
+data_dir = "`+dir+`"
+session_key = "test-session-key-32bytes-padding!"
+language = "en"
+username = "admin"
+password = ""
+# No test may reach for the network. Tests that want the update check switch it
+# on themselves, with a cache primed so nothing is fetched.
+update_check = false
+[tls]
+cert = ""
+key  = ""
+`), 0600)
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	// NewServer makes data_dir/web before it opens a store; so does this.
+	prepareStateDir(cfg.DataDir)
+	// Set a real hashed password for login tests
+	hash, err := HashPassword("testpassword123!")
+	if err != nil {
+		t.Fatalf("HashPassword: %v", err)
+	}
+	cfg.Password = hash
+
+	client := NewCoreClient(fc.socketPath)
+
+	// Built the way production builds it, so the session lifetime a test sees is
+	// the one the server enforces. Secure is relaxed afterwards: the test
+	// requests are plain HTTP.
+	store := newSessionStore("test-session-key-32bytes-padding!")
+	store.Options.Secure = false
+
+	pendingStore := newPendingStore("test-session-key-32bytes-padding!")
+	pendingStore.Options.Secure = false
+
+	bundle := testBundle(t)
+	tmpl := testTemplates(t)
+
+	// NewServer builds this before anything else and refuses to start without
+	// one; a Server with no certManager at all is not a smaller stand-in for a
+	// real one, it is a state production never reaches. Building it here is
+	// free — with tls.acme unset (the default in this fixture's config) it is
+	// just struct fields, no filesystem I/O.
+	certs, err := newCertManager(cfg)
+	if err != nil {
+		t.Fatalf("newCertManager: %v", err)
+	}
+
+	s := &Server{
+		cfg:                 cfg,
+		client:              client,
+		store:               store,
+		pending:             pendingStore,
+		replay:              newTOTPReplay(dir + "/totp_replay.json"),
+		passkeys:            newPasskeyStore(dir + "/passkeys.json"),
+		passkeyPending:      newPasskeyPendingStore("test-session-key-32bytes-padding!"),
+		loginPasskeyPending: newLoginPasskeyPendingStore("test-session-key-32bytes-padding!"),
+		bundle:              bundle,
+		tmpl:                tmpl,
+		version:             shared.NewChecker(cfg.VersionCachePath(), cfg.UpdateCheckEnabled()),
+		certs:               certs,
+		// No runner: nothing in a handler test fetches a feed.
+		feedStore: newFeedStore(cfg.FeedStatePath()),
+	}
+	// As NewServer: country_lookup is on by default, so this web.toml has a
+	// lookup. No runner loads or fetches it — its table stays empty.
+	if cfg.CountryLookup {
+		s.lookup = newCountryLookup(cfg.CountryTablePath(), s.feedStore)
+	}
+	// Built the way production builds it (NewServer wires this the same way,
+	// right after the struct literal): a real, empty store rather than the
+	// bare "0" this used to be. credentialFingerprint reads
+	// s.passkeys.fingerprintInput() on every request from 2.18 on, and that
+	// call panics on a nil *passkeyStore — every server this package builds
+	// needs a real one now, not only the tests that enrol a passkey.
+	s.passkeyCount = func() int { return len(s.passkeys.all()) }
+	// Before buildRouter: it captures s.onLoginBlocked, which reaches for
+	// s.events.
+	s.events = newAuditEvents(client, false)
+	s.eventsStop = make(chan struct{})
+	go s.events.run(s.eventsStop)
+	t.Cleanup(func() { close(s.eventsStop) })
+	s.router = s.buildRouter(cfg)
+	return s
+}
+
+// testSetupToken is the setup token every first-run fixture holds, and
+// withSetupToken the form field that proves it. 32 base32 characters, the
+// 20 bytes newTOTPSecret draws. Every step-1 POST in this package carries it
+// unless the test is about the token: without it the request is refused
+// before any other field is read, and a test of the username check would go
+// green on the token check instead.
+const (
+	testSetupToken = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	withSetupToken = "&setup_token=" + testSetupToken
+)
+
+// newFirstRunTestServer creates a Server in first-run mode (no password set).
+func newFirstRunTestServer(t *testing.T, fc *fakeCore) *Server {
+	t.Helper()
+
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+
+	cfgPath := dir + "/web.toml"
+	_ = os.WriteFile(cfgPath, []byte(`
+bind_addr = "127.0.0.1:19999"
+socket_path = "`+fc.socketPath+`"
+ssl_dir = "`+sslDir+`"
+data_dir = "`+dir+`"
+session_key = "test-session-key-32bytes-padding!"
+language = "en"
+username = ""
+password = ""
+update_check = false
+[tls]
+cert = ""
+key  = ""
+`), 0600)
+
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	// NewServer makes data_dir/web before it opens a store; so does this.
+	prepareStateDir(cfg.DataDir)
+
+	client := NewCoreClient(fc.socketPath)
+
+	// Built the way production builds it, so the session lifetime a test sees is
+	// the one the server enforces. Secure is relaxed afterwards: the test
+	// requests are plain HTTP.
+	store := newSessionStore("test-session-key-32bytes-padding!")
+	store.Options.Secure = false
+
+	pendingStore := newPendingStore("test-session-key-32bytes-padding!")
+	pendingStore.Options.Secure = false
+
+	bundle := testBundle(t)
+	tmpl := testTemplates(t)
+
+	// See newTestServer's own certs construction: NewServer never leaves this
+	// nil, so neither does this fixture.
+	certs, err := newCertManager(cfg)
+	if err != nil {
+		t.Fatalf("newCertManager: %v", err)
+	}
+
+	s := &Server{
+		cfg:                 cfg,
+		client:              client,
+		store:               store,
+		pending:             pendingStore,
+		replay:              newTOTPReplay(dir + "/totp_replay.json"),
+		passkeys:            newPasskeyStore(dir + "/passkeys.json"),
+		passkeyPending:      newPasskeyPendingStore("test-session-key-32bytes-padding!"),
+		loginPasskeyPending: newLoginPasskeyPendingStore("test-session-key-32bytes-padding!"),
+		bundle:              bundle,
+		tmpl:                tmpl,
+		version:             shared.NewChecker(cfg.VersionCachePath(), cfg.UpdateCheckEnabled()),
+		certs:               certs,
+		setupToken:          formatTOTPSecret(testSetupToken),
+	}
+	s.passkeyCount = func() int { return len(s.passkeys.all()) }
+	// Before buildRouter: it captures s.onLoginBlocked, which reaches for
+	// s.events.
+	s.events = newAuditEvents(client, false)
+	s.eventsStop = make(chan struct{})
+	go s.events.run(s.eventsStop)
+	t.Cleanup(func() { close(s.eventsStop) })
+	s.router = s.buildRouter(cfg)
+	return s
+}
+
+// makeAuthCookie creates a session cookie with admin user logged in.
+//
+// It carries the credential fingerprint the server is currently running with,
+// exactly as a real login would leave it — a session without one is refused,
+// which is the whole point of it.
+func makeAuthCookie(t *testing.T, s *Server) *http.Cookie {
+	t.Helper()
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	sess, err := s.store.Get(req, SessionName)
+	if err != nil {
+		t.Fatalf("store.Get: %v", err)
+	}
+	sess.Values[SessionUserKey] = "admin"
+	sess.Values[SessionCredentialKey] = credentialFingerprint(
+		s.cfg.Password, s.cfg.WebConfig.TOTPSecret, s.passkeys.fingerprintInput())
+	sess.Values[SessionIDKey] = newSessionID()
+	if err := sess.Save(req, rec); err != nil {
+		t.Fatalf("sess.Save: %v", err)
+	}
+	cookies := rec.Result().Cookies()
+	if len(cookies) == 0 {
+		t.Fatal("no session cookie set")
+	}
+	return cookies[0]
+}
+
+// doRequest performs a request against the server's router and returns the response.
+func doRequest(s *Server, method, url string, body io.Reader, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, url, body)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// remoteAddrCounter is used to generate unique IPs for rate-limit isolation.
+var remoteAddrCounter int
+
+// doFormRequest performs a POST (or given method) with URL-encoded form data and Content-Type set.
+// Uses a unique RemoteAddr to avoid interference from the global login rate limiter.
+func doFormRequest(s *Server, method, url, formBody string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, url, strings.NewReader(formBody))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Use unique IP per request to prevent rate limiter interference across tests
+	remoteAddrCounter++
+	req.RemoteAddr = fmt.Sprintf("10.%d.%d.%d:12345",
+		(remoteAddrCounter/65025)%256,
+		(remoteAddrCounter/255)%256,
+		remoteAddrCounter%255+1)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	return rec
+}
+
+// newTestServerCountingStatusCalls builds a server backed by a fresh fakeCore
+// and returns a counter that ticks up once for every GET_STATUS the server
+// sends it. It exists for TestRender_LoginPageDoesNotAskTheCoreForStatus: the
+// login page has no session yet, and render() must not reach for the core on
+// its behalf, since the core is not guaranteed to be reachable at all before
+// anyone has signed in.
+//
+// The observer fires on the fakeCore's own connection-handling goroutine, so
+// the counter is an int32 read and written with atomic ops rather than a
+// plain int — a bug that made the login page call the core would otherwise
+// race the test's read against the observer's write instead of just failing
+// the assertion.
+//
+// GET_STATUS answers a parseable status rather than the fakeCore's bare
+// {Success: true}: a caller using this to exercise statusForRender's cache
+// needs the first call to actually populate it, or every render after it is a
+// cache miss for the wrong reason. The login test never triggers GetStatus at
+// all, so what it would parse to does not affect that assertion.
+func newTestServerCountingStatusCalls(t *testing.T) (*Server, *int32) {
+	t.Helper()
+	fc := newFakeCore(t)
+	fc.SetResponse(shared.CmdGetStatus, successResp(shared.FirewallStatus{Acceptance: shared.AcceptanceIdle}))
+	var calls int32
+	fc.OnCommand(shared.CmdGetStatus, func(shared.Command) {
+		atomic.AddInt32(&calls, 1)
+	})
+	s := newTestServer(t, fc)
+	return s, &calls
+}
+
+// doAuthRequest performs an authenticated request (with session cookie).
+func doAuthRequest(t *testing.T, s *Server, method, url string, body io.Reader) *httptest.ResponseRecorder {
+	t.Helper()
+	cookie := makeAuthCookie(t, s)
+	return doRequest(s, method, url, body, cookie)
+}
+
+// getAuthenticated performs an authenticated GET, the shape the panic-banner
+// tests need across several pages: they only ever read the body of a
+// successful GET, so the fuller doAuthRequest's method/body parameters would
+// be dead weight repeated at every call site.
+func getAuthenticated(t *testing.T, s *Server, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	return doAuthRequest(t, s, http.MethodGet, path, nil)
+}
+
+// newTestServerWithStatus builds a server backed by a fake core that answers
+// every GET_STATUS with the given status. render() calls GetStatus once per
+// authenticated page to fill PageData.Panic, and the panic-banner tests need
+// to control what comes back without caring about any other command.
+func newTestServerWithStatus(t *testing.T, status *shared.FirewallStatus) *Server {
+	t.Helper()
+	fc := newFakeCore(t)
+	fc.SetResponse(shared.CmdGetStatus, successResp(*status))
+	return newTestServer(t, fc)
+}
+
+// doAuthFormRequest performs an authenticated POST with URL-encoded form data.
+func doAuthFormRequest(t *testing.T, s *Server, url, formBody string) *httptest.ResponseRecorder {
+	t.Helper()
+	cookie := makeAuthCookie(t, s)
+	return doFormRequest(s, "POST", url, formBody, cookie)
+}
+
+// assertRedirect checks that the response is a redirect to the expected location.
+func assertRedirect(t *testing.T, rec *httptest.ResponseRecorder, expectedLoc string) {
+	t.Helper()
+	if rec.Code != http.StatusSeeOther {
+		t.Errorf("expected 303 redirect, got %d", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != expectedLoc {
+		t.Errorf("expected redirect to %q, got %q", expectedLoc, loc)
+	}
+}
+
+// assertStatus checks the response status code.
+func assertStatus(t *testing.T, rec *httptest.ResponseRecorder, expected int) {
+	t.Helper()
+	if rec.Code != expected {
+		t.Errorf("expected status %d, got %d", expected, rec.Code)
+	}
+}
+
+// successResp creates a success Response with JSON data.
+func successResp(data interface{}) shared.Response {
+	raw, _ := json.Marshal(data)
+	return shared.Response{Success: true, Data: raw}
+}
+
+// errorResp creates a failure Response.
+func errorRespFor(msg string) shared.Response {
+	return shared.Response{Success: false, Error: msg}
+}
+
+// urlEncode escapes a value for a form body. Rule editors post JSON in a hidden
+// field, which contains braces and quotes.
+func urlEncode(v string) string { return url.QueryEscape(v) }
+
+// newDemoTestServer builds a Server the way demo_mode = true builds one: the
+// in-memory mock behind the client, and cfg.DemoMode set, so a handler asking
+// "am I the demo" gets the same answer production gives it.
+//
+// newTestServer already built s.events against the fake core with demo=false —
+// correct for its own non-demo callers, wrong here. NewServer builds client
+// and events together from the same cfg.DemoMode, so a Server claiming to be
+// the demo but recording addresses through it would be exactly the kind of
+// mismatch this release's audit trail exists to avoid. The old dispatcher's
+// drain goroutine is stopped before a fresh one, wired to demo=true and the
+// demo client, replaces it; the cleanup newTestServer already registered
+// reads s.eventsStop at cleanup time, so it closes this new channel without
+// having to be re-registered.
+func newDemoTestServer(t *testing.T) *Server {
+	t.Helper()
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	s.cfg.DemoMode = true
+	s.client = NewDemoClient()
+	s.feedStore = newDemoFeedStore(time.Now()) // what NewServer builds in demo mode
+
+	close(s.eventsStop)
+	s.events = newAuditEvents(s.client, true)
+	s.eventsStop = make(chan struct{})
+	go s.events.run(s.eventsStop)
+
+	s.router = s.buildRouter(s.cfg)
+	return s
+}
+
+// testPassword is the plaintext newTestServer hashes into cfg.Password, so any
+// helper built on it can authenticate without minting its own hash.
+const testPassword = "testpassword123!"
+
+// newFactorTestServer builds a Server carrying the given second factors, for
+// factorCount/mayRemoveFactor and the routes that call them.
+//
+// totp, when non-empty, is stored the way enrolment stores it (SaveTOTP), so
+// TOTPSecret() and TOTPEnabled() agree with it. passkeys sets s.passkeyCount
+// to a fixed count, decoupled from the real (and here always empty)
+// *passkeyStore behind it — a caller after "the gate sees N factors" and
+// nothing about a specific enrolled credential. A test that needs a real
+// enrolled passkey — the fingerprint changing, a specific credential being
+// removable — builds one through the actual ceremony instead; see
+// newPasskeyTestServer in handler_passkey_test.go.
+// demo reuses newDemoTestServer's own client swap, so IsDemo() agrees with
+// cfg.DemoMode exactly as production wires it.
+func newFactorTestServer(t *testing.T, totp string, passkeys int, demo bool) *Server {
+	t.Helper()
+	var s *Server
+	if demo {
+		s = newDemoTestServer(t)
+	} else {
+		s = newTestServer(t, newFakeCore(t))
+	}
+	if totp != "" {
+		if err := s.cfg.SaveTOTP(totp, nil); err != nil {
+			t.Fatalf("SaveTOTP: %v", err)
+		}
+	}
+	s.passkeyCount = func() int { return passkeys }
+	return s
+}
+
+// postAuthed performs an authenticated POST with form values and returns the
+// raw response, for tests that only need the status code and not a recorder.
+func (s *Server) postAuthed(t *testing.T, path string, form map[string]string) *http.Response {
+	t.Helper()
+	vals := url.Values{}
+	for k, v := range form {
+		vals.Set(k, v)
+	}
+	return s.postAuthedForm(t, path, vals.Encode())
+}
+
+// postAuthedJSON performs an authenticated POST carrying form values plus a
+// "credential" field holding the given raw JSON — the shape
+// handlePasskeyFinish reads a WebAuthn ceremony response from, since a real
+// form field and a JSON body cannot both be the request body at once.
+func (s *Server) postAuthedJSON(t *testing.T, path string, form map[string]string, credential string) *http.Response {
+	t.Helper()
+	vals := url.Values{}
+	for k, v := range form {
+		vals.Set(k, v)
+	}
+	vals.Set("credential", credential)
+	return s.postAuthedForm(t, path, vals.Encode())
+}
+
+// serverExtraCookies remembers, per Server used in a test, the last
+// non-session cookie a response set — the passkey registration challenge,
+// chiefly. postAuthed and postAuthedJSON each mint a fresh session cookie
+// through makeAuthCookie, which does not matter for who is signed in, but a
+// real browser talking to the same server across two requests would still be
+// holding whatever else the previous response set. Without this, a
+// two-request ceremony like passkey begin -> finish would need every test to
+// thread a cookie through by hand; this replays it the way a browser's own
+// cookie jar would, for exactly the one test that chains the two calls this
+// way — see TestAPasskeyCanBeEnrolledAndCounts.
+var (
+	serverExtraCookiesMu sync.Mutex
+	serverExtraCookies   = map[*Server][]*http.Cookie{}
+)
+
+// postAuthedForm is what postAuthed and postAuthedJSON share.
+func (s *Server) postAuthedForm(t *testing.T, path, formBody string) *http.Response {
+	t.Helper()
+	serverExtraCookiesMu.Lock()
+	extra := serverExtraCookies[s]
+	serverExtraCookiesMu.Unlock()
+
+	cookies := append([]*http.Cookie{makeAuthCookie(t, s)}, extra...)
+	resp := doFormRequest(s, "POST", path, formBody, cookies...).Result()
+
+	var carry []*http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name != SessionName {
+			carry = append(carry, c)
+		}
+	}
+	if carry != nil {
+		serverExtraCookiesMu.Lock()
+		serverExtraCookies[s] = carry
+		serverExtraCookiesMu.Unlock()
+		t.Cleanup(func() {
+			serverExtraCookiesMu.Lock()
+			delete(serverExtraCookies, s)
+			serverExtraCookiesMu.Unlock()
+		})
+	}
+	return resp
+}
+
+// doAuthed performs an authenticated request with no body and returns the raw
+// response, for TestTheGateCannotBeWalkedPast: it walks every route the
+// router registers under whatever method chi.Walk reports for it, and most of
+// those carry no form.
+func (s *Server) doAuthed(t *testing.T, method, path string) *http.Response {
+	t.Helper()
+	cookie := makeAuthCookie(t, s)
+	return doRequest(s, method, path, nil, cookie).Result()
+}
+
+// enrollFactor gives s a TOTP secret directly through cfg.SaveTOTP, the same
+// call SaveTOTP-based enrolment itself makes.
+//
+// RequireSecondFactor's arrival in this release means every test that drives
+// an ordinary authenticated route — /dashboard, /ports, /apply, and the rest —
+// through a server built by newTestServer now needs a factor enrolled or the
+// gate redirects it to /password before the handler under test ever runs.
+// This is that one line, named for what it does rather than repeated as the
+// three-line SaveTOTP-plus-error-check newFactorTestServer already carries for
+// the tests that need to control the exact factor count. Tests exercising
+// login, enrolment, or the factor count itself build their own factor state
+// instead — starting unenrolled, or with a specific count, is what they are
+// testing — and call newFactorTestServer or SaveTOTP directly rather than this.
+func enrollFactor(t *testing.T, s *Server) {
+	t.Helper()
+	if err := s.cfg.SaveTOTP("JBSWY3DPEHPK3PXP", nil); err != nil {
+		t.Fatalf("enrollFactor: SaveTOTP: %v", err)
+	}
+}

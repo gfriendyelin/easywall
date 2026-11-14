@@ -1,0 +1,725 @@
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"net"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/jp1337/easywall/internal/core"
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// The console side of easywall.
+//
+// 2.7 restores the stored rules at startup, which takes away the escape route
+// operators actually used: before it, rebooting emptied nftables and let you
+// back into a machine your own rules had shut you out of. A replacement that
+// only exists in the web interface would be no replacement at all — the web
+// interface is the thing you cannot reach.
+//
+// Everything here goes over the same socket the web process uses, so there is
+// never more than one writer to table inet easywall.
+
+// opts is what a subcommand needs beyond its config: the flags that belong to
+// one command rather than to all of them. One field today. It is a struct
+// rather than a bare bool so that the second such flag changes one type and
+// not five signatures.
+type opts struct {
+	// ifStale belongs to selftest and is false everywhere else, because that is
+	// what an unregistered flag means.
+	ifStale bool
+}
+
+// subcommand is one console command: its name, the single line of help an
+// operator sees, and the function that runs it.
+type subcommand struct {
+	name string
+	help string
+	run  func(cfg *core.Config, o opts, stdout, stderr io.Writer) int
+}
+
+// subcommands is every console command, in the order the help prints them, and
+// it is the only place any of them is written down.
+//
+// It used to be three: a hand-written usage string, a `case "status", "panic",
+// "resume":` membership switch, and a dispatch switch. The dispatch switch
+// ended `default: return runResume(...)`, which with three commands was terse
+// and with five is a trap — a command added to the other two copies and
+// forgotten in the dispatch would have run `resume`, and resume on a machine
+// somebody deliberately unfiltered at the console puts the rules back. That is
+// the one action in this binary that must never happen by accident, and a
+// construct whose failure mode is re-arming a firewall a human disarmed does
+// not survive on the grounds that it was already there.
+//
+// So the three copies are one. The help renders from this table, membership is
+// a lookup in it, and dispatch is the entry's own function: "listed but not
+// dispatched" stops being a state that can be reached by editing one place and
+// not another. The only hole the compiler leaves is a nil `run`, and
+// TestEverySubcommandIsRunnable walks the table for exactly that.
+var subcommands = []subcommand{
+	{"status", "report whether the firewall is enforcing, and since when", runStatus},
+	{"health", "report whether the firewall is doing what it says", runHealth},
+	{"selftest", "prove the rule builder against this kernel", runSelftest},
+	{"panic", "take the firewall down and record that it was deliberate", runPanic},
+	{"resume", "end panic mode and put the stored rules back", runResume},
+}
+
+// find returns the entry for name, or nil.
+func find(name string) *subcommand {
+	if i := slices.IndexFunc(subcommands, func(c subcommand) bool { return c.name == name }); i >= 0 {
+		return &subcommands[i]
+	}
+	return nil
+}
+
+// subcommandUsage is the operator-facing help. Built from the list above, and
+// also what main.go prints for `-h`.
+var subcommandUsage = buildSubcommandUsage()
+
+func buildSubcommandUsage() string {
+	var b strings.Builder
+	b.WriteString("easywall-core <command> [-config path]\n\n")
+	for _, c := range subcommands {
+		// Eight, because `selftest` is the longest name there is room for on one
+		// column; a longer one would push its own description out of line and be
+		// visible immediately in the help rather than only in a diff.
+		_, _ = fmt.Fprintf(&b, "  %-8s %s\n", c.name, c.help)
+	}
+	return b.String()
+}
+
+// exit codes. status uses them to be usable from a monitoring check.
+const (
+	exitOK          = 0
+	exitFailed      = 1
+	exitNotFiltered = 2
+)
+
+// auditUserNoDaemon marks an audit entry written by this fallback rather than
+// by the daemon on the console's behalf. The daemon already writes "console"
+// for a CmdPanic/CmdResume it dispatched, so panic_engaged and panic_resumed
+// can come from two different processes; the log has to say which one wrote
+// a given line without an operator having to guess from the timestamp.
+const auditUserNoDaemon = "console-no-daemon"
+
+// runSubcommand executes one console subcommand and returns the process exit
+// code. Writers are parameters so the tests can read what an operator would see.
+func runSubcommand(name string, args []string, stdout, stderr io.Writer) int {
+	// Before the flags, not after: `selftest` is the first subcommand with a
+	// flag of its own, and which flags exist now depends on which command was
+	// asked for. Rejecting the name first also means `easywall-core frobnicate
+	// -whatever` reports the unknown command rather than the unknown flag,
+	// which is the mistake that was actually made.
+	cmd := find(name)
+	if cmd == nil {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: unknown command %q\n\n%s", name, subcommandUsage)
+		return exitFailed
+	}
+	if cmd.run == nil {
+		// The one gap the table cannot close at compile time. Loud, and before
+		// anything is read or written: an entry with no function is a
+		// programming error, and the alternative shapes of "loud" are worse —
+		// a panic in an init() would take the daemon down for a mistake in a
+		// console command, and doing nothing at all is how the old dispatch
+		// switch came to run `resume` by default. TestEverySubcommandIsRunnable
+		// is what catches this before an operator's shell does.
+		_, _ = fmt.Fprintf(stderr,
+			"easywall-core: %q is in the command list with no function to run\n", name)
+		return exitFailed
+	}
+
+	flags := flag.NewFlagSet("easywall-core "+name, flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configPath := flags.String("config", "/etc/easywall/easywall.toml", "path to core config file")
+
+	// Registered only for the command it belongs to, so `status -if-stale` is
+	// still an error rather than a flag that quietly means nothing.
+	var o opts
+	if name == "selftest" {
+		flags.BoolVar(&o.ifStale, "if-stale", false,
+			"run only when the recorded version or kernel differs from this one")
+	}
+
+	if err := flags.Parse(args); err != nil {
+		return exitFailed
+	}
+
+	cfg, err := core.LoadConfig(*configPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: cannot read %s: %v\n", *configPath, err)
+		return exitFailed
+	}
+
+	return cmd.run(cfg, o, stdout, stderr)
+}
+
+// daemonAbsent reports whether err from shared.SendCommand means there is no
+// daemon, as opposed to a daemon that answered badly.
+//
+// This is the whole safety argument for touching nftables from here. The daemon
+// is the only writer of table inet easywall; the CLI may write it *only* when
+// there is no daemon, and a refused connection to a Unix socket is what that
+// looks like. A timeout is not: a daemon that is slow is still a daemon, and two
+// writers would be worse than a slow one.
+func daemonAbsent(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return false
+	}
+	return errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, fs.ErrNotExist)
+}
+
+// tearDownDirectly removes the easywall table without going through the daemon.
+func tearDownDirectly() error {
+	nft, err := core.NewNftablesManager()
+	if err != nil {
+		return fmt.Errorf("reach nftables: %w", err)
+	}
+	return nft.Reset()
+}
+
+// printPanicEngaged is what an operator sees once panic mode is in force,
+// whichever route got it there — through the daemon, or with none running.
+// One copy, not two, so the daemon path and the fallback path cannot drift
+// apart the way only a diff would notice.
+func printPanicEngaged(stdout io.Writer) {
+	_, _ = fmt.Fprintln(stdout, "The firewall is down. This machine is unfiltered, and stays that way")
+	_, _ = fmt.Fprintln(stdout, "across a restart until you run `easywall-core resume`.")
+}
+
+func runStatus(cfg *core.Config, _ opts, stdout, stderr io.Writer) int {
+	resp, err := shared.SendCommand(cfg.SocketPath, shared.Command{Type: shared.CmdGetStatus})
+	if err != nil {
+		if !daemonAbsent(err) {
+			_, _ = fmt.Fprintf(stderr, "easywall-core: the core daemon is not answering on %s: %v\n",
+				cfg.SocketPath, err)
+			return exitFailed
+		}
+		_, _ = fmt.Fprintln(stdout, "daemon:     not running")
+		if core.PanicEngaged(cfg.PanicMarkerPath()) {
+			_, _ = fmt.Fprintln(stdout, "panic mode: engaged — the rules will NOT come back on start")
+			_, _ = fmt.Fprintln(stdout, "            run `easywall-core resume` first")
+		} else {
+			_, _ = fmt.Fprintln(stdout, "panic mode: not engaged — the rules come back when the daemon starts")
+		}
+		return exitNotFiltered
+	}
+	if !resp.Success {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: %s\n", resp.Error)
+		return exitFailed
+	}
+
+	var status shared.FirewallStatus
+	if err := json.Unmarshal(resp.Data, &status); err != nil {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: cannot read the reply: %v\n", err)
+		return exitFailed
+	}
+
+	switch {
+	case status.Panic:
+		_, _ = fmt.Fprintln(stdout, "firewall:   PANIC MODE — deliberately not enforcing")
+		_, _ = fmt.Fprintln(stdout, "            run `easywall-core resume` to put the stored rules back")
+	case status.Active:
+		_, _ = fmt.Fprintln(stdout, "firewall:   enforcing")
+	default:
+		_, _ = fmt.Fprintln(stdout, "firewall:   NOT enforcing")
+	}
+
+	_, _ = fmt.Fprintf(stdout, "acceptance: %s\n", status.Acceptance)
+	// `acceptance: idle` is two states in one word — a window waiting to be
+	// used, and no window at all — and this is the surface recovery.md sends a
+	// monitoring check to. A continuation line rather than a qualifier on the
+	// line above, so a check matching that line exactly keeps working.
+	if !status.AcceptanceEnabled {
+		_, _ = fmt.Fprintln(stdout, "            no window is configured: "+
+			"an apply is final and nothing will undo it")
+	}
+	if status.LastApply != "" {
+		_, _ = fmt.Fprintf(stdout, "last apply: %s\n", status.LastApply)
+	} else {
+		_, _ = fmt.Fprintln(stdout, "last apply: never")
+	}
+	if status.HasPending {
+		_, _ = fmt.Fprintln(stdout, "pending:    there are staged changes that are not live")
+	}
+
+	// A continuation of the state above, never a failure: the firewall is
+	// enforcing the ruleset it reports; one apply includes the network (2.24 D5).
+	for _, b := range status.UnknownBridges {
+		_, _ = fmt.Fprintf(stdout, "docker:     network %s (%s) exists and is not in the rules in force: "+
+			"apply to name it\n", b.Interface, b.CIDRList())
+	}
+
+	// A monitoring check has to be able to read this without parsing the words.
+	// Panic mode is a decision somebody made, so it is not a failure; a machine
+	// that is simply not filtering is.
+	if !status.Active && !status.Panic {
+		return exitNotFiltered
+	}
+	return exitOK
+}
+
+// capSysAdminBit is CAP_SYS_ADMIN's bit in /proc/self/status's CapEff mask
+// (include/uapi/linux/capability.h) — the capability internal/core/netns.go
+// says CLONE_NEWNET needs (netns.go:226-229, 374-379), and the one the
+// self-test's namespace harness cannot be built without.
+const capSysAdminBit = 21
+
+// The two words for an empty stamp. Named so a test can assert on the
+// constant rather than on the sentence: a copy edit to either string still
+// leaves the test checking "the capability-absent branch returns whatever
+// proofUnavailableHere says", which is the actual claim, instead of breaking
+// on a wording change that changed nothing behavioural.
+const (
+	proofNeverRecorded   = "never recorded"
+	proofUnavailableHere = "unavailable here"
+)
+
+// capSysAdminAvailable is the probe describeProof consults for an empty
+// stamp. A package-level var, not a read inside describeProof itself, so a
+// test can fake "capability absent" and "capability present" with no /proc
+// and no process of its own.
+var capSysAdminAvailable = probeCapSysAdmin
+
+// probeCapSysAdmin reads CapEff from /proc/self/status: a file read, no fork,
+// no clone, cheap enough for the 30-second Docker healthcheck that calls
+// `health` and, through it, describeProof.
+//
+// A CapEff this cannot parse is treated as capability present, not absent —
+// the same as before this probe existed. Reporting "unavailable here" on a
+// host where the capability might well be there would send an operator
+// looking for a permission that was never the problem; "never recorded" only
+// costs them the one already-open question of whether anybody has run it.
+// The read's error is discarded rather than branched on: a file that cannot
+// be opened yields no bytes and so no CapEff line, which is already the
+// parse's fail-open case below. One place to get the direction wrong instead
+// of two, and the one a test can reach. The one divergence from branching on
+// the error is a read that fails partway with the boundary inside CapEff's
+// own digits, which would fail closed; /proc/self/status is generated whole
+// on read and that is not a state it reaches.
+func probeCapSysAdmin() bool {
+	data, _ := os.ReadFile("/proc/self/status")
+	return capEffHasSysAdmin(data)
+}
+
+// capEffHasSysAdmin is probeCapSysAdmin's parse, split out because the file
+// read is the half a test cannot drive: this process has the capabilities it
+// has, and `go test` cannot be given others. Two mutations of the logic below
+// — the bit moved to 22, and the fail-open turned into a fail-closed — both
+// stayed green against the suite that only faked capSysAdminAvailable.
+//
+// Every "cannot read this" path returns true, which is the promise the comment
+// above makes and the direction this must fail in.
+func capEffHasSysAdmin(status []byte) bool {
+	for _, line := range strings.Split(string(status), "\n") {
+		rest, ok := strings.CutPrefix(line, "CapEff:")
+		if !ok {
+			continue
+		}
+		eff, err := strconv.ParseUint(strings.TrimSpace(rest), 16, 64)
+		if err != nil {
+			return true
+		}
+		return eff&(1<<capSysAdminBit) != 0
+	}
+	return true
+}
+
+// describeProof is the one line both `health` and `selftest` print about what
+// was last proven, and against what.
+//
+// Every part of it is omitted when it is empty rather than printed as a label
+// with nothing after it. That is not tidiness. A GET_HEALTH reply is not only
+// ever built by the privileged core: the demo builds the same typed reply with
+// an `unprovable` stamp whose kernel is the zero value, because internal/web
+// has no path to core.KernelRelease() — it imports internal/core nowhere, and
+// that separation is the whole design. On a real host an `unprovable` stamp
+// does carry a kernel, so the empty one is not a state this can dismiss as
+// impossible. `kernel: ` with nothing after it would read as a bug in the one
+// release whose entire subject is a firewall not making false statements about
+// itself.
+//
+// An empty result with CAP_SYS_ADMIN absent is not "nobody has run it yet" —
+// the Docker image asks for CAP_NET_ADMIN only, and the namespace harness
+// needs CAP_SYS_ADMIN (netns.go:226-229, 374-379), so the stamp can never be
+// written. "Never recorded" describes a history and reads like a chore an
+// operator ought to clear; "unavailable here" describes a capability and
+// tells them to stop looking, the same distinction `health` already draws
+// between a disproved claim and an unprovable one (docs/_docs/features/health.md).
+//
+// "Here" is this process, not this machine. The probe reads the capabilities of
+// whoever ran the command, and the socket is root:easywall 0660 — so a non-root
+// member of that group running the `easywall-core health` check health.md
+// documents, on a bare-metal host that could prove it, is told "unavailable
+// here". It takes an empty stamp to reach this branch at all, so it cannot
+// happen on a packaged host where easywall-selftest.service has run, and the
+// Docker healthcheck that is the real consumer runs as root in-container.
+func describeProof(version, kernel string, result shared.SelftestResult, at time.Time) string {
+	if result == "" {
+		if !capSysAdminAvailable() {
+			return proofUnavailableHere
+		}
+		return proofNeverRecorded
+	}
+	line := string(result)
+	if version != "" {
+		line += " for " + version
+	}
+	if kernel != "" {
+		line += " on " + kernel
+	}
+	if !at.IsZero() {
+		line += " at " + at.UTC().Format(time.RFC3339)
+	}
+	return line
+}
+
+// printStamp prints what the proof found, including its detail.
+//
+// SelftestStamp.Detail reaches an operator here and nowhere else. It is
+// deliberately absent from HealthResult — /healthz is unauthenticated by
+// necessity, and the detail names a port number and the claim that failed, so
+// the reply cannot carry it. This console runs on the machine, so it can. A
+// field written by RunSelftest and read by nobody is a field the next
+// maintainer deletes as dead weight, having no way to tell it from some.
+func printStamp(w io.Writer, stamp shared.SelftestStamp) {
+	_, _ = fmt.Fprintf(w, "selftest:   %s\n",
+		describeProof(stamp.Version, stamp.Kernel, stamp.Result, stamp.At))
+	if stamp.Detail != "" {
+		_, _ = fmt.Fprintf(w, "detail:     %s\n", stamp.Detail)
+	}
+}
+
+// runHealth asks the one question every other surface renders.
+//
+// For five releases the input chain's `ct state established,related accept`
+// matched no packet — the conntrack masks were byte-reversed — so the stateful
+// half enforced nothing while `status`, the dashboard and the audit log all
+// reported the firewall active. Every signal easywall had was about intent;
+// none was about effect. This is the console end of the one that is.
+//
+// The exit codes are the contract a monitoring check and a Docker HEALTHCHECK
+// depend on: ok → 0, degraded → 1, fail → 2. They deliberately diverge from
+// `status` under panic mode, where status exits 0 and health exits **2**. That
+// was ruled on rather than overlooked: a machine somebody chose to unfilter is
+// in a state somebody chose, so a console asking after *intent* is right to be
+// quiet — but a monitoring system asking after *health* is asking a different
+// question, and answering it closes carried-forward's entry open since 2.7,
+// "a forgotten panic mode is invisible to monitoring; a panic nobody remembers
+// never pages anyone". TestHealthAndStatusDisagreeUnderPanic pins the
+// divergence so it stays a decision instead of being rediscovered as a bug.
+//
+// 2 and not 1, corrected on 2026-09-09 against this release's own spec: §2 said
+// panic reads `degraded`, and that reason was unreachable — Firewall.Panic
+// leaves an empty input chain, which Enforcing() reports as not enforcing, so
+// computeHealth returned at its first branch. The correction is `fail` with
+// reason `panic`, because a panicked machine is not filtering at all and
+// `degraded` would understate it. The state and the cause are printed on
+// separate lines here for exactly that reason: the code says how bad, the
+// reason says why, and `panic` is what stops whoever reads it hunting a kernel
+// that lost its rules.
+func runHealth(cfg *core.Config, _ opts, stdout, stderr io.Writer) int {
+	resp, err := shared.SendCommand(cfg.SocketPath, shared.Command{Type: shared.CmdGetHealth})
+	if err != nil {
+		if !daemonAbsent(err) {
+			_, _ = fmt.Fprintf(stderr, "easywall-core: the core daemon is not answering on %s: %v\n",
+				cfg.SocketPath, err)
+			return exitFailed
+		}
+		// exitNotFiltered, the same code `status` uses for the same situation
+		// and for the same reason: being unable to confirm that a firewall is
+		// up is not the same as it being up. Health is read out of the kernel,
+		// and with no daemon there is nobody to read it.
+		// The constant, not the word: this line and the exit code below are the
+		// same claim, and a literal here would drift the moment the enum's
+		// spelling changed while a script grepping for it kept passing.
+		_, _ = fmt.Fprintf(stdout, "health:     %s\n", shared.HealthFail)
+		_, _ = fmt.Fprintln(stdout, "reason:     the core daemon is not running, so nothing can")
+		_, _ = fmt.Fprintln(stdout, "            confirm what the kernel is holding")
+		return exitNotFiltered
+	}
+	if !resp.Success {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: %s\n", resp.Error)
+		return exitFailed
+	}
+
+	var health shared.HealthResult
+	if err := json.Unmarshal(resp.Data, &health); err != nil {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: cannot read the reply: %v\n", err)
+		return exitFailed
+	}
+
+	_, _ = fmt.Fprintf(stdout, "health:     %s\n", health.State)
+	_, _ = fmt.Fprintf(stdout, "reason:     %s\n", health.Reason)
+	_, _ = fmt.Fprintf(stdout, "selftest:   %s\n",
+		describeProof(health.Selftest.Version, health.Selftest.Kernel,
+			health.Selftest.Result, health.Selftest.At))
+
+	switch health.State {
+	case shared.HealthOK:
+		return exitOK
+	case shared.HealthDegraded:
+		return exitFailed
+	case shared.HealthFail:
+		return exitNotFiltered
+	default:
+		// A state this binary has no code for is not a healthy one. It means a
+		// daemon newer than this console, which on a machine where the package
+		// upgraded and the binary on PATH did not is exactly the moment an
+		// operator must not read a 0.
+		_, _ = fmt.Fprintf(stderr,
+			"easywall-core: the daemon answered with a state this binary does not know (%q)\n",
+			health.State)
+		return exitFailed
+	}
+}
+
+// selftestRunner is core.RunSelftest in production and a counter in the tests.
+//
+// Injected because the two things this subcommand decides — whether to run at
+// all, and what to exit with — need no kernel, while the proof itself builds a
+// network namespace and wants CAP_SYS_ADMIN. The alternative was a test that
+// skips when it cannot get one, and a t.Skip whose precondition is absent reads
+// exactly like a pass in CI output. internal/core's own tests prove the provers
+// against a real kernel.
+var selftestRunner = core.RunSelftest
+
+// runSelftest proves the rule builder against this kernel and records what it
+// found.
+//
+// `--if-stale` is what the systemd unit runs before the daemon starts: the
+// defect class layer C prevents is a *build* defect, identical on every start
+// of the same binary, so proving it once per version and kernel is exactly
+// enough. The bare subcommand is the maintainer's invocation after changing a
+// builder, and it always runs and always rewrites the stamp — the whole reason
+// to run it by hand is to distrust what is recorded.
+//
+// `unprovable` exits 0. The systemd unit lists SuccessExitStatus=0 1 2 so it
+// cannot fail a boot either way, but a non-zero code meaning "this kernel
+// cannot be asked" would show red in `systemctl status` on every container and
+// every hardened host — and it is the *ordinary* production state, since the
+// daemon holds CAP_NET_ADMIN and not CAP_SYS_ADMIN. A red that means nothing
+// gets ignored within a week, and takes the reds that mean something with it.
+func runSelftest(cfg *core.Config, o opts, stdout, stderr io.Writer) int {
+	store := core.NewStampStore(cfg.SelftestStampPath())
+
+	if o.ifStale && !store.Stale(shared.CurrentVersion, core.KernelRelease()) {
+		stamp := store.Read()
+		printStamp(stdout, stamp)
+		_, _ = fmt.Fprintln(stdout,
+			"            already recorded for this version and kernel; not run again")
+		return proofExitCode(stamp.Result)
+	}
+
+	stamp := selftestRunner()
+	if err := store.Write(stamp); err != nil {
+		// The proof ran; only the record of it failed. Reporting that and going
+		// on to print the result is deliberate — whoever ran this asked what the
+		// builder does on this kernel, and an unwritable data directory does not
+		// change the answer. A missing stamp reads as stale, so the next start
+		// simply proves it again.
+		_, _ = fmt.Fprintf(stderr,
+			"easywall-core: the self-test ran, but its result could not be recorded: %v\n", err)
+	}
+	recordProof(cfg, stamp)
+	printStamp(stdout, stamp)
+	return proofExitCode(stamp.Result)
+}
+
+// auditUserSelftest is who wrote a selftest_passed or selftest_failed line.
+//
+// Not "core" and not "console": neither is true. The proof runs in this binary,
+// under easywall-selftest.service before the daemon exists or under a
+// maintainer's hand at a shell, and the daemon it precedes never sees it. The
+// same distinction auditUserNoDaemon exists for — the log has to say which
+// process wrote a line without an operator inferring it from the timestamp.
+const auditUserSelftest = "selftest"
+
+// recordProof puts what the proof found into the audit log, with its detail.
+//
+// This is the *only* place SelftestStamp.Detail is durably recorded. It is
+// deliberately absent from HealthResult, because /healthz is unauthenticated by
+// necessity and the detail names a port number and the claim that failed, and
+// printStamp above puts it on a terminal that scrolls away. Without this half,
+// a field RunSelftest writes is read by nothing that outlives the invocation,
+// and the next maintainer deletes it as dead weight having no way to tell it
+// from some.
+//
+// unprovable writes nothing, and that is not the same omission as a missing
+// case. It is the ordinary state on every container and every host whose daemon
+// holds CAP_NET_ADMIN and not CAP_SYS_ADMIN, which is the normal systemd
+// installation — one line per boot saying the proof could not be attempted
+// would be the whole audit log on a machine that reboots, and it would push out
+// the apply and panic entries an operator actually greps for. computeHealth
+// treats unprovable as ok for the same reason: being unable to prove something
+// is not the same as it being broken. The journal carries it, once.
+//
+// Called from both the ran-and-recorded path and the path whose stamp write
+// failed. The proof ran either way, and an unwritable data directory does not
+// change what it found.
+func recordProof(cfg *core.Config, stamp shared.SelftestStamp) {
+	var action string
+	switch stamp.Result {
+	case shared.SelftestPassed:
+		action = "selftest_passed"
+	case shared.SelftestFailed:
+		action = "selftest_failed"
+	default:
+		return
+	}
+	core.WriteAuditLog(cfg.AuditLogPath(), action, "all", stamp.Detail, auditUserSelftest)
+}
+
+// proofExitCode maps a recorded result onto an exit code. Only a false claim is
+// a failure; see runSelftest for why `unprovable` is not.
+func proofExitCode(result shared.SelftestResult) int {
+	if result == shared.SelftestFailed {
+		return exitFailed
+	}
+	return exitOK
+}
+
+// panicTimeoutReport is runPanic's branch for a SendCommand error that is not
+// daemon-absence — extracted so it can be driven with a synthetic net.Error
+// timeout instead of a real 35 s dial against CommandTimeout(CmdPanic), which
+// is what a timeout on the panic socket actually takes.
+//
+// daemonAbsent is false for a timeout on purpose — a slow daemon is still a
+// daemon, and two writers to the table would be worse than one slow one. But
+// the daemon writes the marker before it touches the table, for the same
+// reason the no-daemon fallback below does, so by the time the deadline
+// expires the marker is on disk and the teardown is landing. Reporting only
+// "not answering" told an operator their firewall was still up when it very
+// likely was not.
+//
+// Read with PanicState and not PanicEngaged: the helper's default for an
+// unreadable marker is "engaged", which is the safe direction at a write that
+// would start filtering and the wrong one here, where it would claim a
+// teardown nobody can confirm.
+func panicTimeoutReport(cfg *core.Config, err error, stderr io.Writer) int {
+	_, _ = fmt.Fprintf(stderr, "easywall-core: the core daemon is not answering on %s: %v\n",
+		cfg.SocketPath, err)
+	engaged, known, _ := core.PanicState(cfg.PanicMarkerPath())
+	switch {
+	case known && engaged:
+		_, _ = fmt.Fprintf(stderr, "easywall-core: panic mode is recorded in %s, so the "+
+			"teardown was very likely started and may already be done. The rules will not "+
+			"come back on a restart. Run `easywall-core status` to see where it ended up.\n",
+			cfg.PanicMarkerPath())
+	case known && !engaged:
+		_, _ = fmt.Fprintf(stderr, "easywall-core: panic mode is NOT recorded in %s, so "+
+			"nothing was taken down. This machine is still filtering. Run "+
+			"`easywall-core status`, and try again once the daemon answers.\n",
+			cfg.PanicMarkerPath())
+	default:
+		_, _ = fmt.Fprintf(stderr, "easywall-core: and %s cannot be read, so whether panic "+
+			"mode was recorded is unknown. Run `easywall-core status`.\n",
+			cfg.PanicMarkerPath())
+	}
+	return exitFailed
+}
+
+func runPanic(cfg *core.Config, _ opts, stdout, stderr io.Writer) int {
+	resp, err := shared.SendCommand(cfg.SocketPath, shared.Command{Type: shared.CmdPanic})
+	if err != nil {
+		if !daemonAbsent(err) {
+			return panicTimeoutReport(cfg, err, stderr)
+		}
+
+		// A refused socket means no daemon is accepting — not that nothing is
+		// still writing. Two windows say otherwise: the boot restore runs before
+		// net.Listen, and Stop's rollback can still be flushing after the
+		// listener is closed and unlinked. What makes those survivable is the
+		// marker going on disk before this teardown *and* the daemon re-reading
+		// it after each write to the table, not before only: a check before a
+		// write cannot see a marker that appears during it, and the loser of
+		// that race would be a machine filtering with panic mode recorded, which
+		// every status surface reports as "deliberately not enforcing". See
+		// Firewall.panicLandedDuringWrite for the second half.
+		//
+		// The marker first, for the same reason the daemon writes it first: an
+		// operator who runs this, believes it worked and reboots must not meet
+		// the rules that made them run it.
+		_, _ = fmt.Fprintln(stdout, "The core daemon is not running.")
+		if err := core.EngagePanic(cfg.PanicMarkerPath()); err != nil {
+			_, _ = fmt.Fprintf(stderr, "easywall-core: %v\n", err)
+			return exitFailed
+		}
+		core.WriteAuditLog(cfg.AuditLogPath(), "panic_engaged", "all",
+			"the firewall was taken down from the console with no daemon running", auditUserNoDaemon)
+		if err := tearDownDirectly(); err != nil {
+			_, _ = fmt.Fprintf(stderr, "easywall-core: panic mode is recorded, but the table "+
+				"could not be torn down: %v\n", err)
+			return exitFailed
+		}
+		printPanicEngaged(stdout)
+		return exitOK
+	}
+	if !resp.Success {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: %s\n", resp.Error)
+		return exitFailed
+	}
+	printPanicEngaged(stdout)
+	return exitOK
+}
+
+func runResume(cfg *core.Config, _ opts, stdout, stderr io.Writer) int {
+	resp, err := shared.SendCommand(cfg.SocketPath, shared.Command{Type: shared.CmdResume})
+	if err != nil {
+		if !daemonAbsent(err) {
+			_, _ = fmt.Fprintf(stderr, "easywall-core: the core daemon is not answering on %s: %v\n",
+				cfg.SocketPath, err)
+			return exitFailed
+		}
+		// Only the marker. Putting the rules back is the daemon's job and it will
+		// do it the moment it starts — restoring from here would install a rule
+		// set nothing is then supervising.
+		_, _ = fmt.Fprintln(stdout, "The core daemon is not running.")
+		if err := core.ClearPanic(cfg.PanicMarkerPath()); err != nil {
+			_, _ = fmt.Fprintf(stderr, "easywall-core: %v\n", err)
+			return exitFailed
+		}
+		core.WriteAuditLog(cfg.AuditLogPath(), "panic_resumed", "all",
+			"panic mode was ended from the console with no daemon running", auditUserNoDaemon)
+		_, _ = fmt.Fprintln(stdout, "Panic mode is over. The rules come back when easywall-core starts:")
+		_, _ = fmt.Fprintln(stdout, "  systemctl start easywall-core")
+		return exitOK
+	}
+	if !resp.Success {
+		_, _ = fmt.Fprintf(stderr, "easywall-core: %s\n", resp.Error)
+		return exitFailed
+	}
+	// Said from the reply, not assumed from Success: this line used to promise
+	// "the stored rules are back in force" after every RESUME, including on an
+	// installation where nothing had ever been applied and nothing was written.
+	var res shared.ResumeResult
+	if err := json.Unmarshal(resp.Data, &res); err != nil {
+		_, _ = fmt.Fprintln(stdout, "Panic mode is over. Run `easywall-core status` to see what is in force.")
+		return exitOK
+	}
+	switch {
+	case res.WasEngaged && res.Restored:
+		_, _ = fmt.Fprintln(stdout, "Panic mode is over and the stored rules are back in force.")
+	case res.WasEngaged:
+		_, _ = fmt.Fprintln(stdout, "Panic mode is over. Nothing has ever been applied here, so there were")
+		_, _ = fmt.Fprintln(stdout, "no rules to put back: the first apply in the web interface starts filtering.")
+	case res.Restored:
+		_, _ = fmt.Fprintln(stdout, "Panic mode was not engaged. The stored rules were written again and are in force.")
+	default:
+		_, _ = fmt.Fprintln(stdout, "Panic mode was not engaged, and nothing has ever been applied here.")
+		_, _ = fmt.Fprintln(stdout, "Nothing changed.")
+	}
+	return exitOK
+}

@@ -1,0 +1,1280 @@
+package core
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"os/exec"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sys/unix"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// Daemon listens on a Unix socket and dispatches typed commands to the Firewall.
+// The socket is owned by root:easywall with mode 0660 so the web process
+// (running as user easywall) can connect without root privileges.
+type Daemon struct {
+	cfg      *Config
+	firewall *Firewall
+	wg       sync.WaitGroup
+	quit     chan struct{}
+	quitOnce sync.Once
+
+	// mu guards listener, and orders every d.wg.Add the daemon makes against
+	// the d.wg.Wait inside Stop — see track. Start writes the listener and Stop
+	// reads it, and the two are called from different goroutines — Start blocks
+	// for the process lifetime, so Stop necessarily runs on another one.
+	// Without this, a SIGTERM arriving while the socket is still being set up
+	// races the write.
+	mu       sync.Mutex
+	listener net.Listener
+	// peerWait holds the connections that are blocked on their peer — reading
+	// its request or writing it the reply — so Stop can close them rather than
+	// wait for them. Guarded by mu. Not the ones in dispatch: those are doing
+	// work the client is owed an answer for.
+	peerWait map[net.Conn]struct{}
+
+	// login folds bursts of stranger-triggerable login events into two lines.
+	// Built on first use so a Daemon constructed by hand in a test still records.
+	loginOnce sync.Once
+	login     *loginEvents
+
+	// packets is the refused-packet ring behind GET_PACKET_LOG. Built by
+	// NewDaemon; packetLog() builds one for a Daemon constructed by hand.
+	packetsOnce sync.Once
+	packets     *PacketLog
+
+	// listenPacketLog binds the NFLOG group. A field so a test can make the
+	// bind fail without a second program holding a real group.
+	listenPacketLog func(p *PacketLog, group uint16) (func(), error)
+	// packetsStop ends the listener started by startPacketLog. nil until a
+	// bind has succeeded.
+	packetsStop func()
+}
+
+// NewDaemon initialises the daemon. Call Start() to begin accepting connections.
+func NewDaemon(cfg *Config) (*Daemon, error) {
+	if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+	dataDirIsShared(cfg.DataDir)
+	if err := os.MkdirAll(cfg.LogDir, 0750); err != nil {
+		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	tightenAuditLog(cfg.AuditLogPath())
+
+	fw, err := NewFirewall(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("init firewall: %w", err)
+	}
+
+	packets := NewPacketLog(cfg.PacketLogEntries())
+	if cfg.PacketLogPersist() {
+		if err := packets.Persist(cfg.PacketLogPath()); err != nil {
+			slog.Error("the packet log cannot use its file; it runs in memory only and "+
+				"starts empty after every restart", "path", cfg.PacketLogPath(), "error", err)
+		}
+	}
+
+	return &Daemon{
+		cfg:      cfg,
+		firewall: fw,
+		quit:     make(chan struct{}),
+		packets:  packets,
+	}, nil
+}
+
+func (d *Daemon) packetLog() *PacketLog {
+	d.packetsOnce.Do(func() {
+		if d.packets == nil {
+			d.packets = NewPacketLog(d.cfg.PacketLogEntries())
+		}
+	})
+	return d.packets
+}
+
+// startPacketLog binds the NFLOG group and, only if that worked, points the log
+// rules at it. Before the boot restore, so the rules the restore writes are
+// already the right ones.
+//
+// A failure is loud and changes nothing else: the sink stays the kernel log,
+// which is what this host had before 2.21.
+func (d *Daemon) startPacketLog() {
+	group := d.cfg.PacketLogGroup()
+	listen := d.listenPacketLog
+	if listen == nil {
+		listen = func(p *PacketLog, g uint16) (func(), error) { return p.listen(g) }
+	}
+	stop, err := listen(d.packetLog(), group)
+	if err != nil {
+		// Recorded here as well as inside listen: the page reads the reason,
+		// and it must be there whichever way the bind failed.
+		d.packetLog().setListening(group, err)
+		slog.Error("the packet log could not bind its NFLOG group, so the Blocked page "+
+			"stays empty and logged packets go to the kernel log instead. \"operation not "+
+			"permitted\" means either another collector (ulogd2, usually) holds this "+
+			"group — set [packet_log] nflog_group in easywall.toml to a free one — or "+
+			"easywall-core lacks CAP_NET_ADMIN; fix the cause and restart",
+			"group", group, "error", err)
+		return
+	}
+	// Under d.mu with a quit check, as Start does for its socket: Stop reads
+	// packetsStop once, so a stop installed after a concurrent Stop would leave
+	// the group bound by a daemon that has shut down. The sink is set inside the
+	// same section, or a Stop between the two could end the listener and leave
+	// the rules pointing at a group nobody reads.
+	//
+	// Lock order d.mu → m.mu. Nothing holding m.mu can reach d.mu: only
+	// daemon.go refers to *Daemon. And nothing else holds m.mu yet — this runs
+	// before the restore, the socket and the watchdog — so the section stays a
+	// few field writes long, which pingWatchdog's TryLock relies on.
+	d.mu.Lock()
+	select {
+	case <-d.quit:
+		d.mu.Unlock()
+		stop()
+		return
+	default:
+		d.packetsStop = stop
+		d.firewall.nft.SetLogSink(logSink{nflog: true, group: group})
+		d.mu.Unlock()
+	}
+	slog.Info("packet log listening", "group", group)
+}
+
+// Start creates the Unix socket and begins accepting connections.
+// Blocks until Stop() is called.
+func (d *Daemon) Start() error {
+	// If Stop already ran before the restore could start, do not restore.
+	// A daemon told to stop before it began must not start writing to the kernel.
+	d.mu.Lock()
+	select {
+	case <-d.quit:
+		d.mu.Unlock()
+		return nil
+	default:
+		d.mu.Unlock()
+	}
+
+	// A data directory that survived with a log directory that did not — the
+	// container-recreate case logDirLooksLost describes. Said at every start
+	// until the log has an entry, which the first apply writes. This has to be
+	// the first thing Start reads the log directory for: the panic-marker
+	// check just below can itself write to AuditLogPath() when the marker is
+	// unreadable, and a boot with both an unreadable marker and a lost log
+	// directory must still warn about the lost directory rather than have that
+	// write make the log look merely rotated.
+	if state, err := d.firewall.RulesStore().GetState(); err == nil &&
+		logDirLooksLost(d.cfg.AuditLogPath(), state.Current) {
+		slog.Warn("the audit log is missing or empty although rules are configured: "+
+			"log_dir did not survive while data_dir did. In a container, mount "+
+			"/var/log/easywall — without it every update starts a new, empty log",
+			"log_dir", d.cfg.LogDir)
+	}
+
+	// One loud entry, once, if the panic marker cannot be read at all.
+	//
+	// PanicEngaged answers an unreadable marker with "engaged", so the restore
+	// below will decline to filter and the machine comes up open. That default
+	// is right — the alternative is filtering a machine somebody deliberately
+	// unfiltered — but it is indistinguishable from real panic mode everywhere
+	// an operator looks: the banner, `easywall-core status` and the status reply
+	// all read one boolean. Worse, the same unreadable marker reaches
+	// Firewall.rollback, which now goes ahead when the state is unknown
+	// precisely because it must not withdraw the acceptance window's undo on a
+	// permission fault. So the fault is reported here, in the audit log, with
+	// the path and the errno — the one place a fault this systemic is worth a
+	// line — rather than by every caller that trips over it.
+	//
+	// boot_enforce_failed, not an action of its own: the consequence is exactly
+	// what that action already means. The stored rules are not going into the
+	// kernel at this start, and it is already registered in auditActionLabels,
+	// auditActionTones, both locales and the documented colour table.
+	if _, known, markerErr := PanicState(d.cfg.PanicMarkerPath()); !known {
+		WriteAuditLog(d.cfg.AuditLogPath(), "boot_enforce_failed", "all",
+			fmt.Sprintf("%s: cannot read the panic marker %s: %v — the stored rules are "+
+				"not being restored, and this machine is not filtering",
+				RestoreReasonBoot, d.cfg.PanicMarkerPath(), markerErr), "core")
+	}
+
+	// Before the restore: the rules it writes must already point at the group,
+	// or the first minutes after every boot are logged nowhere anyone reads.
+	d.startPacketLog()
+
+	// Restore the stored rules before the listener is created. The socket is the
+	// only thing that makes this process observable, so putting the kernel work
+	// first ensures no client can observe a half-restored firewall by construction.
+	//
+	// The quit check above used to leave a window of a few instructions before
+	// the Add below, tolerated on the grounds that a restore installing the
+	// already-stored rules on a daemon that is shutting down leaves the kernel
+	// holding exactly what the machine is supposed to have. track closes it as a
+	// side effect: it re-reads d.quit under d.mu, so the slot and the decision
+	// to restore are now the same step.
+	//
+	// The WaitGroup exists so Stop() waits for kernel work, not for client connections.
+	// Its scope is the restore only, not the accept loop, so the counter is released
+	// the moment the restore returns. Extending it over the loop would couple
+	// shutdown correctness to Stop() closing the listener first, a dependency that
+	// is not obvious and should not exist.
+	//
+	// track rather than a bare Add, here and at every other Add below, for the
+	// reason given on it.
+
+	if !d.track() {
+		return nil
+	}
+	func() {
+		defer d.wg.Done()
+		if err := d.firewall.RestoreCurrent(RestoreReasonBoot); err != nil {
+			slog.Error("could not put the stored rules back at startup; this machine "+
+				"is not filtering — open the interface and apply, or run "+
+				"`easywall-core status` to see why", "error", err)
+		}
+	}()
+
+	// Tracked in wg so Stop waits for it rather than leaving it polling into a
+	// closed daemon. Deliberately outside the closure above: that one releases
+	// its wg slot the instant the boot restore returns, specifically so d.wg
+	// does not span the whole daemon lifetime (see the comment on it). This
+	// goroutine's job only starts once the boot restore has already run, and
+	// it can poll for up to reconcileWait — Stop has to wait for it to notice
+	// d.quit, not for the boot restore that came before it.
+	if d.track() {
+		go func() {
+			defer d.wg.Done()
+			d.firewall.reconcileDockerBridges(d.quit)
+		}()
+	}
+
+	// The counter ticker, tracked in wg for the same reason as the reconciler:
+	// Stop waits for it to notice d.quit rather than leaving it reading netlink
+	// into a closed daemon. It keeps running at usage.interval = 0, so a SIGHUP
+	// can switch it back on.
+	if d.track() {
+		go func() {
+			defer d.wg.Done()
+			d.firewall.collectUsagePeriodically(d.quit)
+		}()
+	}
+
+	// Remove stale socket file if it exists
+	_ = os.Remove(d.cfg.SocketPath)
+
+	ln, err := net.Listen("unix", d.cfg.SocketPath)
+	if err != nil {
+		return fmt.Errorf("listen on %s: %w", d.cfg.SocketPath, err)
+	}
+
+	d.mu.Lock()
+	select {
+	case <-d.quit:
+		// Stop already ran: it saw no listener and closed nothing, so this one
+		// would leak and keep accepting. Close it here instead.
+		d.mu.Unlock()
+		_ = ln.Close()
+		return nil
+	default:
+		d.listener = ln
+		d.mu.Unlock()
+	}
+
+	// Set socket permissions: root:easywall 0660.
+	//
+	// The group is the entire link to the web process: it runs as easywall, and
+	// a socket left owned by root:root is one it cannot connect to at all. That
+	// is what the packaged unit produced — CapabilityBoundingSet=CAP_NET_ADMIN
+	// leaves a root process without CAP_CHOWN, the chown failed, and this was a
+	// warning nobody reads on a daemon that then reported "daemon listening" as
+	// though the interface would work. It never did.
+	//
+	// Passing -1 for the owner asks only for the group to change, which the
+	// owner of a file may do for a group it belongs to without any capability.
+	// The unit puts the daemon in the easywall group for exactly that reason.
+	// #nosec G302 -- 0660 is the point of the socket, not an oversight: the web
+	// process runs as easywall and connecting needs write. Read the note above for
+	// what the group ownership is doing, and what happened when it was missing.
+	if err := os.Chmod(d.cfg.SocketPath, 0660); err != nil {
+		slog.Warn("could not chmod socket", "error", err)
+	}
+	gid, err := lookupGroup("easywall")
+	switch {
+	case err != nil:
+		// No such group: a manual installation that runs both processes as the
+		// same user. Nothing to hand over.
+		slog.Warn("no easywall group; leaving the socket's group as it is", "error", err)
+	default:
+		if err := os.Chown(d.cfg.SocketPath, -1, gid); err != nil {
+			slog.Error("could not give the socket to the easywall group — "+
+				"easywall-web runs as that user and will not be able to connect, "+
+				"so the whole interface will report the core as unreachable. "+
+				"Run the core as a member of the easywall group (Group=easywall in "+
+				"easywall-core.service) or grant it CAP_CHOWN",
+				"socket", d.cfg.SocketPath, "error", err)
+		}
+	}
+
+	slog.Info("daemon listening", "socket", d.cfg.SocketPath)
+
+	// Type=notify. Under Type=simple the unit was active (running) the instant
+	// exec succeeded, which is before every line above this one — so
+	// easywall-web.service's After=easywall-core.service was satisfied by a core
+	// whose socket did not exist yet, and the web process reported an
+	// unreachable core on every page until it happened to retry late enough.
+	//
+	// This is the last statement before the accept loop for a reason: what
+	// Type=notify asserts is not "the process started" but "the socket is there
+	// and has the ownership the easywall group needs", which is only true after
+	// the chmod and the chown above. Moving it earlier would put back the exact
+	// race it was added to close, and the failure would look like an
+	// intermittently unreachable core on slow hosts.
+	NotifyReady()
+
+	// The watchdog, and deliberately not a bare ticker — see pingWatchdog for
+	// what "answering" is taken to mean and what was rejected. It returns
+	// immediately when the unit has no WatchdogSec=, which is every install
+	// before this release and every non-systemd host, so the goroutine is not
+	// even started in that case.
+	//
+	// track rather than a bare Add, for the reason given on track: this Add can
+	// be the transition from zero on a daemon whose Docker coexistence is off
+	// and whose usage.interval is 0, and Stop's Wait runs on another goroutine.
+	if every := WatchdogInterval(); every > 0 && d.track() {
+		go func() {
+			defer d.wg.Done()
+			d.pingWatchdog(every)
+		}()
+	}
+
+	// At most maxConns connections are served at once and maxQueued more wait;
+	// past that a connection is closed unserved. This loop used to accept
+	// without limit, and each served connection can hold MaxMessageBytes of
+	// request: 32 clients each sending 8 MiB−1 and never closing took the heap
+	// from 4 MiB to 286 MiB. Queued rather than refused, so a burst from the
+	// web process waits milliseconds instead of failing.
+	//
+	// A root peer — the console — skips both. The first cap was a semaphore in
+	// front of Accept, so sixteen idle connections from the web process left
+	// `easywall-core panic` in the listen backlog until its client timed out:
+	// the unprivileged side could keep the operator's last resort from being
+	// heard.
+	serving := make(chan struct{}, maxConns)
+	admitted := make(chan struct{}, maxConns+maxQueued)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			select {
+			case <-d.quit:
+				return nil
+			default:
+				slog.Error("accept error", "error", err)
+				continue
+			}
+		}
+		// Registered, or refused and closed — see track.
+		//
+		// A refusal means Stop has closed d.quit, but not that the listener is
+		// shut: Stop closes it a few statements later, after releasing d.mu. So
+		// for that window Accept keeps succeeding and each connection is taken
+		// and closed again. That is bounded by whatever a client manages to dial
+		// in those few statements and ends the moment the close lands, after
+		// which Accept fails into the quit branch above and the loop returns —
+		// so it is not a spin, but it is not one connection either.
+		if !d.track() {
+			_ = conn.Close()
+			continue
+		}
+		go func() {
+			defer d.wg.Done()
+			if isConsolePeer(conn) {
+				d.handleConn(conn)
+				return
+			}
+			select {
+			case admitted <- struct{}{}:
+				defer func() { <-admitted }()
+			default:
+				slog.Warn("socket connection refused: too many open", "limit", maxConns+maxQueued)
+				_ = conn.Close()
+				return
+			}
+			select {
+			case serving <- struct{}{}:
+				defer func() { <-serving }()
+			case <-d.quit:
+				_ = conn.Close()
+				return
+			}
+			d.handleConn(conn)
+		}()
+	}
+}
+
+// isConsolePeer reports whether the kernel says conn's peer is root. A
+// variable so a test, which never has a root peer of its own — or always does,
+// under sudo — can choose which connection is the console.
+var isConsolePeer = func(conn net.Conn) bool {
+	uid, _, err := peerCred(conn)
+	return err == nil && uid == 0
+}
+
+// track takes a slot in d.wg for a piece of work the daemon is about to start,
+// and reports whether it got one. Every Add in Start goes through here — the
+// four that can be the transition from a counter of zero.
+//
+// The two Adds outside Start do not, and must not. The apply goroutine in
+// dispatch and the login sweeper in loginEventLog are both reached from
+// handleConn, which is already holding the slot track gave it, so neither can
+// be an Add at zero by that route; and refusing either during shutdown would be
+// wrong rather than merely unnecessary. The apply's slot is what makes Stop wait
+// for an open acceptance window's rollback instead of abandoning it — see
+// TestAcceptance_ShutdownBeforeTheWindowOpensDoesNotOpenOne — and the sweeper's
+// is inside a sync.Once, so a refusal would leave the debouncer with no sweeper
+// for the rest of the process. Their zero-safety therefore rests on the
+// accept-loop slot being held above them, which is true and unguarded.
+//
+// It exists for the ordering, not the bookkeeping. sync.WaitGroup.Add's own
+// documentation forbids "calls with a positive delta that start when the counter
+// is zero" that do not happen before a Wait, and reports that pairing as a data
+// race on wg.sema by design. Start does exactly that, four times over: the boot
+// restore is the first Add and so always at zero, the reconciler's and the
+// ticker's are at zero whenever the work before them has already finished, and
+// the accept loop's is at zero once both of those have returned — which is the
+// ordinary state of a daemon whose Docker coexistence is off and whose
+// usage.interval is 0. Stop's d.wg.Wait() runs on another goroutine, so nothing
+// ordered any of them against it, and a connection accepted in that instant
+// could be one Wait had already stopped waiting for: dropped at
+// `systemctl restart easywall-core`, and reported by the web process as an
+// unreachable core.
+//
+// d.mu is the ordering. Stop closes d.quit before it takes d.mu, and waits after
+// it has released it, so a critical section here either runs before Stop's — in
+// which case the mutex puts its Add before the Wait — or runs after it, sees the
+// closed channel and adds nothing. Refusing is the right answer at that point:
+// Stop is followed by process exit.
+//
+// Deliberately not a slot held for the accept loop's lifetime, and not a
+// done-channel Stop waits on. Either would make shutdown depend on Stop closing
+// the listener first, because the loop only returns when Accept fails — the
+// dependency the comment on Start rejects. This adds no wait to Stop at all; it
+// only decides, under the lock Stop already takes, whether an Add may still
+// happen.
+func (d *Daemon) track() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	select {
+	case <-d.quit:
+		return false
+	default:
+		d.wg.Add(1)
+		return true
+	}
+}
+
+// pingWatchdog resets systemd's watchdog timer for as long as the daemon can be
+// shown to be answering, and stops the moment it cannot. Returns when Stop
+// closes d.quit.
+//
+// **What "answering" means here, exactly**: this goroutine is still being
+// scheduled, and d.mu can be acquired — the mutex Start takes to install the
+// listener, Stop takes to take it away, and track takes for every piece of work
+// the daemon starts. That is a narrower claim than "a client would get a reply",
+// and it is narrower on purpose.
+//
+// Rejected: dialling d.cfg.SocketPath and sending a real command. It is the only
+// thing that would prove a reply end to end, and it buys that with two costs a
+// firewall daemon cannot pay. A command can queue behind an apply's nft
+// subprocess for up to NftTimeout — thirty seconds, per NftablesManager's own
+// comment — so a perfectly healthy core in the middle of `nft -f` would miss its
+// pings and be killed and restarted mid-apply, by the watchdog, on the one
+// process on the machine that must not be interrupted there. And a probe
+// connection that cannot be answered goes through handleConn, which logs: one
+// line per interval for the life of a misconfigured install, which is the
+// failure mode notify() refuses.
+//
+// What is left is still not a bare ticker, which is the thing that would be
+// dishonest: a ticker alone satisfies systemd for ever regardless of the
+// process's state, and that is the one failure a watchdog exists to catch. This
+// stops pinging on a runtime that has stopped scheduling this goroutine at all —
+// a total deadlock, thread exhaustion, an unbounded GC — and on a Stop or a
+// track wedged holding d.mu. It does **not** catch a hung nft subprocess; the
+// health check added in this release is what reports that, and it reports it to
+// an operator rather than to a killer.
+func (d *Daemon) pingWatchdog(every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+
+	// Two consecutive failures, not one, and the counter is here rather than a
+	// wider TryLock timeout.
+	//
+	// A critical section on d.mu is a few field reads, so a single failed
+	// TryLock is far more likely to be an unlucky sample than a wedge — and
+	// skipping on it would put the daemon's life on a boundary it cannot win.
+	// The interval is WatchdogSec/2, so a ping at t=0 and one skipped at t=30
+	// puts the next attempt at t=60+ε against a deadline of exactly t=60, and Go
+	// tickers drift late rather than early. This comment used to claim "one
+	// missed ping costs nothing at all", which was a margin that did not exist.
+	//
+	// Stopping on the second consecutive failure says what was meant: a wedge,
+	// not one sample. It keeps the last ping at most one interval old whenever
+	// the daemon is merely contended, and a real wedge still loses every ping
+	// from the second one on — so systemd kills it one interval later than it
+	// otherwise would, which on a 60s watchdog is 90s instead of 60s.
+	missed := 0
+
+	for {
+		select {
+		case <-d.quit:
+			return
+		case <-t.C:
+			if d.mu.TryLock() {
+				d.mu.Unlock()
+				missed = 0
+			} else {
+				missed++
+			}
+			if missed < 2 {
+				NotifyWatchdog()
+			}
+		}
+	}
+}
+
+// currentListener returns the active listener, or nil once Stop has run.
+// Anything outside Start must go through this rather than reading the field:
+// Start writes it from its own goroutine, so an unguarded read is a race.
+func (d *Daemon) currentListener() net.Listener {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.listener
+}
+
+// setListener installs a listener. Used by Start and by tests that supply
+// their own socket.
+func (d *Daemon) setListener(ln net.Listener) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.listener = ln
+}
+
+// Stop gracefully shuts down the daemon. Safe to call more than once, and safe
+// to call before or during Start.
+//
+// The order of the first three statements is load-bearing, not stylistic:
+// d.quit is closed before d.mu is taken and d.mu is released before d.wg is
+// waited on, which is what makes every Add in track either happen before this
+// Wait or not happen at all. Read track before moving any of them.
+func (d *Daemon) Stop() {
+	d.quitOnce.Do(func() { close(d.quit) })
+
+	d.mu.Lock()
+	ln := d.listener
+	d.listener = nil
+	d.mu.Unlock()
+
+	if ln != nil {
+		_ = ln.Close()
+	}
+
+	// Close every connection that is waiting on its peer. They used to be
+	// waited for like any other work: one client that dialled and never wrote
+	// held this Stop — and `systemctl restart easywall-core` — until SIGKILL.
+	// Under d.mu, after d.quit, so waitOnPeer either registered before this
+	// sweep or refuses afterwards: track's ordering argument.
+	d.mu.Lock()
+	for c := range d.peerWait {
+		_ = c.Close()
+	}
+	stopPackets := d.packetsStop
+	d.mu.Unlock()
+	if stopPackets != nil {
+		stopPackets()
+	}
+
+	// End an open acceptance window before waiting, or Stop blocks for as long
+	// as that window has left — up to an hour. Cancelling it counts as "not
+	// confirmed", so the rules roll back, which is what the window promises: the
+	// operator did not confirm, and the reason they did not is that the machine
+	// was told to stop.
+	//
+	// The latching variant, because the window may not be open yet. An apply
+	// that is between beginApply and Start — a rules read, a backup write, an
+	// nft snapshot subprocess and a promote — would otherwise swallow this
+	// cancel and open a full-length window with Stop already waiting on it.
+	d.firewall.ShutdownAcceptance()
+
+	d.wg.Wait()
+	_ = os.Remove(d.cfg.SocketPath)
+}
+
+// maxConns is how many socket connections the core serves at once. The web
+// process sends a handful concurrently — a status poll, the page being loaded,
+// a feed update — so sixteen is headroom, and it bounds what the requests can
+// hold in memory at sixteen times MaxMessageBytes.
+const maxConns = 16
+
+// maxQueued is how many more wait for one of those slots before a connection
+// is closed unserved. A waiting connection has read nothing, so it holds a
+// descriptor and a goroutine, not a request.
+const maxQueued = 48
+
+// requestTimeout bounds reading a request. Every client writes its whole
+// request the moment it connects (shared.SendCommand), so this is
+// milliseconds in practice; at connTimeout an idle connection held a serving
+// slot for 35 s and could be renewed for ever.
+var requestTimeout = 5 * time.Second
+
+// connTimeout bounds each wait on a peer: reading its request, writing its
+// reply. It is the longest any client waits for a reply (CommandTimeout), so
+// no client within its own deadline is cut off; past it, the client has given
+// up. Dispatch is not under it — an import's `nft --check` runs between the two.
+var connTimeout = func() time.Duration {
+	var longest time.Duration
+	for _, c := range shared.AllCommandTypes {
+		longest = max(longest, shared.CommandTimeout(c))
+	}
+	return longest
+}()
+
+// waitOnPeer registers conn as blocked on its peer, so Stop can close it, and
+// reports false — registering nothing — once Stop has run.
+func (d *Daemon) waitOnPeer(conn net.Conn) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	select {
+	case <-d.quit:
+		return false
+	default:
+	}
+	if d.peerWait == nil {
+		d.peerWait = make(map[net.Conn]struct{})
+	}
+	d.peerWait[conn] = struct{}{}
+	return true
+}
+
+func (d *Daemon) doneWaitingOnPeer(conn net.Conn) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.peerWait, conn)
+}
+
+func (d *Daemon) handleConn(conn net.Conn) {
+	defer conn.Close()
+
+	// No deadline here used to mean a client that never finished its request
+	// held a goroutine, its memory and a Stop for ever.
+	if !d.waitOnPeer(conn) {
+		return
+	}
+	_ = conn.SetDeadline(time.Now().Add(requestTimeout))
+
+	// One byte past the limit, so a request that is too long is refused as
+	// that. Cut at the limit, it used to reach json.Unmarshal truncated and be
+	// answered "invalid JSON command" — indistinguishable from a malformed one.
+	data, err := io.ReadAll(io.LimitReader(conn, shared.MaxMessageBytes+1))
+	d.doneWaitingOnPeer(conn)
+	if err != nil {
+		slog.Warn("read command error", "error", err)
+		return
+	}
+	if len(data) > shared.MaxMessageBytes {
+		slog.Warn("command refused: longer than the socket limit", "limit", shared.MaxMessageBytes)
+		d.sendError(conn, shared.ErrRequestTooLargeText)
+		return
+	}
+
+	var cmd shared.Command
+	if err := json.Unmarshal(data, &cmd); err != nil {
+		d.sendError(conn, "invalid JSON command")
+		return
+	}
+
+	// PANIC and RESUME are the console's. The socket is root:easywall 0660, so
+	// the group alone admits easywall-web; until this check any client of the
+	// socket could tear the firewall down or re-arm it, and the audit log said
+	// "console" either way. The kernel's view of the peer decides, not the
+	// request.
+	if cmd.Type == shared.CmdPanic || cmd.Type == shared.CmdResume {
+		uid, pid, err := peerCred(conn)
+		if err != nil || uid != 0 {
+			slog.Warn("console-only command refused", "command", cmd.Type,
+				"peer_uid", uid, "peer_pid", pid, "error", err)
+			d.sendError(conn, shared.ErrConsoleOnlyText)
+			return
+		}
+	}
+
+	resp := d.dispatch(cmd)
+	out, _ := json.Marshal(resp)
+	// A fresh deadline: dispatch may have used most of the first. Written even
+	// when Stop ran during dispatch — the work is done and the client is owed
+	// the answer; the deadline bounds that case instead of Stop's sweep.
+	_ = conn.SetDeadline(time.Now().Add(connTimeout))
+	if d.waitOnPeer(conn) {
+		defer d.doneWaitingOnPeer(conn)
+	}
+	_, _ = conn.Write(out)
+}
+
+func (d *Daemon) dispatch(cmd shared.Command) shared.Response {
+	switch cmd.Type {
+	case shared.CmdGetStatus:
+		status := d.firewall.Status()
+		data, _ := json.Marshal(status)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdGetRules:
+		state, err := d.firewall.RulesStore().GetState()
+		if err != nil {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(state)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdSaveRules:
+		var payload shared.SaveRulesPayload
+		if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+			return errResp(fmt.Errorf("invalid payload: %w", err))
+		}
+		// Read the set being replaced first, so the audit entry can say what
+		// changed rather than only that something did.
+		before, _ := d.firewall.RulesStore().GetState()
+		if err := d.firewall.RulesStore().SaveStaged(payload.RuleType, payload.Rules); err != nil {
+			return errResp(err)
+		}
+		after, _ := d.firewall.RulesStore().GetState()
+		WriteAuditLog(d.cfg.AuditLogPath(), "rules_saved", payload.RuleType,
+			shared.DescribeRuleChange(payload.RuleType, before.Staged, after.Staged), "web")
+		return shared.Response{Success: true}
+
+	case shared.CmdApplyRules:
+		// Checked synchronously, before the slot and before the goroutine, for
+		// the same reason ErrApplyInProgress is checked synchronously below:
+		// the answer the caller needs is "did this start", and apply() already
+		// refuses this case on its own — but apply() runs inside the goroutine
+		// below, where its error is only logged. Without this, a browser
+		// clicking Apply while the console has run `panic` got back
+		// {"status":"started"} and never anything else; the operator had no
+		// way to learn their apply did nothing short of reading the daemon's
+		// own log. This check can still race a `panic` that lands after it and
+		// before beginApply — apply()'s own check is what closes that window;
+		// this one only makes the ordinary case visible.
+		if d.firewall.PanicEngaged() {
+			return errResp(ErrPanicEngaged)
+		}
+
+		// The slot is claimed here, synchronously, before anything is reported.
+		// This used to start the goroutine unconditionally and answer "started"
+		// every time, which was untrue for the second request: it did not start,
+		// it queued inside Apply's mutex until the open acceptance window closed,
+		// and then ran on its own. See ErrApplyInProgress for what that did to an
+		// operator, and to shutdown.
+		if !d.firewall.beginApply() {
+			return errResp(ErrApplyInProgress)
+		}
+
+		// Apply runs asynchronously to avoid blocking the socket.
+		// The caller must poll CmdGetStatus to track acceptance progress.
+		//
+		// Tracked in d.wg so Stop waits for it. Until it was, stopping in the
+		// middle of an acceptance window — a package upgrade, systemctl
+		// restart, a SIGTERM — abandoned the goroutine holding that window: the
+		// unconfirmed rules stayed live and the rollback never ran.
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			defer d.firewall.endApply()
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Error("apply panic recovered", "error", r)
+				}
+			}()
+			if err := d.firewall.apply("web"); err != nil {
+				slog.Error("apply error", "error", err)
+			}
+		}()
+		data, _ := json.Marshal(map[string]string{"status": "started"})
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdAccept:
+		// Whether it landed is the answer the caller needs: a confirmation that
+		// arrives after the window closed must not be reported as success.
+		data, _ := json.Marshal(shared.AcceptResult{Accepted: d.firewall.Accept()})
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdCancelAcceptance:
+		// Whether it landed is the answer the caller needs, exactly as for
+		// ACCEPT: a rollback that arrives after the window closed undid nothing.
+		data, _ := json.Marshal(shared.CancelResult{Cancelled: d.firewall.Rollback()})
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdGetOptions:
+		opts := d.firewall.Options()
+		data, _ := json.Marshal(opts)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdSaveOptions:
+		var opts shared.FirewallOptions
+		if err := json.Unmarshal(cmd.Payload, &opts); err != nil {
+			return errResp(fmt.Errorf("invalid payload: %w", err))
+		}
+		changed := shared.DescribeStructChange(d.firewall.Options(), opts)
+		if err := d.cfg.SaveFirewallOptions(opts); err != nil {
+			return errResp(err)
+		}
+		WriteAuditLog(d.cfg.AuditLogPath(), "options_saved", "", changed, "web")
+		return shared.Response{Success: true}
+
+	case shared.CmdGetSettings:
+		s := d.cfg.NetworkSettings()
+		data, _ := json.Marshal(s)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdSaveSettings:
+		var s shared.NetworkSettings
+		if err := json.Unmarshal(cmd.Payload, &s); err != nil {
+			return errResp(fmt.Errorf("invalid payload: %w", err))
+		}
+		changed := shared.DescribeStructChange(d.cfg.NetworkSettings(), s)
+		if err := d.cfg.SaveNetworkSettings(s); err != nil {
+			return errResp(err)
+		}
+		WriteAuditLog(d.cfg.AuditLogPath(), "settings_saved", "", changed, "web")
+		return shared.Response{Success: true}
+
+	case shared.CmdGetSystem:
+		s := d.cfg.SystemSettings()
+		data, _ := json.Marshal(s)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdSaveSystem:
+		var s shared.SystemSettings
+		if err := json.Unmarshal(cmd.Payload, &s); err != nil {
+			return errResp(fmt.Errorf("invalid payload: %w", err))
+		}
+		changed := shared.DescribeStructChange(d.cfg.SystemSettings(), s)
+		if err := d.cfg.SaveSystemSettings(s); err != nil {
+			return errResp(err)
+		}
+		WriteAuditLog(d.cfg.AuditLogPath(), "system_saved", "", changed, "web")
+		return shared.Response{Success: true}
+
+	case shared.CmdGetLog:
+		entries, err := readAuditLog(d.cfg.AuditLogPath(), 200)
+		if err != nil && !os.IsNotExist(err) {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(entries)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdGetPacketLog:
+		var f shared.PacketLogFilter
+		if len(cmd.Payload) > 0 {
+			if err := json.Unmarshal(cmd.Payload, &f); err != nil {
+				return errResp(fmt.Errorf("invalid payload: %w", err))
+			}
+		}
+		res, err := d.packetLog().Query(f)
+		if err != nil {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(res)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdExportRules:
+		data, err := d.firewall.RulesStore().ExportStaged()
+		if err != nil {
+			return errResp(err)
+		}
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdImportRules:
+		// The editor runs every custom rule past `nft --check` before saving it;
+		// import did not, so a file could carry a rule the editor would have
+		// refused. Same check, same path.
+		var incoming shared.Rules
+		if err := json.Unmarshal(cmd.Payload, &incoming); err != nil {
+			return errResp(fmt.Errorf("invalid import data: %w", err))
+		}
+		errs, err := validateCustomRules(incoming.Custom)
+		if err != nil {
+			return errResp(err)
+		}
+		if len(errs) > 0 {
+			lines := make([]string, 0, len(errs))
+			for i, msg := range errs {
+				lines = append(lines, fmt.Sprintf("custom rule %d: %s", i+1, msg))
+			}
+			sort.Strings(lines)
+			return errResp(fmt.Errorf("import validation failed: %s", strings.Join(lines, "; ")))
+		}
+		if err := d.firewall.RulesStore().ImportRules(cmd.Payload); err != nil {
+			return errResp(err)
+		}
+		WriteAuditLog(d.cfg.AuditLogPath(), "rules_imported", "all",
+			fmt.Sprintf("%d tcp, %d udp, %d blocklist, %d allowlist",
+				len(incoming.TCP), len(incoming.UDP),
+				len(incoming.Blocklist), len(incoming.Allowlist)), "web")
+		return shared.Response{Success: true}
+
+	case shared.CmdValidateCustom:
+		var payload shared.ValidateCustomPayload
+		if err := json.Unmarshal(cmd.Payload, &payload); err != nil {
+			return errResp(fmt.Errorf("invalid payload: %w", err))
+		}
+		errs, err := validateCustomRules(payload.Rules)
+		if err != nil {
+			return errResp(err)
+		}
+		result := shared.ValidateCustomResult{Errors: errs}
+		data, _ := json.Marshal(result)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdGetAppliedConfig:
+		res, err := readAppliedConfig(d.cfg.AppliedConfigPath())
+		if err != nil {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(res)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdGetUsage:
+		usage, err := d.firewall.Usage()
+		if err != nil {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(usage)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdGetHealth:
+		// No error path: Health() logs a counter read that failed rather than
+		// returning one, because an unreadable counter is a different signal
+		// from a broken firewall — see computeHealth's counter branch.
+		data, _ := json.Marshal(d.firewall.Health())
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdPanic:
+		if err := d.firewall.Panic("console"); err != nil {
+			return errResp(err)
+		}
+		return shared.Response{Success: true}
+
+	case shared.CmdResume:
+		res, err := d.firewall.Resume("console")
+		if err != nil {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(res)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdLogEvent:
+		var p shared.LogEventPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return errResp(fmt.Errorf("invalid payload: %w", err))
+		}
+		if err := d.recordLoginEvent(p); err != nil {
+			return errResp(err)
+		}
+		return shared.Response{Success: true}
+
+	case shared.CmdUpdateFeed:
+		// Synchronous, like PANIC: the reply says whether the new version was
+		// stored and loaded, and that is only known once it has been.
+		var p shared.UpdateFeedPayload
+		if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+			return errResp(fmt.Errorf("invalid payload: %w", err))
+		}
+		res, err := d.firewall.UpdateFeed(p, "web")
+		if err != nil {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(res)
+		return shared.Response{Success: true, Data: data}
+
+	case shared.CmdGetFeeds:
+		var p shared.GetFeedsPayload
+		if len(cmd.Payload) > 0 {
+			if err := json.Unmarshal(cmd.Payload, &p); err != nil {
+				return errResp(fmt.Errorf("invalid payload: %w", err))
+			}
+		}
+		res, err := d.firewall.Feeds(p.Addr)
+		if err != nil {
+			return errResp(err)
+		}
+		data, _ := json.Marshal(res)
+		return shared.Response{Success: true, Data: data}
+
+	default:
+		return shared.Response{Success: false, Error: fmt.Sprintf("unknown command: %s", cmd.Type)}
+	}
+}
+
+// peerCred is the uid and pid of the process on the other end of conn, as the
+// kernel recorded them at connect (SO_PEERCRED). Anything that is not a Unix
+// socket has no such record and is an error, never uid 0.
+func peerCred(conn net.Conn) (uid uint32, pid int32, err error) {
+	uc, ok := conn.(*net.UnixConn)
+	if !ok {
+		return 0, 0, fmt.Errorf("peer credentials: not a Unix socket (%T)", conn)
+	}
+	raw, err := uc.SyscallConn()
+	if err != nil {
+		return 0, 0, fmt.Errorf("peer credentials: %w", err)
+	}
+	var cred *unix.Ucred
+	var credErr error
+	if err := raw.Control(func(fd uintptr) {
+		cred, credErr = unix.GetsockoptUcred(int(fd), unix.SOL_SOCKET, unix.SO_PEERCRED)
+	}); err != nil {
+		return 0, 0, fmt.Errorf("peer credentials: %w", err)
+	}
+	if credErr != nil {
+		return 0, 0, fmt.Errorf("peer credentials: %w", credErr)
+	}
+	return cred.Uid, cred.Pid, nil
+}
+
+func (d *Daemon) sendError(conn net.Conn, msg string) {
+	resp := shared.Response{Success: false, Error: msg}
+	out, _ := json.Marshal(resp)
+	_, _ = conn.Write(out)
+}
+
+func errResp(err error) shared.Response {
+	return shared.Response{Success: false, Error: err.Error()}
+}
+
+// recordLoginEvent hands one login event to the debouncer.
+func (d *Daemon) recordLoginEvent(p shared.LogEventPayload) error {
+	return d.loginEventLog().record(p, time.Now())
+}
+
+// loginEventLog builds the debouncer on first use and starts its sweeper.
+func (d *Daemon) loginEventLog() *loginEvents {
+	d.loginOnce.Do(func() {
+		d.login = newLoginEvents(func(action, ruleType, detail, user string) {
+			WriteAuditLog(d.cfg.AuditLogPath(), action, ruleType, detail, user)
+		})
+		d.wg.Add(1)
+		go func() {
+			defer d.wg.Done()
+			d.login.run(d.quit)
+		}()
+	})
+	return d.login
+}
+
+// auditTailBytes is how much of the end of the audit log is read to satisfy a
+// request for the most recent entries.
+//
+// An entry is around 150 bytes, so this holds well over a thousand — several
+// times the 200 the viewer asks for. The file is append-only and rotated by
+// logrotate, which the Debian package configures but a manual install may not;
+// reading all of it to show the newest 200 meant the dashboard, which reads the
+// log on every load, grew slower for the lifetime of the host.
+const auditTailBytes = 256 * 1024
+
+// readAuditLog reads the last n entries from the audit log file (most-recent first).
+func readAuditLog(path string, n int) ([]shared.AuditLogEntry, error) {
+	data, truncated, err := tailFile(path, auditTailBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	// The first line of a window that does not start at the beginning of the
+	// file is almost certainly half an entry. Dropping it costs one record out
+	// of a thousand and keeps a mangled one out of the log view.
+	if truncated && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	// Reverse so most-recent first
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+
+	entries := make([]shared.AuditLogEntry, 0, min(n, len(lines)))
+	for _, line := range lines {
+		if len(entries) >= n {
+			break
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var e shared.AuditLogEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	return entries, nil
+}
+
+// tailFile returns at most max bytes from the end of the file, and whether it
+// had to skip anything to do so.
+func tailFile(path string, max int64) ([]byte, bool, error) {
+	// #nosec G304 -- the only caller passes cfg.AuditLogPath(), built from log_dir
+	// in the daemon's own config. No request names a file to read.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close() //nolint:errcheck // read-only
+
+	info, err := f.Stat()
+	if err != nil {
+		return nil, false, err
+	}
+
+	size := info.Size()
+	if size <= max {
+		data, err := io.ReadAll(f)
+		return data, false, err
+	}
+
+	if _, err := f.Seek(size-max, io.SeekStart); err != nil {
+		return nil, false, err
+	}
+	data, err := io.ReadAll(f)
+	return data, true, err
+}
+
+// maxCustomRules bounds how many statements one request may ask the daemon to
+// check. Well above any real rule set — the editor is a textarea and a long one
+// holds a few dozen lines — and far below what the editor's form body can
+// carry: about three thousand at the 64 KB it once had, tens of thousands at
+// the import-sized limit it has had since 2.25.1.
+const maxCustomRules = 256
+
+// validateCustomRules checks the rules with "nft --check" and returns a map of
+// line-index to error string; an empty map means all of them are valid.
+//
+// Two passes, because one fork is cheap and N is not. Every statement goes into
+// a single script first, which answers the ordinary case — a rule set that is
+// valid — with one subprocess. Only when that script is rejected does it fall
+// back to checking each statement on its own, which is the only way to say
+// *which* line is wrong.
+//
+// It matters because this runs on the root daemon, once per keystroke pause in
+// the editor, and there was no bound on it at all: measured at ~15 ms per
+// statement, a 64 KB body of one-line rules asked for roughly 50 seconds of
+// forking, serially, per request — with nothing cancelling it when the web
+// process gave up after five. The count is capped and the whole validation
+// shares one deadline rather than granting each statement its own.
+func validateCustomRules(rules []string) (map[int]string, error) {
+	if len(rules) > maxCustomRules {
+		return nil, fmt.Errorf("too many custom rules: %d, the limit is %d", len(rules), maxCustomRules)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), nftTimeout)
+	defer cancel()
+
+	if checkCustomScript(ctx, rules) == nil {
+		return map[int]string{}, nil
+	}
+	return validateCustomRulesEach(ctx, rules), nil
+}
+
+// checkCustomScript checks every statement in one table, in one nft run.
+func checkCustomScript(ctx context.Context, rules []string) error {
+	var body strings.Builder
+	found := false
+	for _, rule := range rules {
+		rule = strings.TrimSpace(rule)
+		if rule == "" || strings.HasPrefix(rule, "#") {
+			continue
+		}
+		body.WriteString("    " + rule + "\n")
+		found = true
+	}
+	if !found {
+		return nil
+	}
+	_, err := runNftCheck(ctx,
+		"table inet easywall_validate {\n  chain test_input {\n    type filter hook input priority 0;\n"+
+			body.String()+"  }\n}\n")
+	return err
+}
+
+// validateCustomRulesEach attributes failures to individual lines.
+func validateCustomRulesEach(ctx context.Context, rules []string) map[int]string {
+	errs := make(map[int]string)
+	for i, rule := range rules {
+		rule = strings.TrimSpace(rule)
+		if rule == "" || strings.HasPrefix(rule, "#") {
+			continue // skip blanks and comments
+		}
+		// Wrap in a test table context for nft -c
+		script := "table inet easywall_validate {\n  chain test_input {\n    type filter hook input priority 0;\n    " + rule + "\n  }\n}\n"
+		out, err := runNftCheck(ctx, script)
+		// The deadline is shared by the whole validation rather than granted to
+		// each statement: one request must not be able to hold the daemon for
+		// the timeout times the number of lines.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			errs[i] = fmt.Sprintf("syntax check timed out after %s", nftTimeout)
+			continue
+		}
+		if err != nil {
+			msg := strings.TrimSpace(out)
+			if msg == "" {
+				msg = err.Error()
+			}
+			// Strip the internal table name from error messages for cleaner output
+			msg = strings.ReplaceAll(msg, "easywall_validate", "easywall")
+			errs[i] = msg
+		}
+	}
+	return errs
+}
+
+// runNftCheck passes a script to "nft --check --file -" and returns its output.
+func runNftCheck(ctx context.Context, script string) (string, error) {
+	cmd := exec.CommandContext(ctx, nftBinary, "--check", "--file", "-")
+	// Killing the process is not enough on its own: CombinedOutput waits for the
+	// output pipes to close, and anything the child spawned still holds them.
+	// WaitDelay bounds that too, so a cancelled command really does return.
+	cmd.WaitDelay = nftWaitDelay
+	cmd.Stdin = strings.NewReader(script)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// groupFilePath is the path to the system group file; overridden in tests.
+var groupFilePath = "/etc/group"
+
+// lookupGroup returns the numeric GID for a group name by parsing /etc/group.
+// Uses bufio.Scanner to avoid loading the entire file into memory.
+func lookupGroup(name string) (int, error) {
+	f, err := os.Open(groupFilePath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		// /etc/group format: name:password:gid:members
+		fields := strings.SplitN(scanner.Text(), ":", 4)
+		if len(fields) >= 3 && fields[0] == name {
+			var gid int
+			if _, err := fmt.Sscanf(fields[2], "%d", &gid); err == nil {
+				return gid, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("group %q not found", name)
+}

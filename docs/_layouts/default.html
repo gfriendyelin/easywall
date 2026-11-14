@@ -1,0 +1,604 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <script>
+    // Theme init script — must run before paint to prevent FOUC.
+    // Uses the same localStorage key + 'easywall-' prefix as the app so a
+    // visitor's preference carries between docs.jp1337.io and the running
+    // app (when both are on the same origin).
+    (function () {
+      // First, and before anything that can throw. localStorage.getItem below
+      // throws in a browser with site data blocked, which aborted this whole
+      // function — so the flag was never set and the search field, whose only
+      // condition is that a script is running, stayed hidden from a visitor who
+      // had one. The flag depends on nothing.
+      document.documentElement.setAttribute('data-js', 'on');
+      var t = localStorage.getItem('theme');
+      if (t === 'dark' || t === 'light') t = 'easywall-' + t;
+      if (!t) {
+        t = window.matchMedia('(prefers-color-scheme: dark)').matches
+          ? 'easywall-dark' : 'easywall-light';
+      }
+      document.documentElement.setAttribute('data-theme', t);
+    })();
+  </script>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="{% if page.description %}{{ page.description }}{% else %}{{ site.description }}{% endif %}">
+  {%- if page.noindex %}
+  <meta name="robots" content="noindex">
+  {%- endif %}
+  <link rel="preload" href="{{ '/assets/fonts/inter-var.woff2' | relative_url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="{{ '/assets/fonts/jetbrains-mono-var.woff2' | relative_url }}" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="{{ '/assets/css/style.css' | relative_url }}?v={{ site.time | date: '%s' }}">
+  <link rel="icon" type="image/svg+xml" href="{{ '/assets/img/icon.svg' | relative_url }}">
+  <link rel="apple-touch-icon" href="{{ '/assets/img/icon-180.png' | relative_url }}">
+  <link rel="icon" type="image/png" sizes="32x32" href="{{ '/assets/img/icon-32.png' | relative_url }}">
+  {% seo %}
+
+  {%- if page.seo == "software" -%}
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "{{ site.title }}",
+    "url": "{{ site.url }}/",
+    "description": "{{ site.description }}",
+    "applicationCategory": "SecurityApplication",
+    "operatingSystem": "Linux",
+    "softwareVersion": "{{ site.version }}",
+    "license": "https://www.gnu.org/licenses/gpl-3.0",
+    "image": "{{ '/assets/img/og-image.png' | absolute_url }}",
+    "author": {
+      "@type": "Person",
+      "name": "{{ site.author.name }}",
+      "url": "{{ site.author.url }}"
+    },
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "EUR"
+    },
+    "releaseNotes": "https://github.com/jp1337/easywall/releases/latest"
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebSite",
+    "name": "easywall",
+    "url": "{{ site.url }}/",
+    "publisher": {
+      "@type": "Organization",
+      "name": "easywall",
+      "url": "{{ site.url }}/",
+      "logo": "{{ '/assets/img/og-image.png' | absolute_url }}",
+      "sameAs": [
+        "https://github.com/jp1337/easywall",
+        "{{ site.discord }}",
+        "https://ko-fi.com/jp1337"
+      ]
+    }
+  }
+  </script>
+  {%- endif -%}
+</head>
+<body>
+
+  <!-- ── Mobile topbar ────────────────────────────────────────────── -->
+  <header class="topbar">
+    <button class="sidebar-toggle" id="sidebar-toggle" aria-label="Toggle navigation" aria-expanded="false">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M3.75 6.75h16.5M3.75 12h16.5m-16.5 5.25h16.5"/>
+      </svg>
+    </button>
+    <a href="{{ '/' | relative_url }}" class="topbar-logo">
+      <img src="{{ '/assets/img/icon.svg' | relative_url }}" width="22" height="22" alt="">
+      easywall
+    </a>
+    <a href="https://github.com/jp1337/easywall" class="topbar-github" target="_blank" rel="noopener">GitHub ↗</a>
+  </header>
+
+  <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
+
+  <div class="layout">
+
+    <!-- ── Sidebar ──────────────────────────────────────────────── -->
+    <nav class="sidebar" id="sidebar" aria-label="Documentation navigation">
+      <div class="sidebar-header">
+        <a href="{{ '/' | relative_url }}" class="sidebar-logo">
+          <img src="{{ '/assets/img/icon.svg' | relative_url }}" width="26" height="26" alt="">
+          easywall
+        </a>
+        <a href="https://github.com/jp1337/easywall" class="sidebar-github" target="_blank" rel="noopener" title="GitHub" aria-label="GitHub repository">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+          </svg>
+        </a>
+      </div>
+
+      {% include search.html %}
+
+      <div class="sidebar-nav">
+        {% for item in site.nav %}
+          {% if item.group %}
+            {%- comment -%}
+              A group is open when it holds the page being read, and closed
+              otherwise. Nothing stores that: the current page is the answer, so
+              there is no state to persist across a navigation and no script to
+              restore it. <details> carries the rest — the toggle, the keyboard
+              handling and the disclosure semantics are the element's own.
+            {%- endcomment -%}
+            {% assign group_open = false %}
+            {% for child in item.children %}
+              {% if page.url == child.path %}{% assign group_open = true %}{% endif %}
+            {% endfor %}
+            <details class="nav-group"{% if group_open %} open{% endif %}>
+              <summary class="nav-group-label">{{ item.title }}</summary>
+              <div class="nav-section">
+                {% for child in item.children %}
+                  <a href="{{ child.path | relative_url }}" class="nav-link nav-sub{% if page.url == child.path %} active{% endif %}">{{ child.title }}</a>
+                {% endfor %}
+              </div>
+            </details>
+          {% else %}
+            <div class="nav-section-single">
+              <a href="{{ item.path | relative_url }}" class="nav-link{% if page.url == item.path %} active{% endif %}">{{ item.title }}</a>
+            </div>
+          {% endif %}
+        {% endfor %}
+      </div>
+
+      <div class="sidebar-footer">
+        <button class="theme-toggle" id="theme-toggle" title="Toggle theme" aria-label="Toggle light/dark theme" type="button">
+          <svg class="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+          <svg class="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z"/>
+          </svg>
+          <span class="theme-label">Theme</span>
+        </button>
+        <span class="sidebar-version">v{{ site.version }}</span>
+      </div>
+    </nav>
+
+    <!-- ── Page content ──────────────────────────────────────────── -->
+    <main class="content{% if page.toc == false %} content-full{% endif %}" id="main-content">
+      <!-- Filled from the rendered headings by the script at the end of this
+           file, and removed again if the page is too short to need it. Empty
+           in the served HTML on purpose: kramdown owns the heading ids, and
+           Liquid cannot read them back out of {% raw %}{{ content }}{% endraw %}. -->
+      {%- unless page.toc == false %}
+      <nav class="docs-toc" id="docs-toc" aria-labelledby="docs-toc-title" hidden>
+        <p class="docs-toc-title" id="docs-toc-title">On this page</p>
+        <ul class="docs-toc-list"></ul>
+      </nav>
+      {%- endunless %}
+
+      <article class="content-body">
+        {{ content }}
+      </article>
+
+      <footer class="page-footer">
+        <p>easywall — <em>Your firewall. Your rules. No surprises.</em> · <a href="{{ '/docs/license/' | relative_url }}">GPL-3.0</a> · <a href="https://github.com/jp1337/easywall" target="_blank" rel="noopener">GitHub</a> · <a href="{{ site.discord }}" target="_blank" rel="noopener">Discord</a> · <a href="{{ '/legal-notice/' | relative_url }}">Legal notice</a> · <a href="{{ '/privacy/' | relative_url }}">Privacy</a></p>
+      </footer>
+    </main>
+
+  </div>
+
+  <script>
+    // Mobile sidebar toggle
+    (function () {
+      var toggle = document.getElementById('sidebar-toggle');
+      var sidebar = document.getElementById('sidebar');
+      var backdrop = document.getElementById('sidebar-backdrop');
+      if (!toggle || !sidebar || !backdrop) return;
+      function open()  { sidebar.classList.add('open'); backdrop.classList.add('visible'); toggle.setAttribute('aria-expanded', 'true'); document.body.style.overflow = 'hidden'; }
+      function close() { sidebar.classList.remove('open'); backdrop.classList.remove('visible'); toggle.setAttribute('aria-expanded', 'false'); document.body.style.overflow = ''; }
+      toggle.addEventListener('click', function () { sidebar.classList.contains('open') ? close() : open(); });
+      backdrop.addEventListener('click', close);
+      document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && sidebar.classList.contains('open')) close(); });
+    })();
+
+    // Theme toggle — stays in sync with the app's localStorage convention.
+    (function () {
+      var btn = document.getElementById('theme-toggle');
+      if (!btn) return;
+      btn.addEventListener('click', function () {
+        var cur = document.documentElement.getAttribute('data-theme');
+        var next = cur === 'easywall-dark' ? 'easywall-light' : 'easywall-dark';
+        document.documentElement.setAttribute('data-theme', next);
+        localStorage.setItem('theme', next);
+      });
+    })();
+
+    // Several tables use the headerless markdown idiom — a "| | |" header row —
+    // for key/value content. kramdown still emits a <thead>, and a styled row of
+    // empty cells renders as a blank band above the table. Drop it.
+    (function () {
+      document.querySelectorAll('.content-body table thead').forEach(function (h) {
+        var empty = Array.prototype.every.call(h.querySelectorAll('th, td'),
+          function (c) { return c.textContent.trim() === ''; });
+        if (empty) h.remove();
+      });
+    })();
+
+    // Wrap tables and pre blocks in horizontal scroll containers on mobile.
+    (function () {
+      var body = document.querySelector('.content-body');
+      if (!body) return;
+      body.querySelectorAll('table, pre').forEach(function (el) {
+        if (el.parentNode.classList.contains('scroll-wrapper') || el.parentNode.classList.contains('highlight')) return;
+        var w = document.createElement('div');
+        w.className = 'scroll-wrapper';
+        el.parentNode.insertBefore(w, el);
+        w.appendChild(el);
+      });
+    })();
+
+    // On-page contents. Built from the rendered headings rather than declared in
+    // the markdown, so it cannot fall out of step with the page. Only h2 and h3
+    // — deeper than that is an outline of an outline.
+    (function () {
+      var nav  = document.getElementById('docs-toc');
+      var body = document.querySelector('.content-body');
+      if (!nav || !body) return;
+
+      // A heading inside a collapsed <details> is not on the page as far as the
+      // reader is concerned, and an entry that scrolls to something invisible is
+      // worse than no entry. The changelog is thirty disclosures deep.
+      var heads = [].slice.call(body.querySelectorAll('h2[id], h3[id]'))
+                    .filter(function (h) { return !h.closest('details'); });
+      // Two entries is a list, not an overview; it would cost more attention
+      // than it saves. Removing the column also has to release the space
+      // reserved for it in CSS, or the page keeps a 340px empty gutter for a
+      // contents list that is not there — which is what the landing page had.
+      if (heads.length < 3) {
+        nav.remove();
+        document.getElementById('main-content').classList.add('content-full');
+        return;
+      }
+
+      var list = nav.querySelector('.docs-toc-list');
+      var links = heads.map(function (h) {
+        var li = document.createElement('li');
+        li.className = 'docs-toc-item is-' + h.tagName.toLowerCase();
+        var a = document.createElement('a');
+        a.href = '#' + h.id;
+        a.textContent = h.textContent;
+        li.appendChild(a);
+        list.appendChild(li);
+        return a;
+      });
+      nav.hidden = false;
+
+      // Scroll spy. One rAF-throttled scroll handler, not an
+      // IntersectionObserver: the observer watched a band that ended 70% up the
+      // viewport, so on a short page — three headings and 475 words, which is
+      // export-import — the last heading could never enter it and the last
+      // entries never became current. Reported as the column not reaching the
+      // bottom; it is the right height and always was.
+      var current = null;
+      function mark(a) {
+        if (current === a) return;
+        if (current) current.removeAttribute('aria-current');
+        current = a;
+        if (current) current.setAttribute('aria-current', 'true');
+      }
+
+      // Two rules, and the second is the fix: current is the last heading whose
+      // top has passed 100px — just under the 72px topbar — and unconditionally
+      // the last heading once the document is scrolled to its end.
+      function spy() {
+        ticking = false;
+        var i = 0;
+        for (var j = 0; j < heads.length; j++) {
+          if (heads[j].getBoundingClientRect().top <= 100) i = j;
+        }
+        // 2px of slack, not 0: a fractional device pixel ratio leaves scrollY
+        // a hair short of the arithmetic bottom, and the last entry would light
+        // up on some displays and not others.
+        if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 2) {
+          i = heads.length - 1;
+        }
+        mark(links[i]);
+      }
+
+      var ticking = false;
+      function onScroll() {
+        if (ticking) return;
+        ticking = true;
+        requestAnimationFrame(spy);
+      }
+      window.addEventListener('scroll', onScroll, { passive: true });
+      window.addEventListener('resize', onScroll, { passive: true });
+      spy();
+    })();
+
+    // A copy button in every code block. .highlighter-rouge is the element
+    // carrying the frame — div.highlight and pre.highlight inside it are
+    // deliberately bare — so the button is positioned against that and not
+    // against the <pre>, which scrolls horizontally and would carry the button
+    // off the screen with it.
+    //
+    // The confirmation is the button's own label for two seconds plus one
+    // aria-live region: the convention on GitHub and on MDN. A floating toast
+    // needs positioning it cannot get right over a scrolling <pre>, and is
+    // announced either badly or not at all.
+    (function () {
+      var blocks = document.querySelectorAll('.content-body .highlighter-rouge');
+      if (!blocks.length || !navigator.clipboard) return;
+
+      // Styled inline rather than with .sr-only: nothing under docs/ uses that
+      // class, so the utility is correctly absent from the built stylesheet —
+      // see the note in TestDocsStylesheetKeepsLoadBearingRules — and adding a
+      // class here to make Tailwind emit it again is the tail wagging the dog.
+      var live = document.createElement('div');
+      live.setAttribute('aria-live', 'polite');
+      live.style.cssText = 'position:absolute;width:1px;height:1px;overflow:hidden;' +
+                           'clip:rect(0 0 0 0);white-space:nowrap';
+      document.body.appendChild(live);
+
+      [].forEach.call(blocks, function (block) {
+        var pre = block.querySelector('pre');
+        if (!pre) return;
+
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'docs-copy';
+        btn.textContent = 'Copy';
+
+        btn.addEventListener('click', function () {
+          // innerText, not textContent: it is what the reader sees, with the
+          // rouge spans flattened and the line breaks kept. The trailing
+          // newline goes; a trailing space inside a config example does not.
+          navigator.clipboard.writeText(pre.innerText.replace(/\n$/, '')).then(function () {
+            btn.textContent = 'Copied';
+            btn.setAttribute('data-copied', '');
+            live.textContent = 'Copied to clipboard';
+            setTimeout(function () {
+              btn.textContent = 'Copy';
+              btn.removeAttribute('data-copied');
+              live.textContent = '';
+            }, 2000);
+          }, function () {
+            // A clipboard write is refused over plain HTTP and in a few
+            // configurations over HTTPS. Say so rather than confirming.
+            btn.textContent = 'Ctrl+C';
+            setTimeout(function () { btn.textContent = 'Copy'; }, 2000);
+          });
+        });
+
+        block.appendChild(btn);
+      });
+    })();
+
+    // Diagrams and screenshots used to be reconciled with the theme from here, by
+    // reassigning img.src against a <picture> that chose from prefers-color-scheme.
+    // That never worked — a matching <source> outranks the src — so a reader on a
+    // dark OS who chose the light docs saw dark diagrams on a white page. Both
+    // variants are now in the markup and CSS picks one from [data-theme]; see
+    // _includes/themed-figure.html. Nothing to do at runtime.
+  </script>
+
+  <script>
+    // The engine and its UI are ~176 KB together, and a reference page is read
+    // far more often than it is searched. So the sidebar ships a button and this
+    // fetches the real thing the first time somebody opens the overlay.
+    //
+    // The overlay is a native <dialog>. showModal() is what makes it cheap: the
+    // focus trap, the Esc key, the inert background and returning focus to the
+    // trigger on close all come from the platform, and those four were the
+    // entire reason the design spec first chose a field in the sidebar instead.
+    // What that cost was a 639px results block in a 260px column, pushing the
+    // navigation off the screen while you searched.
+    (function () {
+      var trigger = document.getElementById('docs-search-open');
+      var dialog  = document.getElementById('docs-search-dialog');
+      var panel   = document.getElementById('docs-search-panel');
+      if (!trigger || !dialog || !panel || !dialog.showModal) return;
+
+      var loading = false;
+      function load() {
+        if (loading) return;
+        loading = true;
+
+        var css = document.createElement('link');
+        css.rel = 'stylesheet';
+        css.href = '{{ "/pagefind/pagefind-ui.css" | relative_url }}';
+        document.head.appendChild(css);
+
+        var js = document.createElement('script');
+        js.src = '{{ "/pagefind/pagefind-ui.js" | relative_url }}';
+        js.onload = function () {
+          new window.PagefindUI({
+            element: '#docs-search-panel',
+            bundlePath: '{{ "/pagefind/" | relative_url }}',
+            // The page-level excerpt does not reliably contain the match — for
+            // "acceptance.duration" it returned prose about a daemon that
+            // refuses to start. The sub-result carries the heading it sits
+            // under and an excerpt that does contain the term, which is the
+            // whole point of searching a reference.
+            showSubResults: true,
+            showImages: false,
+            // Words, not characters. It was 20 while the results lived in a
+            // 260px sidebar, where every excerpt still arrived as a fragment;
+            // the overlay is 680px wide, so they can be sentences.
+            excerptLength: 30,
+            pageSize: 5,
+            // Result links carry ?highlight=<term>, which the block below acts
+            // on. Landing on the right section with the term marked is the
+            // difference between an answer and a page to read again.
+            highlightParam: 'highlight'
+          });
+          prune.watch();
+          focusField();
+        };
+        js.onerror = function () {
+          panel.textContent = 'Search is unavailable — the index did not load.';
+          panel.className += ' docs-search-failed';
+        };
+        document.body.appendChild(js);
+      }
+
+      // Pagefind truncates a query term until a prefix matches something in the
+      // index: `asdasd` returns 23 results, every one of them matching `as`, and
+      // `xyzzyq` returns one, matching the `X` in `iptables -X`. Forward prefix
+      // matching is the behaviour that is wanted — `config` has to find
+      // `configuration` — and it is also the clean discriminator, because a real
+      // prefix match marks a word at least as long as what was typed while
+      // truncation always marks a shorter one.
+      //
+      // This runs over the rendered results, and not through the processResult
+      // option, which looks like the hook for exactly this and is not: 1.5.2
+      // applies it per card as `data = processResult(data) ?? data`, so
+      // returning null hands the original straight back and the card renders
+      // anyway — and it runs after the count has been computed. Read in the
+      // built bundle, not inferred from the option list.
+      var prune = (function () {
+        function run() {
+          var field = panel.querySelector('.pagefind-ui__search-input');
+          var typed = (field && field.value || '').toLowerCase();
+          var words = typed.split(/\s+/).filter(Boolean);
+          var cards = panel.querySelectorAll('.pagefind-ui__result');
+          var kept = 0;
+
+          for (var i = 0; i < cards.length; i++) {
+            var marks = cards[i].querySelectorAll('mark');
+            var texts = [];
+            for (var m = 0; m < marks.length; m++) texts.push(marks[m].textContent.toLowerCase());
+
+            // Every word typed has to have marked, somewhere in this result, a
+            // word it is a genuine prefix of. The prefix test alone is not
+            // enough on a two-word query, where one word can match fully and
+            // carry a second that was truncated.
+            var keep = !words.length || words.every(function (w) {
+              return texts.some(function (k) { return k.indexOf(w) === 0; });
+            });
+
+            // ponytail: a stemmed query whose marked form is shorter than what
+            // was typed — `running` marked as `run` — is dropped by this rule.
+            // No such term exists in the corpus today; if one appears, widen to
+            // "or the mark is a prefix of the word and at least 3 characters"
+            // rather than loosening the prefix test itself.
+            cards[i].hidden = !keep;
+            if (keep) kept++;
+          }
+
+          var msg = panel.querySelector('.pagefind-ui__message');
+          if (msg && words.length) {
+            var want = kept === 0
+              ? 'No results for ' + (field.value || '')
+              : kept + (kept === 1 ? ' result for ' : ' results for ') + (field.value || '');
+            // Only when it differs, or writing it is itself a mutation and the
+            // observer below calls this forever.
+            if (msg.textContent !== want) msg.textContent = want;
+          }
+
+          // "No results" sitting above a Load-more button contradicts itself.
+          var more = panel.querySelector('.pagefind-ui__button');
+          if (more) {
+            var hideMore = words.length > 0 && kept === 0;
+            // Same trap as the message above: write only on change.
+            if (more.hidden !== hideMore) more.hidden = hideMore;
+          }
+        }
+
+        return {
+          watch: function () {
+            new MutationObserver(function () { run(); })
+              .observe(panel, { childList: true, subtree: true });
+            run();
+          }
+        };
+      })();
+
+      // PagefindUI renders its own input, so there is nothing to focus until it
+      // has mounted; open() calls this too, for every open after the first.
+      function focusField() {
+        var field = panel.querySelector('input');
+        if (field) field.focus();
+      }
+
+      function open() {
+        if (!dialog.open) dialog.showModal();
+        load();
+        focusField();
+      }
+
+      trigger.addEventListener('click', open);
+
+      document.addEventListener('keydown', function (e) {
+        if (e.key !== '/' || e.metaKey || e.ctrlKey || e.altKey) return;
+        // Or `/` cannot be typed into the search field this very handler opened,
+        // and every future field on the page inherits the same problem.
+        // isContentEditable covers the case where the editor is a <div>.
+        var t = e.target;
+        if (t && (t.isContentEditable ||
+                  (t.matches && t.matches('input, textarea, select')))) return;
+        e.preventDefault();
+        open();
+      });
+
+      // A click on the backdrop reports the dialog itself as the target; a click
+      // on anything inside reports that child.
+      dialog.addEventListener('click', function (e) {
+        if (e.target === dialog) dialog.close();
+      });
+
+      // Nothing here returns focus on close, deliberately: a <dialog> restores it
+      // to whatever had it when showModal() ran, which is the right answer in the
+      // case that matters. A reader who tabbed to a link deep in the page and
+      // then pressed the shortcut lands back on that link; forcing focus to the
+      // trigger instead would move them to the top of the sidebar and lose the
+      // place they were keeping. Measured either way — the platform's answer is
+      // better than the one this file had for a few minutes.
+
+      // Following a result has to close the overlay, or the reader arrives at
+      // the section they asked for with the search still covering it.
+      panel.addEventListener('click', function (e) {
+        if (e.target.closest('a')) dialog.close();
+      });
+    })();
+
+    // The other half of highlightParam, and the only reason a docs page loads
+    // any search code without being asked: it runs when the visitor arrived
+    // from a result, which is exactly when the term is worth marking. Gated on
+    // the parameter, so an ordinary page load still fetches nothing.
+    //
+    // Wrapped like every other block in this file. Bare, its `var hl` was a
+    // property of window on 26 pages.
+    (function () {
+      if (!new URLSearchParams(location.search).has('highlight')) return;
+      var hl = document.createElement('script');
+      // pagefind-highlight.js ends in `export { PagefindHighlight as default }`
+      // — an ES module. Attached as a classic script it fails to parse at all
+      // ("Unexpected token 'export'"), so window.PagefindHighlight is never
+      // set and the line below throws "is not a constructor" — found by
+      // actually loading the built file, not by reading the option list.
+      hl.type = 'module';
+      hl.src = '{{ "/pagefind/pagefind-highlight.js" | relative_url }}';
+      hl.onload = function () {
+        new window.PagefindHighlight({
+          highlightParam: 'highlight',
+          // What the index actually covers, which is not the same string as
+          // --root-selector: Pagefind excludes <nav> and <footer> by default, so
+          // indexing main.content indexes this article. mark.js has no such
+          // default, so naming main.content here marked the on-page contents
+          // list as well — and left at its own default it marked the whole
+          // document: every "a" in the sidebar's page list, and the logo read
+          // "e a syw a ll".
+          markContext: 'article.content-body',
+          // Its own stylesheet is one rule — a yellow background. Ours is in
+          // docs.css, where it can use the theme's tokens and match the marks
+          // in the search panel.
+          addStyles: false
+        });
+      };
+      document.body.appendChild(hl);
+    })();
+  </script>
+
+</body>
+</html>

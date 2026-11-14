@@ -1,0 +1,105 @@
+package web
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"slices"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// handleExport streams the current rule set as a downloadable JSON file.
+func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
+	data, err := s.client.ExportRules()
+	if err != nil {
+		slog.Warn("export rules error", "error", err)
+		s.setFlash(w, r, "export_error")
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+		return
+	}
+
+	filename := fmt.Sprintf("easywall-rules-%s.json", time.Now().UTC().Format("2006-01-02"))
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filename))
+	w.WriteHeader(http.StatusOK)
+	if _, writeErr := w.Write(data); writeErr != nil {
+		slog.Warn("write export response", "error", writeErr)
+	}
+}
+
+// maxImportBytes is the upload ceiling for a rules file. Every other form on
+// the site is a handful of fields and lives under the global 64 KB cap; a rule
+// set is the one thing an operator legitimately uploads by the hundred kilobyte.
+const maxImportBytes = 512 * 1024
+
+// maxListFormBytes is the body limit of every editor an imported list lands in.
+// Form encoding writes a byte as up to three (%3A for every colon of an IPv6
+// address, %0D%0A for each line break), so 3x maxImportBytes is what saving an
+// imported list back can take; the rest is room for the form's other fields.
+// These routes had the site-wide 64 KiB, and a blocklist /import accepted could
+// not be saved again from its own page.
+const maxListFormBytes = 4 * maxImportBytes
+
+// handleImport reads an uploaded JSON file and passes it to the core for validation and import.
+func (s *Server) handleImport(w http.ResponseWriter, r *http.Request) {
+	// The body limit is set by the MaxBodySize middleware, which knows this
+	// route needs more room than the rest of the site. Setting another
+	// MaxBytesReader here would not widen anything — wrapping an already
+	// limited reader leaves the inner, smaller limit in force, which is exactly
+	// how a documented 512 KB ceiling silently behaved as 64 KB.
+	file, _, err := r.FormFile("rules_file")
+	if err != nil {
+		// MaxBytesReader surfaces as a read error from the multipart parser, so
+		// "no file" and "file too big" arrive at the same place. Telling the
+		// operator to upload a file they did upload is the wrong answer.
+		if isBodyTooLarge(err) {
+			s.setFlash(w, r, "import_too_large")
+		} else {
+			s.setFlash(w, r, "import_no_file")
+		}
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+		return
+	}
+	defer file.Close() //nolint:errcheck // multipart file close errors are irrelevant after full read
+
+	data, err := io.ReadAll(file)
+	if err != nil {
+		key := "import_read_error"
+		if isBodyTooLarge(err) {
+			key = "import_too_large"
+		}
+		s.setFlash(w, r, key)
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+		return
+	}
+
+	// What was staged before, so the import's newly switched-on feeds get their
+	// first fetch at once, as a switch in the Feeds card does (spec §3, final
+	// review I2). Unreadable, every imported feed counts as new: refreshNow
+	// does nothing for a feed the core already holds a copy of.
+	var before []string
+	if state, err := s.client.GetRules(); err == nil {
+		before = state.Staged.Feeds
+	}
+	if err := s.client.ImportRules(data); err != nil {
+		slog.Warn("import rules error", "error", err)
+		s.setFlash(w, r, "import_error")
+		http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+		return
+	}
+	// The core accepted it, so it parses as the core parsed it.
+	var imported shared.Rules
+	_ = json.Unmarshal(data, &imported)
+	for _, id := range imported.Feeds {
+		if !slices.Contains(before, id) {
+			s.refreshFeedNow(id)
+		}
+	}
+
+	s.setFlash(w, r, "import_success")
+	http.Redirect(w, r, "/dashboard", http.StatusSeeOther)
+}

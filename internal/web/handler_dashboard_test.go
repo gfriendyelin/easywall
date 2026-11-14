@@ -1,0 +1,274 @@
+package web
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+func TestHandleDashboard_RequiresAuth(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+
+	rec := doRequest(s, "GET", "/dashboard", nil)
+	assertRedirect(t, rec, "/login")
+}
+
+func TestHandleDashboard_Success(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+	fc.SetResponse(shared.CmdGetStatus, successResp(shared.FirewallStatus{
+		Active:     true,
+		Acceptance: shared.AcceptanceIdle,
+		HasPending: false,
+	}))
+
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	assertStatus(t, rec, http.StatusOK)
+}
+
+func TestHandleDashboard_CoreUnavailable(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+	fc.SetResponse(shared.CmdGetStatus, errorRespFor("core not reachable"))
+
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	// Should still render the page (with error info), not a server error
+	assertStatus(t, rec, http.StatusOK)
+}
+
+func TestDashboardNamesAnUnknownBridge(t *testing.T) {
+	fc := newFakeCore(t)
+	fc.SetResponse(shared.CmdGetStatus, successResp(shared.FirewallStatus{
+		Active:         true,
+		UnknownBridges: []shared.UnknownBridge{{Interface: "br-4f2a", CIDRs: []string{"172.20.0.0/24"}}},
+	}))
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+	body := doAuthRequest(t, s, "GET", "/dashboard", nil).Body.String()
+	// The notice's own markup, not a bare href: the sidebar always links /apply.
+	const want = `<span>Docker network br-4f2a (172.20.0.0/24) exists and is not in the rules in force. ` +
+		`Apply to include it. <a class="link" href="/apply">Apply Rules</a></span>`
+	if !strings.Contains(body, want) {
+		t.Errorf("the dashboard does not name the unknown bridge with its own link to apply:\n  want %q\n%s", want, body)
+	}
+}
+
+func TestHandleDashboard_WithVersionCache(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+	fc.SetResponse(shared.CmdGetStatus, successResp(shared.FirewallStatus{Active: true}))
+
+	// A fresh cache naming a release ahead of this build. Fresh means the
+	// checker answers from it without a request, so the test needs no network.
+	info := shared.VersionInfo{
+		Current:         shared.CurrentVersion,
+		Latest:          "v99.0.0",
+		UpdateAvailable: true,
+		ReleaseURL:      "https://example.com/releases/v99.0.0",
+		CheckedAt:       time.Now().UTC().Format(time.RFC3339),
+	}
+	data, _ := json.Marshal(info)
+	if err := os.WriteFile(s.cfg.VersionCachePath(), data, 0600); err != nil {
+		t.Fatalf("write version cache: %v", err)
+	}
+	s.version = shared.NewChecker(s.cfg.VersionCachePath(), true)
+
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	assertStatus(t, rec, http.StatusOK)
+
+	// The old test asserted only the status code, so it passed whether or not
+	// the version ever reached the page.
+	if body := rec.Body.String(); !strings.Contains(body, "v99.0.0") {
+		t.Error("the dashboard must show the newer release it knows about")
+	}
+}
+
+func TestHandleDashboard_DoesNotWaitOnAnUnreachableUpdateAPI(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+	fc.SetResponse(shared.CmdGetStatus, successResp(shared.FirewallStatus{Active: true}))
+
+	// No cache, update check on, and nothing listening: the state of a host
+	// with no route out. The dashboard used to sit through the full HTTP
+	// timeout here, on every single load.
+	s.version = shared.NewChecker(s.cfg.VersionCachePath(), true)
+
+	start := time.Now()
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	elapsed := time.Since(start)
+
+	assertStatus(t, rec, http.StatusOK)
+	if elapsed > time.Second {
+		t.Errorf("dashboard took %v to render; it must not wait for the update check", elapsed)
+	}
+}
+
+func TestHandleDashboard_RootRedirectsToDashboard(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+
+	rec := doAuthRequest(t, s, "GET", "/", nil)
+	assertRedirect(t, rec, "/dashboard")
+}
+
+func TestHandleDashboard_WithRuleCounts(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+
+	rules := shared.RulesState{
+		Current: shared.Rules{
+			TCP:       []shared.PortRule{{Port: "22"}, {Port: "80"}},
+			UDP:       []shared.PortRule{{Port: "53"}},
+			Blocklist: []string{"1.2.3.4"},
+			Allowlist: []string{"10.0.0.0/8", "192.168.0.0/16"},
+		},
+	}
+	fc.SetResponse(shared.CmdGetRules, successResp(rules))
+
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	assertStatus(t, rec, http.StatusOK)
+}
+
+// The tiles count rules, not lines.
+//
+// The three free-text lists keep the operator's comments and the blank lines
+// between groups. Every other counter in the interface skips them; the dashboard
+// took a plain len(), so the same list read "12 entries" on the front page and
+// "7" on its own page — and the demo, which is what people look at first, ships
+// lists full of comments.
+func TestDashboardCountsIgnoreCommentsAndBlankLines(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+
+	fc.SetResponse(shared.CmdGetRules, successResp(shared.RulesState{
+		Current: shared.Rules{
+			Blocklist: []string{"# scanners", "192.0.2.1", "", "192.0.2.2"},
+			Allowlist: []string{"# office", "", "203.0.113.10"},
+			Custom:    []string{"# note", "tcp dport 9100 accept", ""},
+			TCP:       []shared.PortRule{{Port: "22"}},
+		},
+	}))
+	fc.SetResponse(shared.CmdGetLog, successResp([]shared.AuditLogEntry{}))
+
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	assertStatus(t, rec, http.StatusOK)
+
+	// Counted through the same predicate the editors use, so the two pages agree.
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  int
+	}{
+		{"blocklist", []string{"# scanners", "192.0.2.1", "", "192.0.2.2"}, 2},
+		{"allowlist", []string{"# office", "", "203.0.113.10"}, 1},
+		{"custom", []string{"# note", "tcp dport 9100 accept", ""}, 1},
+	} {
+		if got := countListEntries(tc.lines); got != tc.want {
+			t.Errorf("%s: counted %d, want %d — comments and blanks are not entries",
+				tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestDashboard_TheChipCarriesTheCount(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+
+	fc.SetResponse(shared.CmdGetStatus, successResp(shared.FirewallStatus{HasPending: true}))
+	fc.SetResponse(shared.CmdGetRules, successResp(shared.RulesState{
+		Current: shared.Rules{},
+		Staged:  shared.Rules{TCP: []shared.PortRule{{Port: "8443"}, {Port: "9443"}}},
+	}))
+	fc.SetResponse(shared.CmdGetOptions, successResp(shared.FirewallOptions{}))
+	fc.SetResponse(shared.CmdGetSettings, successResp(shared.NetworkSettings{}))
+	fc.SetResponse(shared.CmdGetAppliedConfig, successResp(shared.AppliedConfigResult{}))
+
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	assertStatus(t, rec, http.StatusOK)
+	// ">2<" matches any "2" the dashboard happens to render anywhere on the
+	// page — a date, a port, an unrelated count. The chip's count is the
+	// specific markup dashboard.html emits for it.
+	if !strings.Contains(rec.Body.String(), `<span class="diff-count">2</span>`) {
+		t.Errorf("the chip does not carry the count of pending changes:\n%s", rec.Body.String())
+	}
+}
+
+// The finding, on the front page: a port that has not carried a packet in a
+// month. Thirty days follows FortiGate's convention, which is where most
+// operators will have met this idea.
+func TestDashboard_CountsTheTCPPortsNobodyHasUsed(t *testing.T) {
+	s := newDemoTestServer(t) // demo-backed: 8443 is sixty days stale
+	rec := doAuthRequest(t, s, "GET", "/dashboard", nil)
+	assertStatus(t, rec, http.StatusOK)
+	// "30" rather than "30+": html/template HTML-escapes the literal "+" in
+	// the locale string to "&#43;" in a text node, which is real output, not a
+	// bug — the prefix is the part a plus sign cannot disturb.
+	if !strings.Contains(rec.Body.String(), "unused for 30") {
+		t.Error("the TCP tile does not report the ports nobody has used; the demo seeds one " +
+			"at sixty days, which is the whole reason it is seeded")
+	}
+}
+
+// A rule that has never been observed is not counted, and that is deliberate.
+// FirstSeen is the first *use*, not the moment the rule was written, so there is
+// nothing to date a never-used rule from — "unused for 30+ days" would be a
+// claim about a duration nobody measured. The table says "never" for it instead.
+func TestUnusedForThirtyDays_CountsOnlyWhatWasEverSeen(t *testing.T) {
+	now := time.Now()
+	rules := []shared.PortRule{
+		{ID: "old", Port: "8443"},
+		{ID: "fresh", Port: "443"},
+		{ID: "unseen", Port: "5432"},
+		{ID: "", Port: "22"},
+	}
+	usage := map[string]shared.RuleUsage{
+		"old":   {LastSeen: now.AddDate(0, 0, -60)},
+		"fresh": {LastSeen: now.Add(-2 * time.Hour)},
+	}
+	if got := unusedForThirtyDays(rules, usage); got != 1 {
+		t.Errorf("unusedForThirtyDays = %d, want 1 (only the sixty-day-old rule)", got)
+	}
+}
+
+// The threshold is thirty *days*, not some other unit that also happens to
+// leave a two-hour-old rule uncounted and a sixty-day-old one counted — a
+// mutation to `unusedThreshold = 30 * time.Hour` passes both of those and
+// would go undetected without a case on the actual boundary. Twenty-nine days
+// is not counted, thirty-one is.
+func TestUnusedForThirtyDays_ThresholdIsThirtyDaysNotThirtyHours(t *testing.T) {
+	now := time.Now()
+	rules := []shared.PortRule{
+		{ID: "almost", Port: "8080"},
+		{ID: "over", Port: "9090"},
+	}
+	usage := map[string]shared.RuleUsage{
+		"almost": {LastSeen: now.AddDate(0, 0, -29)},
+		"over":   {LastSeen: now.AddDate(0, 0, -31)},
+	}
+	if got := unusedForThirtyDays(rules, usage); got != 1 {
+		t.Errorf("unusedForThirtyDays = %d, want 1 (only the thirty-one-day-old rule; "+
+			"twenty-nine days is not yet unused for thirty)", got)
+	}
+}
+
+// And the count is zero when nothing is known, rather than "all of them".
+func TestUnusedForThirtyDays_KnowsNothingFromNothing(t *testing.T) {
+	rules := []shared.PortRule{{ID: "a", Port: "80"}, {ID: "b", Port: "443"}}
+	if got := unusedForThirtyDays(rules, nil); got != 0 {
+		t.Errorf("with no usage at all the count is %d, want 0", got)
+	}
+}

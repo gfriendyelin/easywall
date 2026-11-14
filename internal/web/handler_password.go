@@ -1,0 +1,166 @@
+package web
+
+import (
+	"encoding/base64"
+	"html/template"
+	"log/slog"
+	"net/http"
+)
+
+// totpSetup is the enrolment card, non-nil only while enrolling.
+type totpSetup struct {
+	// QR is template.URL rather than string: html/template's contextual
+	// escaper treats a plain string in a src attribute as untrusted and
+	// refuses any scheme but http/https/mailto, rendering "#ZgotmplZ" instead
+	// of the image — silently, with no error, on every page that would have
+	// shown a QR code. template.URL is the escaper's own sanctioned way for a
+	// caller to certify a value it built itself, never from a request, is safe
+	// to place there. qrPNGDataURI's own base64 encoding is what is being
+	// certified, not anything a visitor supplied.
+	QR         template.URL
+	SecretText string // grouped in fours, because it gets copied by hand
+	ServerTime string
+
+	// Failed mirrors pendingSecret.failed: whether a submitted code has
+	// already missed against this pending entry. The template shows the
+	// recovery-code escape only when this is true and MustEnrol also is —
+	// an operator with an existing factor is not locked out by a failed
+	// code here and simply leaves the page instead.
+	Failed bool
+}
+
+// passwordPageData is what password.html reads.
+type passwordPageData struct {
+	TOTPEnabled  bool
+	RecoveryLeft int
+	Setup        *totpSetup
+	// Codes is non-nil exactly once, on the response that issues them. There is
+	// no route that serves them: a URL that returns the codes would turn "shown
+	// once" into "retrievable at any time".
+	Codes []string
+	Demo  bool
+	// MustEnrol is true when this page is the gate rather than a settings page:
+	// the operator has no second factor and cannot go anywhere else until they
+	// have one. It changes the copy at the top of the page.
+	MustEnrol bool
+	// JustGated is true on the one response that both shows fresh recovery
+	// codes and was the operator's first factor. The codes cannot move to a
+	// redirect target — this is the only response that will ever carry them —
+	// so instead this response also offers the way onward: a link to the
+	// dashboard the operator was trying to reach when the gate stopped them.
+	JustGated bool
+
+	// Passkeys lists what is enrolled, oldest first — passkeyStore.all()'s own
+	// order — for the card's remove buttons.
+	Passkeys []passkeyView
+	// PasskeyReason is the locale key naming why the card's add control is
+	// disabled, or "" when passkeys are available. See passkeyUnavailableReason.
+	PasskeyReason string
+}
+
+// passkeyView is one row of the passkey card: passkeystore.go's storedPasskey
+// reshaped for the template, which needs the ID as the string a hidden form
+// field can hold and the date as text rather than a time.Time to format itself.
+type passkeyView struct {
+	IDBase64 string
+	Name     string
+	AddedAt  string
+}
+
+func (s *Server) passwordPage(setup *totpSetup, codes []string) passwordPageData {
+	stored := s.passkeys.all()
+	views := make([]passkeyView, len(stored))
+	for i, pk := range stored {
+		views[i] = passkeyView{
+			IDBase64: base64.RawURLEncoding.EncodeToString(pk.ID),
+			Name:     pk.Name,
+			AddedAt:  pk.AddedAt.Format("2 Jan 2006, 15:04"),
+		}
+	}
+	return passwordPageData{
+		TOTPEnabled:   s.cfg.TOTPEnabled(),
+		RecoveryLeft:  len(s.cfg.RecoveryCodes()),
+		Setup:         setup,
+		Codes:         codes,
+		Demo:          s.client.IsDemo(),
+		MustEnrol:     !s.hasSecondFactor() && !s.client.IsDemo(),
+		Passkeys:      views,
+		PasskeyReason: s.passkeyUnavailableReason(),
+	}
+}
+
+func (s *Server) handlePasswordGET(w http.ResponseWriter, r *http.Request) {
+	s.render(w, r, "password.html", "password", s.passwordPage(nil, nil))
+}
+
+func (s *Server) handlePasswordPOST(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		s.setFlash(w, r, "internal_error")
+		http.Redirect(w, r, "/password", http.StatusSeeOther)
+		return
+	}
+
+	// The demo shows the form and writes nothing. There is nothing to
+	// demonstrate past the form here — the interesting half of changing a
+	// password is that it is stored — and web.toml is the one piece of state the
+	// in-memory mock does not cover: SaveCredentials writes the real file, so a
+	// visitor could lock every other visitor out until the process restarted.
+	// Enumerated in TestDemoModeRefusesToWriteCredentials, which a new
+	// credential-writing route has to join.
+	if s.client.IsDemo() {
+		s.setFlash(w, r, "demo_readonly")
+		http.Redirect(w, r, "/password", http.StatusSeeOther)
+		return
+	}
+
+	current := r.FormValue("current_password")
+	newPw := r.FormValue("new_password")
+	confirm := r.FormValue("confirm_password")
+
+	username, currentHash := s.cfg.Credentials()
+	if !VerifyPassword(current, currentHash) {
+		s.setFlash(w, r, "password_wrong")
+		http.Redirect(w, r, "/password", http.StatusSeeOther)
+		return
+	}
+
+	if newPw != confirm {
+		s.setFlash(w, r, "password_mismatch")
+		http.Redirect(w, r, "/password", http.StatusSeeOther)
+		return
+	}
+
+	if key := passwordPolicyError(newPw); key != "" {
+		s.setFlash(w, r, key)
+		http.Redirect(w, r, "/password", http.StatusSeeOther)
+		return
+	}
+
+	hash, err := HashPassword(newPw)
+	if err != nil {
+		slog.Error("hash password error", "error", err)
+		s.setFlash(w, r, "internal_error")
+		http.Redirect(w, r, "/password", http.StatusSeeOther)
+		return
+	}
+
+	if err := s.cfg.SaveCredentials(username, hash); err != nil {
+		slog.Error("save credentials error", "error", err)
+		s.setFlash(w, r, "internal_error")
+		http.Redirect(w, r, "/password", http.StatusSeeOther)
+		return
+	}
+
+	// Every session issued under the old password is now invalid. Re-stamp this
+	// one so the operator who just changed it is not thrown out of the tab they
+	// are working in — anyone else signed in is.
+	if sess, err := s.store.Get(r, SessionName); err == nil {
+		sess.Values[SessionCredentialKey] = credentialFingerprint(hash, s.cfg.TOTPSecret(), s.passkeys.fingerprintInput())
+		if err := sess.Save(r, w); err != nil {
+			slog.Warn("could not refresh session after password change", "error", err)
+		}
+	}
+
+	s.setFlash(w, r, "password_changed")
+	http.Redirect(w, r, "/password", http.StatusSeeOther)
+}

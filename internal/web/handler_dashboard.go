@@ -1,0 +1,198 @@
+package web
+
+import (
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+type ruleCounts struct {
+	TCP        int
+	UDP        int
+	Blocklist  int
+	Allowlist  int
+	Custom     int
+	Forwarding int
+}
+
+type dashboardData struct {
+	Status  *shared.FirewallStatus
+	Version *shared.VersionInfo
+	Counts  *ruleCounts
+	Recent  []shared.AuditLogEntry
+	CoreErr string
+
+	// Health is whether the firewall is doing what the rest of this page says it
+	// is doing, or nil when the core did not answer that question.
+	//
+	// Nil is not an error state here and is not shown as one. Status.Active is
+	// NftablesManager.Enforcing — the table exists and its input chain has rules
+	// — which is a true claim and the one the hero made before this release. It
+	// is simply a claim about intent, and a core one version behind this web
+	// process does not know CmdGetHealth at all: rendering "unknown" over a
+	// working dashboard because the two binaries were upgraded a minute apart
+	// would be the same false alarm in the other direction.
+	Health *shared.HealthResult
+
+	// PendingCount is how many changes the Unapplied changes chip is about. Zero
+	// when nothing is pending, and the chip is not shown then either.
+	PendingCount int
+
+	// UnusedTCP is how many open TCP ports have not carried a packet in thirty
+	// days. Zero hides the line rather than printing a zero: "0 unused for 30+
+	// days" is a sentence about nothing.
+	UnusedTCP int
+
+	// AskTelemetry shows the card asking whether this installation may be
+	// counted, once per minor version (spec 2.28 D1).
+	AskTelemetry bool
+	// TelemetryEndpoint is the address the card names, for the reason System
+	// names it: what is sent is only checkable if where is shown too.
+	TelemetryEndpoint string
+}
+
+// unusedThreshold is how long a port has to have been quiet before the dashboard
+// mentions it. Thirty days, following FortiGate's convention — the interface most
+// operators will have met this idea in.
+const unusedThreshold = 30 * 24 * time.Hour
+
+// unusedForThirtyDays counts the rules whose last recorded use is older than the
+// threshold.
+//
+// A rule that has never been observed is *not* counted, and the omission is the
+// honest one: FirstSeen is the first use, not the moment the rule was written,
+// so there is nothing to date a never-used rule from. "Unused for 30+ days"
+// about a rule added yesterday would be a claim about a duration nobody
+// measured. The port table says "never" for it, which is the true statement, and
+// features/ports.md says why the tile and the table disagree.
+func unusedForThirtyDays(rules []shared.PortRule, usage map[string]shared.RuleUsage) int {
+	cutoff := time.Now().Add(-unusedThreshold)
+	n := 0
+	for _, r := range rules {
+		if r.ID == "" {
+			continue
+		}
+		u, ok := usage[r.ID]
+		if !ok || u.LastSeen.IsZero() {
+			continue
+		}
+		if u.LastSeen.Before(cutoff) {
+			n++
+		}
+	}
+	return n
+}
+
+// recentActivityLimit is how many audit entries the dashboard shows. Enough to
+// answer "what changed here lately" without turning into a second log page.
+const recentActivityLimit = 6
+
+// countListEntries counts what is actually a rule.
+//
+// The three free-text lists keep the operator's `#` comments and the blank lines
+// between groups, and every other counter in the interface skips them — the
+// template helper the editors use says so in as many words. The dashboard tiles
+// took a plain len() instead, so the same list was "12 entries" on one page and
+// "7" on another, and the number that disagreed was the one on the front page.
+// The demo ships lists full of comments, so it was visible to anyone who looked.
+func countListEntries(lines []string) int {
+	n := 0
+	for _, l := range lines {
+		if !shared.IsListComment(l) {
+			n++
+		}
+	}
+	return n
+}
+
+func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	data := &dashboardData{}
+
+	status, err := s.client.GetStatus()
+	if err != nil {
+		slog.Warn("could not get firewall status", "error", err)
+		data.CoreErr = err.Error()
+	} else {
+		data.Status = status
+	}
+
+	// The question the five releases before this one could not answer. Two
+	// netlink reads and a file read in the core, uncached: nothing else on this
+	// page polls it, and a cached "ok" is the one answer a health check must
+	// never be handed — the reason handleHealthz sets no-store on the same
+	// result. A failure is logged and left nil; see dashboardData.Health.
+	if health, err := s.client.GetHealth(); err != nil {
+		slog.Debug("could not read the health state for the dashboard", "error", err)
+	} else {
+		data.Health = health
+	}
+
+	if rules, err := s.client.GetRules(); err == nil {
+		data.Counts = &ruleCounts{
+			TCP:        len(rules.Current.TCP),
+			UDP:        len(rules.Current.UDP),
+			Blocklist:  countListEntries(rules.Current.Blocklist),
+			Allowlist:  countListEntries(rules.Current.Allowlist),
+			Custom:     countListEntries(rules.Current.Custom),
+			Forwarding: len(rules.Current.Forwarding),
+		}
+
+		// One more command, and only when there are rules to say anything about.
+		if res, err := s.client.GetUsage(); err == nil {
+			data.UnusedTCP = unusedForThirtyDays(rules.Current.TCP, res.Usage)
+		} else {
+			slog.Debug("could not read the usage counters for the dashboard", "error", err)
+		}
+	}
+
+	// Only when something is pending, so a quiet dashboard costs no extra reads:
+	// three more round trips over a local socket on the load where the number is
+	// worth having, and none on the load where it is zero.
+	if status != nil && status.HasPending {
+		data.PendingCount = s.pendingChangeCount()
+	}
+
+	// Recent activity. Best-effort: the dashboard is still useful without it,
+	// so a log read failure is logged and otherwise ignored rather than
+	// surfaced as a page-level error.
+	if entries, err := s.client.GetLog(); err != nil {
+		slog.Debug("could not get audit log for dashboard", "error", err)
+	} else if len(entries) > recentActivityLimit {
+		data.Recent = entries[:recentActivityLimit]
+	} else {
+		data.Recent = entries
+	}
+
+	// Version check. Answered from cache; a stale cache is refreshed in the
+	// background and shows up on the next load. The comment here used to say
+	// "non-blocking" above a call that waited out a five-second HTTP timeout on
+	// every render — on exactly the isolated hosts easywall is built for.
+	data.Version = s.version.Info()
+	data.AskTelemetry = s.askTelemetry()
+	data.TelemetryEndpoint = shared.TelemetryEndpoint
+
+	s.render(w, r, "dashboard.html", "dashboard", data)
+}
+
+// pendingChangeCount is the number the dashboard's chip carries: rule deltas
+// plus configuration drift, the same two halves /apply lists. It is a count of
+// changes and not of pages, so an option and a port are one each.
+func (s *Server) pendingChangeCount() int {
+	state, err := s.client.GetRules()
+	if err != nil {
+		return 0
+	}
+	n := len(shared.DiffRules(state.Current, state.Staged))
+
+	opts, oErr := s.client.GetOptions()
+	nets, nErr := s.client.GetSettings()
+	applied, aErr := s.client.GetAppliedConfig()
+	if oErr == nil && nErr == nil && aErr == nil && applied.Recorded {
+		n += len(shared.DiffConfig(applied.Config, shared.AppliedConfig{
+			Firewall: *opts, Network: *nets,
+		}))
+	}
+	return n
+}

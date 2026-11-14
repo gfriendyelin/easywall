@@ -1,0 +1,325 @@
+package shared
+
+import (
+	"fmt"
+	"net"
+	"net/netip"
+	"strconv"
+	"strings"
+)
+
+// ValidateRules is the one definition of what a storable rule set is.
+//
+// It lives here rather than in the core because three places have to agree on
+// it: the core, which must not trust what the web process sends; the web
+// process, which owes the operator a message naming the line rather than a
+// redirect; and the demo, which represents the product to everyone who has not
+// installed it yet and used to accept input the real thing refuses.
+func ValidateRules(r Rules) error {
+	for _, rule := range r.TCP {
+		if err := validatePortRule(rule); err != nil {
+			return fmt.Errorf("tcp rule %q: %w", rule.Port, err)
+		}
+	}
+	for _, rule := range r.UDP {
+		if err := validatePortRule(rule); err != nil {
+			return fmt.Errorf("udp rule %q: %w", rule.Port, err)
+		}
+	}
+	// Two rules sharing an id share a usage counter, and the number an operator
+	// would then close a port on is the sum of two ports' traffic. EnsureRuleIDs
+	// repairs this on every write path, so reaching here means a rules.json
+	// edited by hand — which is exactly the case that needs an error rather than
+	// a silently merged history. An empty id is not a duplicate: a file written
+	// before 2.15 has nothing else.
+	// No capacity hint: these hold one entry per port rule, which is dozens,
+	// and len(r.TCP)+len(r.UDP) is the only size arithmetic in the tree —
+	// CodeQL's size-computation-overflow query flags it as a high-severity
+	// alert. The sum cannot overflow an int without exabytes of PortRule, so
+	// the alert is wrong, but the hint was worth nothing to begin with and
+	// arguing with a scanner over ceremony is the worse trade.
+	seenIDs := make(map[string]bool)
+	for _, list := range [][]PortRule{r.TCP, r.UDP} {
+		for _, rule := range list {
+			if rule.ID == "" {
+				continue
+			}
+			// The format, and it is not cosmetic. This value is written verbatim
+			// into the kernel as an nftables comment, and userdata.Append writes
+			// the TLV length as byte(len(data)) — an unchecked narrowing. An id of
+			// 254 characters declares a length past the kernel's
+			// NFT_USERDATA_MAXLEN and every apply is refused until that rule is
+			// deleted: the firewall cannot be changed. At 255 the length byte
+			// wraps to zero, so the id read back out of the kernel is the empty
+			// string, Collect books the traffic under a key no rule has, and the
+			// port reports "never" for ever. The same value also lands in
+			// `nft list ruleset`, where an operator and any script reading that
+			// output see it.
+			//
+			// Here rather than only in EnsureRuleIDs, which repairs a malformed id
+			// on every write path: this is the boundary the web process crosses,
+			// and it is the one place that must not trust the shape of what it was
+			// handed. ValidRuleID rejects the empty string, which is why the check
+			// sits after the continue above.
+			if !ValidRuleID(rule.ID) {
+				return fmt.Errorf("rule id %q is not a rule id; it must be exactly twelve "+
+					"lowercase hex characters, because it is written into the kernel as an "+
+					"nftables comment whose length field is a single byte", rule.ID)
+			}
+			if seenIDs[rule.ID] {
+				return fmt.Errorf("rule id %q is used by two rules; ids key the usage "+
+					"counters, so the two would share one history", rule.ID)
+			}
+			seenIDs[rule.ID] = true
+		}
+	}
+	for _, ip := range r.Blocklist {
+		if IsListComment(ip) {
+			continue
+		}
+		if err := ValidateIPOrCIDR(ip); err != nil {
+			return fmt.Errorf("blocklist %q: %w", ip, err)
+		}
+	}
+	for _, ip := range r.Allowlist {
+		if IsListComment(ip) {
+			continue
+		}
+		if err := ValidateIPOrCIDR(ip); err != nil {
+			return fmt.Errorf("allowlist %q: %w", ip, err)
+		}
+	}
+	// A feed id becomes a set name and a counter id in the kernel (Task 3), and
+	// the core looks up its stored copy by it. An id nothing knows would build
+	// an empty set named after whatever the web process sent, and a second
+	// copy of one id would be two rules dropping the same traffic.
+	seenFeeds := make(map[string]bool, len(r.Feeds))
+	countries := 0
+	for _, id := range r.Feeds {
+		if !KnownFeedID(id) {
+			return fmt.Errorf("feed %q is neither a catalogue feed, a country, nor own-1 to own-%d", id, MaxOwnFeeds)
+		}
+		if seenFeeds[id] {
+			return fmt.Errorf("feed %q is switched on twice", id)
+		}
+		seenFeeds[id] = true
+		if IsCountryFeedID(id) {
+			countries++
+		}
+	}
+	// Spec D5: every country is two sets and up to four rules, and every
+	// refresh reads all of them.
+	if countries > MaxCountries {
+		return fmt.Errorf("%d countries are switched on; at most %d may be", countries, MaxCountries)
+	}
+	for i, rule := range r.Custom {
+		if err := validateCustomRule(rule); err != nil {
+			return fmt.Errorf("custom rule %d: %w", i+1, err)
+		}
+	}
+	for _, fwd := range r.Forwarding {
+		if fwd.Protocol != "tcp" && fwd.Protocol != "udp" {
+			return fmt.Errorf("forwarding: invalid protocol %q", fwd.Protocol)
+		}
+		if fwd.SourcePort < 1 || fwd.SourcePort > 65535 {
+			return fmt.Errorf("forwarding: invalid source port %d", fwd.SourcePort)
+		}
+		if fwd.DestPort < 1 || fwd.DestPort > 65535 {
+			return fmt.Errorf("forwarding: invalid dest port %d", fwd.DestPort)
+		}
+	}
+	return nil
+}
+
+// validatePortRule accepts "80" or "8000:9000" and nothing else.
+//
+// It used to parse with fmt.Sscanf, which stops at the first thing it cannot
+// read and reports success for what it got: "80abc" passed as port 80, and so
+// did "80 90" — someone who meant to open two ports opened one, and the rule
+// list showed a string the firewall was not enforcing. strconv.Atoi rejects any
+// trailing character, so what is stored is what is applied.
+func validatePortRule(r PortRule) error {
+	if r.Port == "" {
+		return fmt.Errorf("port is required")
+	}
+
+	if start, end, ok := strings.Cut(r.Port, ":"); ok {
+		lo, err := ParsePortNumber(start)
+		if err != nil {
+			return fmt.Errorf("port range start: %w", err)
+		}
+		hi, err := ParsePortNumber(end)
+		if err != nil {
+			return fmt.Errorf("port range end: %w", err)
+		}
+		if hi < lo {
+			return fmt.Errorf("port range %d:%d ends before it starts", lo, hi)
+		}
+	} else if _, err := ParsePortNumber(r.Port); err != nil {
+		return err
+	}
+
+	switch r.Scope {
+	case "", ScopeHost, ScopeForwarded, ScopeBoth:
+	default:
+		return fmt.Errorf("unknown scope %q: use host, forwarded or both", r.Scope)
+	}
+
+	// The source restriction is an address list like every other one in this
+	// file: comments and blank spacers are part of what the operator typed and
+	// are skipped rather than refused, exactly as cidrMatch skips them when it
+	// builds the rule.
+	for _, src := range r.Sources {
+		if IsListComment(src) {
+			continue
+		}
+		if err := ValidateIPOrCIDR(strings.TrimSpace(src)); err != nil {
+			return fmt.Errorf("source %q: %w", src, err)
+		}
+	}
+	return nil
+}
+
+// customRuleSeparators are the characters nft reads as the end of one command
+// and the start of the next.
+const customRuleSeparators = "\n\r;"
+
+// validateCustomRule checks that a rule is one nft statement and not several.
+//
+// Custom rules are appended to a script as `add rule inet easywall input <rule>`,
+// and nft takes both a newline and a semicolon as a command separator. A rule
+// carrying either is not a rule: it is a second command, run by the root daemon,
+// able to reach tables easywall does not own. Demonstrated against a real
+// kernel — an imported rule containing a newline wrote into a neighbouring
+// table, which is precisely what "easywall owns one table and never looks at
+// another" says cannot happen.
+//
+// The textarea splits on newlines, so this was reachable through import, where
+// a JSON string can hold anything. Structural rather than a parser check on
+// purpose: it does not depend on nft's grammar, on a subprocess being available,
+// or on the wrapper used for syntax checking happening to be unbalanced.
+func validateCustomRule(rule string) error {
+	if i := strings.IndexAny(rule, customRuleSeparators); i >= 0 {
+		return fmt.Errorf("contains %q, which nft reads as the end of the command; "+
+			"a custom rule is a single statement, so put each on its own line",
+			string(rule[i]))
+	}
+	return nil
+}
+
+// ValidateNetworkList is the one definition of what the two network lists on the
+// Network page hold: `docker.custom_networks` and `routing.networks`.
+//
+// It lives here for the same reason ValidateRules does — three places have to
+// agree on it. The core must not trust what the web process sends; the web
+// process owes the operator a message naming the entry rather than a generic
+// "check core connection"; and the demo represents the product to everyone who
+// has not installed it yet.
+//
+// They had three different answers. The editor validated with the blocklist's
+// rules, which accept a bare address and skip comments and blanks; the core
+// demanded net.ParseCIDR of every element including those; and the demo checked
+// nothing. So a blank line between two networks, a `#` note, or a bare address
+// was accepted by the page, refused by the core, and reported as "Failed to save
+// changes. Check core connection." — with a working core.
+//
+// Comments and blank lines are skipped rather than refused, because that is what
+// the rest of the product does with a list an operator types: the editors keep
+// them, countEntries ignores them, and addCIDRAccept and cidrMatch in the core
+// already skip them when building rules. This function was the only place that
+// did not.
+func ValidateNetworkList(what string, entries []string) error {
+	for _, entry := range entries {
+		if IsListComment(entry) {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(strings.TrimSpace(entry)); err != nil {
+			return fmt.Errorf("%s %q: not a CIDR network", what, entry)
+		}
+	}
+	return nil
+}
+
+// ParsePortNumber parses a complete port number, rejecting anything else.
+func ParsePortNumber(s string) (int, error) {
+	p, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, fmt.Errorf("%q is not a port number", s)
+	}
+	if p < 1 || p > 65535 {
+		return 0, fmt.Errorf("port %d is outside 1-65535", p)
+	}
+	return p, nil
+}
+
+// isListComment reports whether an address-list entry is a comment or a blank
+// spacer. Both are part of the stored list — the editor keeps them so an
+// operator's note about why an address is blocked survives a save — and neither
+// is an address to validate or turn into a rule.
+func IsListComment(entry string) bool {
+	entry = strings.TrimSpace(entry)
+	return entry == "" || strings.HasPrefix(entry, "#")
+}
+
+func ValidateIPOrCIDR(s string) error {
+	if ip := net.ParseIP(s); ip != nil {
+		return nil
+	}
+	if _, _, err := net.ParseCIDR(s); err == nil {
+		return nil
+	}
+	return fmt.Errorf("invalid IP or CIDR: %s", s)
+}
+
+// ParseNetwork reads an address-list network entry the way every rule builder
+// and every containment check reads it.
+//
+// An IPv4-mapped network is the IPv4 network it names: ::ffff:10.0.0.0/104 is
+// 10.0.0.0/8. ValidateIPOrCIDR has always accepted that spelling and until 2.22
+// nothing turned it back, so the blocklist and the allowlist paired a 4-byte
+// compare with a 16-byte mask and the kernel refused the whole rule set with
+// EINVAL, and a port rule's source list skipped it with a WARN.
+//
+// It parses with net.ParseCIDR, the parser ValidateIPOrCIDR uses, and not with
+// netip.ParsePrefix: the two disagree (10.0.0.0/08 passes one and not the
+// other), and a builder stricter than the validator skips an entry the
+// operator was told is fine — a blocklist line that blocks nothing.
+func ParseNetwork(s string) (netip.Prefix, error) {
+	_, n, err := net.ParseCIDR(strings.TrimSpace(s))
+	if err != nil {
+		return netip.Prefix{}, err
+	}
+	// n.IP is 4 bytes for an IPv4 network and 16 for any other, so a mapped
+	// network arrives here as a 16-byte ::ffff: address.
+	addr, _ := netip.AddrFromSlice(n.IP)
+	bits, _ := n.Mask.Size()
+	if addr.Is4In6() && bits >= 96 {
+		return netip.PrefixFrom(addr.Unmap(), bits-96).Masked(), nil
+	}
+	return netip.PrefixFrom(addr, bits).Masked(), nil
+}
+
+// ValidateAddressList checks one of the configuration's address lists: bare
+// addresses and CIDR networks, the two shapes every other address list in the
+// product accepts, with comments and blanks skipped the same way.
+//
+// A malformed entry stops startup. Dropping it instead would leave a list one
+// entry short, which stops trusting a proxy that is really there — and the
+// operator meets that as a login limiter that suddenly counts everyone
+// together, six weeks later, with nothing anywhere naming the typo.
+//
+// key names the setting in the error, and that is the whole reason this takes a
+// parameter rather than being copied per list: 2.17's health_allow has the same
+// grammar and a different meaning, and a message naming trusted_proxies for a
+// health_allow entry sends an operator to the wrong line of their web.toml.
+func ValidateAddressList(key string, entries []string) error {
+	for _, entry := range entries {
+		if IsListComment(entry) {
+			continue
+		}
+		if err := ValidateIPOrCIDR(strings.TrimSpace(entry)); err != nil {
+			return fmt.Errorf("%s %q: %w", key, entry, err)
+		}
+	}
+	return nil
+}

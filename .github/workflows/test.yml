@@ -1,0 +1,356 @@
+name: Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+permissions:
+  contents: read
+  id-token: write
+
+# A superseded run is finished work nobody reads. Renovate rebases its branches
+# whenever main moves (rebaseWhen: behind-base-branch), and every push to a pull
+# request used to leave its predecessor running to completion.
+#
+# Deliberately not on main: a cancelled run there could skip publishing an edge
+# image or a deployment, and the point of a push to main is that it completes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The toolchain comes from go.mod's `toolchain` line, here and in every
+      # other job. It used to be written out as "1.25" in ten places while the
+      # Dockerfile said 1.26 — so the image was built by a Go version nothing
+      # tested with, and no tool could see the disagreement.
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify modules
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests with race detector
+        run: go test -race -coverprofile=coverage.out -covermode=atomic ./cmd/... ./internal/...
+
+      # The profile has to exist and have something in it before anyone is told
+      # about it. This check fails; the upload below does not, and that pairing
+      # is how an upload that never landed stayed invisible.
+      - name: The coverage profile is not empty
+        run: |
+          set -euo pipefail
+          test -s coverage.out || { echo "::error::coverage.out is missing or empty"; exit 1; }
+          echo "$(( $(wc -l < coverage.out) - 1 )) covered blocks recorded"
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v7
+        continue-on-error: true  # Dependabot PRs lack CODECOV_TOKEN; don't block CI
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.out
+          flags: unit
+          fail_ci_if_error: true
+
+  test-integration:
+    name: Integration tests (nftables / CAP_NET_ADMIN, ACME / Pebble)
+    runs-on: ubuntu-26.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Install nftables
+        run: sudo apt-get install -y nftables
+
+      # Pulled here, before TestMain's CLONE_NEWNET below, not inside the
+      # test itself: once that namespace exists it has only loopback, and a
+      # container image that still has to be pulled finds no route to
+      # ghcr.io from inside it — see internal/web/acme_integration_test.go's
+      # own package comment for the arrangement this feeds. Pinned to the
+      # same version pebbleImageVersion names there, for the same reason
+      # named there (a Location-header regression between that version and
+      # current Pebble). As root (sudo): rootless and root podman keep
+      # separate storage directories, and the test below also runs under
+      # sudo — a pull done as the runner user would sit in a store the
+      # suite, running as root, never looks in.
+      - name: Pull Pebble images
+        run: sudo podman pull ghcr.io/letsencrypt/pebble:2.7.0 ghcr.io/letsencrypt/pebble-challtestsrv:2.7.0
+
+      # Integration tests run in an isolated network namespace created by
+      # TestMain via CLONE_NEWNET (requires CAP_SYS_ADMIN = root via sudo).
+      # They verify that actual nftables rules are applied correctly to the
+      # kernel — something unit-test mocking cannot achieve — and, since 2.13,
+      # that the trusted-proxy resolution sees a peer address the kernel
+      # assigned rather than one a test wrote into a struct. Since this task,
+      # ./internal/web/...'s own TestIntegration_ACertificateArrivesOverHTTP01
+      # runs in the same namespace and proves the ACME path the same way: a
+      # certificate arriving from Pebble over a challenge Start() really
+      # served, not a mock standing in for the wire.
+      #
+      # The timeout is there to catch a hang, not to police seconds: three
+      # provers now run under it (the nftables suite, the core self-test
+      # layer, and Pebble's own issuance round trip, which alone measured up
+      # to 90s against this same job's usual load), and a limit that trips
+      # intermittently costs far more to diagnose than a generous one costs
+      # to wait for.
+      #
+      # EASYWALL_REQUIRE_SELFTEST is what stops this step being green for a run
+      # that measured nothing. 2.17's layer C proves four claims inside a network
+      # namespace of its own, and every prover skips politely when it cannot
+      # build one — right on a developer's machine, silent here. Measured: with
+      # all of them skipping, one of the three parent tests still reports PASS.
+      # The same variable also gates TestIntegration_ACertificateArrivesOverHTTP01's
+      # own precondition, a container runtime — see acme_integration_test.go's
+      # skipOrFailUnprovable.
+      #
+      # Not for the case of this whole job losing CAP_SYS_ADMIN — TestMain
+      # re-execs into CLONE_NEWNET and exits 1 when it cannot, so that day is
+      # already loud. It is for the quiet one: the clone succeeded, the suite ran,
+      # and a prover returned "unprovable" anyway. With the variable set,
+      # skipOrFailUnprovable turns that into a t.Fatal.
+      # See internal/core/selftest_required_test.go.
+      #
+      # Passed to sudo as an assignment rather than relying on -E: sudo's default
+      # env_reset drops it, and a variable the suite never sees is a gate that
+      # does nothing while looking exactly like a gate that works.
+      - name: Integration tests (kernel nftables, ACME/Pebble)
+        run: sudo EASYWALL_REQUIRE_SELFTEST=1 go test -tags integration -v -count=1 -timeout 480s -coverprofile=coverage-integration.out -covermode=atomic ./internal/core/... ./internal/web/...
+
+      # Counted, not just run. Without this the rule builders in nftables.go
+      # measured 0% — every one of them is exercised here and nowhere else, so
+      # the coverage report said the firewall's core logic was untested while
+      # the suite above was testing it against a real kernel. A number that
+      # wrong is worse than no number: it hid which parts genuinely had none.
+      # The suite runs under sudo, so the profile belongs to root and inherits
+      # root's umask. The uploader runs as the runner user; a profile it cannot
+      # read is an upload that does not happen, behind a step that cannot fail.
+      # Codecov's flag list for this repository is empty, which is what "the
+      # integration half has never arrived" looks like from outside — this is
+      # the cheapest of the candidate causes and the only one reachable from
+      # here. Whether it is *the* cause is not something this repository can
+      # prove; the check below at least stops the file itself being the problem.
+      - name: The integration profile is readable and not empty
+        run: |
+          set -euo pipefail
+          sudo chown "$(id -u):$(id -g)" coverage-integration.out
+          test -s coverage-integration.out || {
+            echo "::error::coverage-integration.out is missing or empty"; exit 1; }
+          echo "$(( $(wc -l < coverage-integration.out) - 1 )) covered blocks recorded"
+
+      - name: Upload integration coverage
+        uses: codecov/codecov-action@v7
+        continue-on-error: true # Dependabot PRs lack CODECOV_TOKEN; don't block CI
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage-integration.out
+          flags: integration
+          fail_ci_if_error: true
+
+  # Both stylesheets and every diagram are generated files that are committed, so
+  # a release does not need the Node toolchain. Nothing verified they were
+  # current: `npm run check:diagrams` was written for exactly this and CONTRIBUTING.md
+  # names it as the guard, but no workflow ever called it, and the docs
+  # stylesheet had already drifted from its source by the time anyone looked.
+  # A generated file with no freshness check is a file that is stale eventually.
+  assets:
+    name: Generated assets are current
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # codespell is a typo-only dictionary — near-zero false positives on
+      # nftables, conntrack and argon2id, where hunspell floods. Configuration,
+      # and the reasoning for every skip and every ignored word, is in
+      # .codespellrc. First, because it needs no Ruby, no Node and no build.
+      #
+      # Here and not in docs.yml, where it lived until 2.19: .codespellrc is
+      # written repo-wide and codespell runs repo-wide, but docs.yml triggers on
+      # docs/**, CHANGELOG.md and three other paths — so a typo in README.md,
+      # DESIGN.md, locales/en.json or internal/**/*.go was never checked. This
+      # workflow has no path filter, which is the whole reason it is the right
+      # home.
+      #
+      # No paths on the command line, deliberately: explicit paths bypass the
+      # skip list's ./-prefixed entries in .codespellrc, so the repo-wide
+      # invocation is the correct one as well as the shorter one.
+      - name: Spelling
+        run: pipx run codespell
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - run: npm ci
+
+      # Rebuild in place and let git report the difference — the diff names the
+      # rule that is missing, which "files differ" would not.
+      - name: Stylesheets match their sources
+        run: |
+          npm run build:css
+          npm run build:docs-css
+          git diff --exit-code --stat -- web/static/style.css docs/assets/css/style.css
+
+      - name: Diagrams match their .mmd sources
+        run: npm run check:diagrams
+
+      # htmx is the third committed artefact and the only one nothing checked.
+      # web/static/htmx.min.js is served to every page and is a copy of the
+      # dependency pinned in package.json; the two are kept in step by hand, so
+      # a version bump — or Dependabot's — updates the lockfile and leaves the
+      # served copy on the old release. Nothing errors: the interface simply runs
+      # a version of htmx the project no longer claims to ship.
+      - name: The served htmx matches the pinned dependency
+        run: |
+          cp node_modules/htmx.org/dist/htmx.min.js web/static/htmx.min.js
+          git diff --exit-code --stat -- web/static/htmx.min.js || {
+            echo "::error::web/static/htmx.min.js is not the htmx pinned in package.json."
+            echo "Run: cp node_modules/htmx.org/dist/htmx.min.js web/static/htmx.min.js"
+            exit 1
+          }
+
+      # The flags (2.27.1) are the fourth: web/static/flags is flag-icons' 4x3
+      # set, one per shared.CountryCodes, written by build:flags. Rebuilt and
+      # diffed, untracked files included, so a flag-icons bump or a new country
+      # without the rebuild is red here.
+      - name: The served flags match the pinned dependency
+        run: |
+          npm run build:flags
+          git add -N web/static/flags
+          git diff --exit-code --stat -- web/static/flags || {
+            echo "::error::web/static/flags is not what npm run build:flags writes."
+            echo "Run: npm run build:flags && git add web/static/flags"
+            exit 1
+          }
+
+  # What a Go test and a stylesheet diff cannot see: the interface running in a
+  # browser. The forwarding editor stored a port of "1E+04" as port 1, because
+  # parseInt and <input type="number"> disagree about what the field holds — a
+  # mistake no assertion on the server side can reach, and one the page reported
+  # as "Changes saved.". The same run also catches a console error, a failed
+  # request or a sideways scroll on any page, in both themes.
+  #
+  # Driven against demo mode, so there is no core daemon, no root and no
+  # nftables: the config starts with no password and the script completes the
+  # first-run wizard itself, which exercises that too.
+  ui:
+    name: Interface in a browser
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - run: npm ci
+
+      # playwright-core ships no browser of its own. Its Chromium is pinned by the
+      # playwright-core version in package-lock.json, so this is reproducible
+      # rather than "whatever Chrome the runner image happens to carry".
+      #
+      # Not --only-shell: a plain chromium.launch() uses the full build, and with
+      # the shell alone the launch fails outright. Verified by asking for a bare
+      # launch and reading back which binary answered.
+      - name: Install Chromium
+        run: npx playwright-core install --with-deps chromium
+
+      # The committed stylesheet is what the pages are styled with; build it so a
+      # missing rule shows up here as well as in the assets job.
+      - name: Compile CSS
+        run: npm run build:css
+
+      - name: Build easywall-web
+        run: go build -o bin/easywall-web ./cmd/easywall-web
+
+      - name: Start easywall-web in demo mode
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/easywall/ssl /tmp/easywall/data
+          cat > /tmp/easywall/web.toml <<'EOF'
+          bind_addr    = "127.0.0.1:12227"
+          ssl_dir      = "/tmp/easywall/ssl"
+          data_dir     = "/tmp/easywall/data"
+          demo_mode    = true
+          update_check = false
+          session_key  = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+          username     = ""
+          password     = ""
+          [tls]
+          cert = ""
+          key  = ""
+          EOF
+          ./bin/easywall-web -config /tmp/easywall/web.toml > /tmp/easywall/web.log 2>&1 &
+          for _ in $(seq 1 40); do
+            curl -sk -o /dev/null https://127.0.0.1:12227/firstrun && break
+            sleep 0.25
+          done
+          curl -skf -o /dev/null https://127.0.0.1:12227/firstrun || {
+            echo "::error::easywall-web did not come up"; cat /tmp/easywall/web.log; exit 1;
+          }
+
+      # EASYWALL_CONFIG points the script's second run at the config the wizard
+      # above just wrote, so it can read the password hash back out and start a
+      # second easywall-web with it — see checkVerifyPage in ui-check.mjs.
+      - name: Drive the interface
+        env:
+          EASYWALL_URL: https://127.0.0.1:12227
+          EASYWALL_CONFIG: /tmp/easywall/web.toml
+        run: npm run check:ui
+
+      - name: The server logged nothing it should not have
+        if: always()
+        run: |
+          cat /tmp/easywall/web.log
+          # A panic recovered into a 500 is invisible from the browser's side.
+          ! grep -q "panic" /tmp/easywall/web.log
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.15.0
+          install-mode: goinstall
+          args: --timeout 5m

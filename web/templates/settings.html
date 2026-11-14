@@ -1,0 +1,220 @@
+{{define "settings.html"}}
+{{template "head" .}}
+{{template "sidebar" .}}
+<div class="main">
+  {{template "topbar" .}}
+  <div class="content">
+    {{template "flash" .}}
+
+    <div class="page-header">
+      <div class="page-header-text">
+        <h1 class="page-title">{{T "settings_title"}}</h1>
+        <p class="page-subtitle">{{T "settings_subtitle"}}</p>
+      </div>
+    </div>
+
+    {{with .Data}}
+    {{if .CoreErr}}
+    <div role="alert" class="alert alert-crit mb-4">
+      <svg class="size-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.28 7.22a.75.75 0 00-1.06 1.06L8.94 10l-1.72 1.72a.75.75 0 101.06 1.06L10 11.06l1.72 1.72a.75.75 0 101.06-1.06L11.06 10l1.72-1.72a.75.75 0 00-1.06-1.06L10 8.94 8.28 7.22z" clip-rule="evenodd"/></svg>
+      <span>{{.CoreErr}}</span>
+    </div>
+    {{end}}
+
+    {{$ns := .Settings}}
+    <form method="POST" action="/settings"
+          hx-post="/settings"
+          hx-swap="none">
+
+      <div class="page-grid">
+        <div>
+          <div class="card mb-4">
+            <div class="section-head">
+              <div class="section-head-text">
+                <h2 class="section-title">{{T "settings_ipv6"}}</h2>
+                <p class="section-desc">{{T "settings_ipv6_desc"}}</p>
+              </div>
+            </div>
+
+            <label class="switch-row">
+              <span class="switch-text">
+                <span class="switch-name">{{T "settings_ipv6_filter"}}</span>
+                <span class="switch-desc">{{richText (T "settings_ipv6_filter_desc")}}</span>
+              </span>
+            </label>
+
+            {{$mode := "filter"}}{{if $ns}}{{$mode = $ns.IPv6.Mode}}{{end}}
+            <fieldset class="choice-group">
+              <legend class="sr-only">{{T "settings_ipv6_filter"}}</legend>
+              <label class="choice-row">
+                <input type="radio" name="ipv6_mode" value="filter" class="radio"
+                       {{if eq (printf "%s" $mode) "filter"}}checked{{end}}>
+                <span class="switch-text">
+                  <span class="switch-name">{{T "settings_ipv6_mode_filter"}}</span>
+                  <span class="switch-desc">{{T "settings_ipv6_mode_filter_desc"}}</span>
+                </span>
+              </label>
+              <label class="choice-row">
+                <input type="radio" name="ipv6_mode" value="passthrough" class="radio"
+                       {{if eq (printf "%s" $mode) "passthrough"}}checked{{end}}>
+                <span class="switch-text">
+                  <span class="switch-name">{{T "settings_ipv6_mode_passthrough"}}</span>
+                  <span class="switch-desc">{{T "settings_ipv6_mode_passthrough_desc"}}</span>
+                </span>
+              </label>
+              <label class="choice-row">
+                <input type="radio" name="ipv6_mode" value="block" class="radio"
+                       {{if eq (printf "%s" $mode) "block"}}checked{{end}}>
+                <span class="switch-text">
+                  <span class="switch-name">{{T "settings_ipv6_mode_block"}}</span>
+                  <span class="switch-desc">{{T "settings_ipv6_mode_block_desc"}}</span>
+                </span>
+              </label>
+            </fieldset>
+
+            <label class="switch-row">
+              <span class="switch-text">
+                <span class="switch-name">{{T "settings_ra"}}</span>
+                <span class="switch-desc">{{T "settings_ra_desc"}}</span>
+              </span>
+              <input type="checkbox" name="icmp_allow_router_advertisement" class="toggle"
+                     {{if and $ns $ns.IPv6.ICMPAllowRouterAdvertisement}}checked{{end}}>
+            </label>
+
+            <label class="switch-row">
+              <span class="switch-text">
+                <span class="switch-name">{{T "settings_na"}}</span>
+                <span class="switch-desc">{{T "settings_na_desc"}}</span>
+              </span>
+              <input type="checkbox" name="icmp_allow_neighbor_advertisement" class="toggle"
+                     {{if and $ns $ns.IPv6.ICMPAllowNeighborAdvertisement}}checked{{end}}>
+            </label>
+          </div>
+
+          <div class="card mb-4">
+            <div class="section-head">
+              <div class="section-head-text">
+                <h2 class="section-title">{{T "settings_routing"}}</h2>
+                <p class="section-desc">{{T "settings_routing_desc"}}</p>
+              </div>
+            </div>
+
+            {{$rmode := "closed"}}{{if $ns}}{{$rmode = $ns.Routing.Mode}}{{end}}
+            <fieldset class="choice-group">
+              <legend class="sr-only">{{T "settings_routing"}}</legend>
+              <label class="choice-row">
+                <input type="radio" name="routing_mode" value="closed" class="radio"
+                       {{if eq (printf "%s" $rmode) "closed"}}checked{{end}}>
+                <span class="switch-text">
+                  <span class="switch-name">{{T "settings_routing_closed"}}</span>
+                  <span class="switch-desc">{{T "settings_routing_closed_desc"}}</span>
+                </span>
+              </label>
+              <label class="choice-row">
+                <input type="radio" name="routing_mode" value="networks" class="radio"
+                       {{if eq (printf "%s" $rmode) "networks"}}checked{{end}}>
+                <span class="switch-text">
+                  <span class="switch-name">{{T "settings_routing_networks"}}</span>
+                  <span class="switch-desc">{{T "settings_routing_networks_desc"}}</span>
+                </span>
+              </label>
+              <label class="choice-row">
+                <input type="radio" name="routing_mode" value="open" class="radio"
+                       {{if eq (printf "%s" $rmode) "open"}}checked{{end}}>
+                <span class="switch-text">
+                  <span class="switch-name">{{T "settings_routing_open"}}</span>
+                  <span class="switch-desc">{{T "settings_routing_open_desc"}}</span>
+                </span>
+              </label>
+            </fieldset>
+
+            <div class="switch-detail">
+              <label class="field-label" for="routing_networks">{{T "settings_routing_networks_label"}}</label>
+              <textarea id="routing_networks" name="routing_networks" rows="4"
+                        class="input input-data w-full mt-1.5"
+                        placeholder="10.8.0.0/24&#10;192.168.50.0/24">
+{{.RoutingNetworks}}</textarea>
+              <p class="field-help">{{richText (T "settings_routing_networks_help")}}</p>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="section-head">
+              <div class="section-head-text">
+                <h2 class="section-title">{{T "settings_docker"}}</h2>
+                <p class="section-desc">{{T "settings_docker_desc"}}</p>
+              </div>
+            </div>
+
+            <label class="switch-row">
+              <span class="switch-text">
+                <span class="switch-name">{{T "settings_docker_detect"}}</span>
+                <span class="switch-desc">{{T "settings_docker_detect_desc"}}</span>
+              </span>
+              <input type="checkbox" name="docker_enabled" class="toggle"
+                     {{if and $ns $ns.Docker.Enabled}}checked{{end}}>
+            </label>
+
+            <label class="switch-row">
+              <span class="switch-text">
+                <span class="switch-name">{{T "settings_docker_allow"}}</span>
+                <span class="switch-desc">{{T "settings_docker_allow_desc"}}</span>
+              </span>
+              <input type="checkbox" name="allow_bridge_networks" class="toggle"
+                     {{if and $ns $ns.Docker.AllowBridgeNetworks}}checked{{end}}>
+            </label>
+
+            <div class="switch-detail">
+              <label class="field-label" for="custom_networks">{{T "settings_custom_networks"}}</label>
+              <textarea id="custom_networks" name="custom_networks" rows="4"
+                        class="input input-data w-full mt-1.5"
+                        placeholder="192.168.100.0/24&#10;172.20.0.0/16">
+{{.CustomNetworks}}</textarea>
+              <p class="field-help">{{richText (T "settings_custom_networks_help")}}</p>
+            </div>
+          </div>
+
+          <div class="save-bar">
+            <button type="submit" class="btn btn-primary">
+              <svg class="size-4" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm3.857-9.809a.75.75 0 00-1.214-.882l-3.483 4.79-1.88-1.88a.75.75 0 10-1.06 1.061l2.5 2.5a.75.75 0 001.137-.089l4-5.5z" clip-rule="evenodd"/></svg>
+              {{T "settings_save"}}
+            </button>
+            <span class="save-bar-note">{{richText (T "settings_saved_note") "/apply" (T "link_apply_rules")}}</span>
+          </div>
+        </div>
+
+        <div class="aside-stack">
+          <div class="aside-card">
+            <h2 class="aside-title">
+              <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clip-rule="evenodd"/></svg>
+              {{T "settings_ipv6_warn_title"}}
+            </h2>
+            <p>{{richText (T "settings_ipv6_warn_body")}}</p>
+          </div>
+
+          <div class="aside-card">
+            <h2 class="aside-title">
+              <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/></svg>
+              {{T "settings_routing_card_title"}}
+            </h2>
+            <p>{{T "settings_routing_card_body"}}</p>
+            <p>{{T "settings_routing_card_note"}}</p>
+          </div>
+
+          <div class="aside-card">
+            <h2 class="aside-title">
+              <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path fill-rule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clip-rule="evenodd"/></svg>
+              {{T "settings_docker_card_title"}}
+            </h2>
+            <p>{{T "settings_docker_card_body"}}</p>
+            <p>{{T "settings_docker_card_note"}}</p>
+          </div>
+        </div>
+      </div>
+
+    </form>
+    {{end}}
+  </div>
+</div>
+{{template "foot" .}}
+{{end}}

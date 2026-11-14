@@ -1,0 +1,68 @@
+[Unit]
+Description=easywall Web Interface
+Documentation=https://easywall-project.org
+After=network.target easywall-core.service
+Wants=easywall-core.service
+
+# In [Unit], where systemd documents it — see the note in easywall-core.service.
+StartLimitIntervalSec=60s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=easywall
+Group=easywall
+ExecStart=/usr/sbin/easywall-web --config /etc/easywall/web.toml
+
+# Working directory — templates and static files are served relative to this
+WorkingDirectory=/usr/share/easywall
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=easywall-web
+
+# Restart on failure. The rate limit that bounds it is in [Unit] above.
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening — web process runs unprivileged
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+# /var/lib/easywall/web and not /var/lib/easywall: the parent is the core's
+# data directory, and this process has no business writing it (2.22 — it could
+# replace the core's files there and plant links root then wrote through). Not
+# prefixed with "-": postinst creates it, and a unit that cannot keep its state
+# should say so at start rather than lose passkeys quietly.
+#
+# /run/easywall is prefixed: it is easywall-core.service's RuntimeDirectory=,
+# and systemd removes it whenever the core stops. Unprefixed, a missing path
+# failed this unit with 226/NAMESPACE, and after StartLimitBurst it stayed
+# down — a core that had crashed took the interface that reports
+# "core unreachable" with it. Skipped while absent, the socket is reached
+# again once the core recreates the directory; no restart needed.
+ReadWritePaths=/var/lib/easywall/web /etc/easywall -/run/easywall
+# ssl_dir is deliberately not ReadOnlyPaths: easywall generates its own
+# self-signed certificate there on first start and replaces it before it
+# expires. Marking it read-only made both impossible — the process could not
+# create the certificate it then tried to serve. File ownership is what keeps
+# the rest of /etc/easywall out of reach: the directory is root-owned, and only
+# web.toml and ssl/ belong to the easywall user.
+
+# Port 12227 needs no capability. Port 80 does, and easywall binds it when
+# tls.acme is on: a certificate authority looks for an HTTP-01 response there
+# and the port number is fixed by the ACME specification.
+#
+# Granted unconditionally rather than only when ACME is configured, because a
+# unit file that has to be edited to turn a setting on is a setting that fails
+# with "permission denied" for everyone who forgets. The capability permits
+# binding a low port and nothing else, and it composes with NoNewPrivileges:
+# ambient capabilities are granted by systemd at exec, not acquired by the
+# process.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

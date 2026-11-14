@@ -1,0 +1,1032 @@
+package core
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// newTestConfig creates a minimal core Config pointing to a temp directory.
+func newTestConfig(t *testing.T) *Config {
+	t.Helper()
+	dir := t.TempDir()
+	cfg := &Config{}
+	cfg.SocketPath = dir + "/core.sock"
+	cfg.DataDir = dir + "/data"
+	cfg.LogDir = dir + "/log"
+	cfg.Acceptance.Enabled = true
+	cfg.Acceptance.Duration = 30
+	cfg.configPath = dir + "/easywall.toml"
+	if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
+		t.Fatalf("mkdir DataDir: %v", err)
+	}
+	if err := os.MkdirAll(cfg.LogDir, 0750); err != nil {
+		t.Fatalf("mkdir LogDir: %v", err)
+	}
+	return cfg
+}
+
+// newTestFirewall creates a Firewall with a stub NftablesManager for dispatch tests.
+// configureTestFirewall gives a test firewall the one thing RestoreCurrent now
+// requires before it will write anything: evidence that this installation has
+// ever been configured.
+//
+// Deliberately a separate call rather than something newTestFirewall does for
+// every caller. The distinction it draws — a host somebody has configured, and a
+// host where nothing has ever been applied — is the whole point of
+// Firewall.everConfigured, and a helper that quietly made every test look
+// configured would hide the case that produced it.
+func configureTestFirewall(t *testing.T, fw *Firewall) {
+	t.Helper()
+	if err := fw.rules.SaveStaged("tcp", []shared.PortRule{
+		{Port: "22", Description: "SSH", SSH: true},
+	}); err != nil {
+		t.Fatalf("stage a rule: %v", err)
+	}
+	if err := fw.rules.PromoteStaged(); err != nil {
+		t.Fatalf("promote it into Current: %v", err)
+	}
+}
+
+func newTestFirewall(t *testing.T, cfg *Config) *Firewall {
+	t.Helper()
+	store, err := NewRulesStore(cfg.RulesPath())
+	if err != nil {
+		t.Fatalf("NewRulesStore: %v", err)
+	}
+	return &Firewall{
+		cfg:        cfg,
+		nft:        &NftablesManager{}, // nil conn — safe for dispatch tests that don't trigger Apply
+		rules:      store,
+		acceptance: NewAcceptance(cfg.AcceptanceDuration()),
+		usage:      NewUsageStore(cfg.UsagePath()),
+		feeds:      NewFeedStore(cfg.FeedsPath()),
+	}
+}
+
+// sendDaemonCmd sends a command to a daemon socket and returns the response.
+func sendDaemonCmd(t *testing.T, socketPath string, cmd shared.Command) shared.Response {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", socketPath, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	data, _ := json.Marshal(cmd)
+	_, _ = conn.Write(data)
+	if uc, ok := conn.(*net.UnixConn); ok {
+		_ = uc.CloseWrite()
+	}
+
+	respData, err := io.ReadAll(io.LimitReader(conn, 1<<20))
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	var resp shared.Response
+	if err := json.Unmarshal(respData, &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	return resp
+}
+
+// startTestSocket starts a daemon socket in the background.
+func startTestSocket(t *testing.T, d *Daemon) {
+	t.Helper()
+	_ = os.Remove(d.cfg.SocketPath)
+	ln, err := net.Listen("unix", d.cfg.SocketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	d.setListener(ln)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go d.handleConn(conn)
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+}
+
+// startDaemonGoroutine runs the real Start in a goroutine and returns the
+// channel its error lands on. Every test that runs the real Start goes through
+// here, and TestDaemonTests_StartIsOnlySpawnedByTheHelper keeps it that way —
+// getting this right is two lines, seven tests needed them, and the two lines
+// went missing twice.
+//
+// It used to hold a slot in d.wg for as long as Start ran, so that no Add inside
+// the daemon was ever the transition from a counter of zero — because the accept
+// loop's d.wg.Add(1) was exactly that, concurrently with the d.wg.Wait() inside
+// the Stop the test calls from its own goroutine, which is the ordering
+// sync.WaitGroup.Add's own documentation forbids and which -race reports as a
+// read and a write of wg.sema. The slot made the tests quiet without making the
+// daemon right: the same pairing dropped a socket request in flight at
+// systemctl restart, and the web process reported the core unreachable for it.
+//
+// The daemon now refuses that Add instead of racing it — Daemon.track — so the
+// slot has gone. Deliberately: with it in place no test could ever see the
+// production hazard, which is why the fix went a release unmade.
+// TestDaemonStart_StopRefusesAConnectionItCannotWaitFor is the test that sees
+// it, and it only sees it because nothing here masks the counter any more.
+func startDaemonGoroutine(d *Daemon) <-chan error {
+	stubPacketLogBind(d)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.Start()
+	}()
+	return errCh
+}
+
+// stubPacketLogBind keeps a unit test's Start off the real NFLOG group: as a
+// user the bind fails and prints an ERROR line into the test output, and under
+// sudo (CI's integration job runs the unit tests too) every test would bind
+// the same group for real and race the others for it.
+func stubPacketLogBind(d *Daemon) {
+	if d.listenPacketLog == nil {
+		d.listenPacketLog = func(*PacketLog, uint16) (func(), error) { return func() {}, nil }
+	}
+}
+
+// startTestDaemon runs the real Start in the background, waits for its socket,
+// and registers a cleanup that stops the daemon *and waits for Start to return*.
+//
+// The wait is the point. d.wg covers the boot restore, the bridge reconciler and
+// each served connection — deliberately not the accept loop, so Stop returns as
+// soon as it has closed the listener, while the Start goroutine has still to come
+// back from Accept, take the quit branch and return. That overlap was measured at
+// 3 runs in 200: Stop had returned and Start was still executing. A test that ends
+// there leaves a goroutine touching t.TempDir()-scoped state while testing tears
+// the frame down, which is what -race reported on main as
+// TestDaemonStart_RestoresAtStartup on 2026-08-30.
+//
+// Waiting was only half of it — the wait happens after Stop, and the other half
+// raced inside it. That half is now closed in the daemon rather than papered
+// over here; see startDaemonGoroutine above and Daemon.track.
+func startTestDaemon(t *testing.T, d *Daemon) {
+	t.Helper()
+	errCh := startDaemonGoroutine(d)
+	t.Cleanup(func() {
+		d.Stop()
+		<-errCh
+	})
+	waitForSocket(t, d.cfg.SocketPath)
+}
+
+// TestDaemonDispatch uses dispatch() directly to avoid goroutine lifecycle complexity.
+
+func TestDaemonDispatch_GetStatus(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdGetStatus})
+	if !resp.Success {
+		t.Fatalf("GetStatus: %s", resp.Error)
+	}
+	var status shared.FirewallStatus
+	if err := json.Unmarshal(resp.Data, &status); err != nil {
+		t.Fatalf("parse status: %v", err)
+	}
+	// See TestFirewallStatus_WithoutLastApply: the stub firewall holds no
+	// netlink connection, so Active must be false. Whether it is true when
+	// rules really are installed is a question only the kernel can answer,
+	// and TestIntegration_Status_* asks it there.
+	if status.Active {
+		t.Error("expected Active=false without a netlink connection")
+	}
+}
+
+func TestDaemonDispatch_GetRules(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdGetRules})
+	if !resp.Success {
+		t.Fatalf("GetRules: %s", resp.Error)
+	}
+	var state shared.RulesState
+	if err := json.Unmarshal(resp.Data, &state); err != nil {
+		t.Fatalf("parse state: %v", err)
+	}
+}
+
+func TestDaemonDispatch_SaveRules_TCP(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	rules := []shared.PortRule{{Port: "80", Description: "HTTP"}}
+	payload, _ := json.Marshal(shared.SaveRulesPayload{RuleType: "tcp", Rules: rules})
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdSaveRules, Payload: payload})
+	if !resp.Success {
+		t.Fatalf("SaveRules tcp: %s", resp.Error)
+	}
+}
+
+func TestDaemonDispatch_SaveRules_UDP(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	rules := []shared.PortRule{{Port: "53", Description: "DNS"}}
+	payload, _ := json.Marshal(shared.SaveRulesPayload{RuleType: "udp", Rules: rules})
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdSaveRules, Payload: payload})
+	if !resp.Success {
+		t.Fatalf("SaveRules udp: %s", resp.Error)
+	}
+}
+
+func TestDaemonDispatch_SaveRules_Blocklist(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	payload, _ := json.Marshal(shared.SaveRulesPayload{RuleType: "blocklist", Rules: []string{"192.168.1.1"}})
+	resp := d.dispatch(shared.Command{Type: shared.CmdSaveRules, Payload: payload})
+	if !resp.Success {
+		t.Fatalf("SaveRules blocklist: %s", resp.Error)
+	}
+}
+
+func TestDaemonDispatch_SaveRules_InvalidPayload(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdSaveRules, Payload: []byte(`{invalid`)})
+	if resp.Success {
+		t.Error("expected failure for invalid JSON payload")
+	}
+}
+
+func TestDaemonDispatch_SaveRules_UnknownType(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	payload, _ := json.Marshal(shared.SaveRulesPayload{RuleType: "unknown", Rules: nil})
+	resp := d.dispatch(shared.Command{Type: shared.CmdSaveRules, Payload: payload})
+	if resp.Success {
+		t.Error("expected failure for unknown rule type")
+	}
+}
+
+func TestDaemonDispatch_Accept(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdAccept})
+	if !resp.Success {
+		t.Fatalf("Accept: %s", resp.Error)
+	}
+}
+
+func TestDaemonDispatch_GetOptions(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdGetOptions})
+	if !resp.Success {
+		t.Fatalf("GetOptions: %s", resp.Error)
+	}
+	var opts shared.FirewallOptions
+	if err := json.Unmarshal(resp.Data, &opts); err != nil {
+		t.Fatalf("parse options: %v", err)
+	}
+}
+
+func TestDaemonDispatch_ExportRules(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdExportRules})
+	if !resp.Success {
+		t.Fatalf("ExportRules: %s", resp.Error)
+	}
+}
+
+func TestDaemonDispatch_ImportRules(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	payload := []byte(`{"tcp":[],"udp":[],"blocklist":[],"allowlist":[],"forwarding":[],"custom":[]}`)
+	resp := d.dispatch(shared.Command{Type: shared.CmdImportRules, Payload: payload})
+	if !resp.Success {
+		t.Fatalf("ImportRules: %s", resp.Error)
+	}
+}
+
+func TestDaemonDispatch_ImportRules_Invalid(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdImportRules, Payload: []byte(`{invalid}`)})
+	if resp.Success {
+		t.Error("expected failure for invalid import JSON")
+	}
+}
+
+func TestDaemonDispatch_UnknownCommand(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: "MYSTERY_CMD"})
+	if resp.Success {
+		t.Error("expected failure for unknown command")
+	}
+	if resp.Error == "" {
+		t.Error("expected non-empty error message")
+	}
+}
+
+func TestDaemonHandleConn_InvalidJSON(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+	startTestSocket(t, d)
+
+	conn, err := net.DialTimeout("unix", cfg.SocketPath, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	_, _ = conn.Write([]byte(`not json!`))
+	if uc, ok := conn.(*net.UnixConn); ok {
+		_ = uc.CloseWrite()
+	}
+
+	data, _ := io.ReadAll(io.LimitReader(conn, 1<<20))
+	var resp shared.Response
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("parse response: %v", err)
+	}
+	if resp.Success {
+		t.Error("expected error response for invalid JSON")
+	}
+}
+
+func TestDaemonHandleConn_ValidCommand(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+	startTestSocket(t, d)
+
+	resp := sendDaemonCmd(t, cfg.SocketPath, shared.Command{Type: shared.CmdGetStatus})
+	if !resp.Success {
+		t.Fatalf("expected success via socket: %s", resp.Error)
+	}
+}
+
+func TestDaemonErrResp(t *testing.T) {
+	err := fmt.Errorf("test error")
+	resp := errResp(err)
+	if resp.Success {
+		t.Error("expected Success=false")
+	}
+	if resp.Error != "test error" {
+		t.Errorf("expected 'test error', got %q", resp.Error)
+	}
+}
+
+func TestLookupGroup_Root(t *testing.T) {
+	gid, err := lookupGroup("root")
+	if err != nil {
+		t.Skipf("root group not found: %v", err)
+	}
+	if gid != 0 {
+		t.Errorf("expected GID 0 for root, got %d", gid)
+	}
+}
+
+func TestLookupGroup_NonExistent(t *testing.T) {
+	_, err := lookupGroup("definitely-nonexistent-group-xyz123")
+	if err == nil {
+		t.Error("expected error for non-existent group")
+	}
+}
+
+func TestDaemonStop(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+	startTestSocket(t, d)
+
+	// Hold the listener before stopping: Stop clears the field so that a
+	// second Stop, or a Start racing it, cannot act on a closed socket.
+	ln := d.currentListener()
+
+	// Stop should close the quit channel, close the listener, and clean up
+	d.Stop()
+
+	// After stop, the listener should be closed (further Accept should fail)
+	if _, err := ln.Accept(); err == nil {
+		t.Error("expected error after stop (listener should be closed)")
+	}
+
+	// And stopping twice must not panic on the closed quit channel.
+	d.Stop()
+}
+
+// Stop before Start, and Stop twice. Both happen for real: SIGTERM can arrive
+// while the socket is still being set up, and the signal handler and a deferred
+// Stop can both fire.
+func TestDaemonStop_BeforeStartAndTwiceIsSafe(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	d.Stop()
+	d.Stop() // quitOnce must absorb the second close
+
+	if d.currentListener() != nil {
+		t.Error("Stop must leave no listener behind")
+	}
+	select {
+	case <-d.quit:
+	default:
+		t.Error("Stop must close the quit channel so Start returns")
+	}
+}
+
+func TestDaemonDispatch_ApplyRules_ReturnsSuccess(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	// CmdApplyRules dispatches immediately and starts Apply in a goroutine.
+	// The goroutine may fail (no netlink), but the dispatch itself returns success.
+	// We just verify the dispatch return, then give the goroutine time to fail gracefully.
+	done := make(chan shared.Response, 1)
+	go func() {
+		defer func() { _ = recover() }() // recover from any goroutine panics in Apply
+		done <- d.dispatch(shared.Command{Type: shared.CmdApplyRules})
+	}()
+
+	select {
+	case resp := <-done:
+		if !resp.Success {
+			t.Fatalf("ApplyRules dispatch: %s", resp.Error)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for dispatch")
+	}
+	// d.wg, not a sleep. The dispatch case adds to it before it starts the
+	// goroutine — "Tracked in d.wg so Stop waits for it" — so waiting on it
+	// waits for exactly this apply and nothing else.
+	//
+	// A sleep here was a hope, and it broke: DataDir is t.TempDir(), the apply
+	// writes into it, and 2.15 gave it two more writes on that path (the usage
+	// collect and the baseline reset). On a loaded runner the goroutine landed
+	// after the test returned and t.TempDir()'s RemoveAll failed with
+	// "directory not empty" — a docs-only pull request went red on it.
+	d.wg.Wait()
+}
+
+func TestDaemonDispatch_GetRules_Error(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	// Delete the rules file so GetState() fails
+	_ = os.Remove(cfg.RulesPath())
+	// Also create an invalid file so json.Unmarshal fails
+	_ = os.WriteFile(cfg.RulesPath(), []byte("not valid json"), 0644)
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdGetRules})
+	if resp.Success {
+		t.Error("expected failure when rules file is corrupt")
+	}
+}
+
+func TestDaemonDispatch_ExportRules_Error(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	// Corrupt the rules file so ExportStaged → GetState fails
+	_ = os.WriteFile(cfg.RulesPath(), []byte("not valid json"), 0644)
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdExportRules})
+	if resp.Success {
+		t.Error("expected failure when rules file is corrupt")
+	}
+}
+
+func TestDaemonDispatch_SaveRules_SaveError(t *testing.T) {
+	// The integration suite runs in a user namespace as root, and root ignores
+	// the directory permission this test relies on — the save then succeeds and
+	// the assertions below are checking the wrong thing.
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions; skipping read-only dir test")
+	}
+
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	// Corrupt the rules file and make data dir read-only so save() fails
+	_ = os.WriteFile(cfg.RulesPath(), []byte("{}"), 0444) // valid JSON but not RulesState
+	// Also remove write permission from data dir
+	_ = os.Chmod(cfg.DataDir, 0444)
+	defer func() { _ = os.Chmod(cfg.DataDir, 0750) }()
+
+	rules := []shared.PortRule{{Port: "80"}}
+	payload, _ := json.Marshal(shared.SaveRulesPayload{RuleType: "tcp", Rules: rules})
+	resp := d.dispatch(shared.Command{Type: shared.CmdSaveRules, Payload: payload})
+	if resp.Success {
+		t.Error("a save that cannot be written must be reported as a failure")
+	}
+	if resp.Error == "" {
+		t.Error("a failed save must say why")
+	}
+	// Either parse error or save error — either way not Success
+	_ = resp // just ensure no panic
+}
+
+func TestLookupGroup_ParsesValidGroup(t *testing.T) {
+	// "root" or "nogroup" should exist — test that we can look up a real group
+	gid, err := lookupGroup("root")
+	if err != nil {
+		t.Logf("root group not found (skipping): %v", err)
+		return
+	}
+	if gid != 0 {
+		t.Errorf("root GID should be 0, got %d", gid)
+	}
+}
+
+// sendRaw writes exactly these bytes to the daemon socket and reads the reply.
+// The write runs beside the read, so a daemon that answers before it has read
+// everything cannot deadlock the test.
+func sendRaw(t *testing.T, socketPath string, data []byte) shared.Response {
+	t.Helper()
+	conn, err := net.DialTimeout("unix", socketPath, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", socketPath, err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	go func() {
+		_, _ = conn.Write(data)
+		_ = conn.(*net.UnixConn).CloseWrite()
+	}()
+	respData, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	var resp shared.Response
+	if err := json.Unmarshal(respData, &resp); err != nil {
+		t.Fatalf("parse response %q: %v", respData, err)
+	}
+	return resp
+}
+
+// 2.23: a request of exactly MaxMessageBytes is read whole and dispatched; one
+// byte more is answered "request too large". It used to be cut at 1 MiB and
+// answered "invalid JSON command", a truncation that read as a malformed
+// message.
+func TestDaemonHandleConn_RequestLimitIsExact(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+	startTestSocket(t, d)
+
+	cmd, _ := json.Marshal(shared.Command{Type: shared.CmdGetStatus})
+	exact := append(cmd, bytes.Repeat([]byte(" "), shared.MaxMessageBytes-len(cmd))...)
+	if resp := sendRaw(t, cfg.SocketPath, exact); !resp.Success {
+		t.Fatalf("a request of exactly MaxMessageBytes was refused: %q", resp.Error)
+	}
+	resp := sendRaw(t, cfg.SocketPath, append(exact, ' '))
+	if resp.Success || resp.Error != shared.ErrRequestTooLargeText {
+		t.Errorf("one byte over the limit: %+v, want the error %q", resp, shared.ErrRequestTooLargeText)
+	}
+}
+
+// TestDaemonHandleConn_ReadError triggers the io.ReadAll error path: a client
+// that never sends its request runs into handleConn's own read deadline,
+// shortened here from requestTimeout. There used to be no such deadline,
+// and this test set one on the connection itself; handleConn now sets its own.
+func TestDaemonHandleConn_ReadError(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	server, client := net.Pipe()
+	defer server.Close()
+
+	saved := requestTimeout
+	requestTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { requestTimeout = saved })
+
+	// handleConn must return rather than block or panic when the read fails.
+	// Without the bound below, a regression here hangs the suite instead of
+	// failing it — and in production it would hold a goroutine per connection.
+	done := make(chan struct{})
+	go func() {
+		d.handleConn(client)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleConn did not return after a failed read")
+	}
+}
+
+// TestDaemonDispatch_ApplyRules_GoroutineError waits long enough for the Apply
+// goroutine to complete and hit the slog.Error path.
+func TestDaemonDispatch_ApplyRules_GoroutineError(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdApplyRules})
+	if !resp.Success {
+		t.Fatalf("dispatch CmdApplyRules should return Success: %s", resp.Error)
+	}
+	// d.wg, not a sleep. The dispatch case adds to it before it starts the
+	// goroutine — "Tracked in d.wg so Stop waits for it" — so waiting on it
+	// waits for exactly this apply and nothing else.
+	//
+	// A sleep here was a hope, and it broke: DataDir is t.TempDir(), the apply
+	// writes into it, and 2.15 gave it two more writes on that path (the usage
+	// collect and the baseline reset). On a loaded runner the goroutine landed
+	// after the test returned and t.TempDir()'s RemoveAll failed with
+	// "directory not empty" — a docs-only pull request went red on it.
+	d.wg.Wait()
+}
+
+// TestDaemonDispatch_ApplyRules_PanicRecovery exercises the recover() branch inside
+// the Apply goroutine by using a nil rules store that causes Apply to panic.
+func TestDaemonDispatch_ApplyRules_PanicRecovery(t *testing.T) {
+	cfg := newTestConfig(t)
+	// nil rules causes f.rules.GetState() inside Apply to panic (nil pointer)
+	fw := &Firewall{
+		cfg:        cfg,
+		nft:        &NftablesManager{},
+		rules:      nil,
+		acceptance: NewAcceptance(cfg.AcceptanceDuration()),
+	}
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	resp := d.dispatch(shared.Command{Type: shared.CmdApplyRules})
+	if !resp.Success {
+		t.Fatalf("dispatch should return success immediately: %s", resp.Error)
+	}
+	// d.wg, not a sleep. The dispatch case adds to it before it starts the
+	// goroutine — "Tracked in d.wg so Stop waits for it" — so waiting on it
+	// waits for exactly this apply and nothing else.
+	//
+	// A sleep here was a hope, and it broke: DataDir is t.TempDir(), the apply
+	// writes into it, and 2.15 gave it two more writes on that path (the usage
+	// collect and the baseline reset). On a loaded runner the goroutine landed
+	// after the test returned and t.TempDir()'s RemoveAll failed with
+	// "directory not empty" — a docs-only pull request went red on it.
+	d.wg.Wait()
+}
+
+func TestLookupGroup_OpenError(t *testing.T) {
+	old := groupFilePath
+	groupFilePath = "/nonexistent/etc/group"
+	defer func() { groupFilePath = old }()
+
+	_, err := lookupGroup("root")
+	if err == nil {
+		t.Error("expected error when group file does not exist")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// NewDaemon error paths (no nftables required — errors happen before NewFirewall)
+// ---------------------------------------------------------------------------
+
+func TestNewDaemon_DataDirCreationError(t *testing.T) {
+	cfg := newTestConfig(t)
+	// /proc is not writable — MkdirAll fails before NewFirewall is ever called.
+	cfg.DataDir = "/proc/easywall-unit-test-data"
+	_, err := NewDaemon(cfg)
+	if err == nil {
+		t.Error("expected error when data dir cannot be created")
+	}
+}
+
+func TestNewDaemon_LogDirCreationError(t *testing.T) {
+	cfg := newTestConfig(t)
+	// DataDir already exists (created by newTestConfig), but LogDir points to /proc.
+	cfg.LogDir = "/proc/easywall-unit-test-log"
+	_, err := NewDaemon(cfg)
+	if err == nil {
+		t.Error("expected error when log dir cannot be created")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Daemon.Start lifecycle (no nftables required — uses stub firewall)
+// ---------------------------------------------------------------------------
+
+func TestDaemonStart_ListenError(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+	// /proc sub-path is not writable — net.Listen("unix", ...) fails.
+	d.cfg.SocketPath = "/proc/nonexistent/easywall.sock"
+	stubPacketLogBind(d)
+
+	err := d.Start()
+	if err == nil {
+		t.Error("expected error when socket path is invalid")
+	}
+}
+
+func TestDaemonStart_Stop(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	errCh := startDaemonGoroutine(d)
+
+	// Wait for the socket file to appear (Start → net.Listen → Accept loop).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(cfg.SocketPath); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(cfg.SocketPath); err != nil {
+		t.Fatalf("socket not created within 2s: %v", err)
+	}
+
+	d.Stop()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start returned unexpected error after Stop: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("Start did not return within 3s after Stop")
+	}
+}
+
+// TestDaemonStart_ChownPath exercises the os.Chown call inside Start by creating
+// a synthetic group file that contains the "easywall" group so lookupGroup succeeds.
+// The chown itself may fail (not root) — either branch is covered.
+func TestDaemonStart_ChownPath(t *testing.T) {
+	groupFile, err := os.CreateTemp("", "group-chown-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(groupFile.Name())
+	_, _ = groupFile.WriteString("easywall:x:12345:\n")
+	groupFile.Close()
+
+	old := groupFilePath
+	groupFilePath = groupFile.Name()
+	defer func() { groupFilePath = old }()
+
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	errCh := startDaemonGoroutine(d)
+
+	// Wait for the socket — once it appears, Start has already executed the chown path.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(cfg.SocketPath); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	d.Stop()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("Start did not return within 3s")
+	}
+}
+
+// TestDaemonStart_AcceptErrorDefaultBranch covers the default: continue branch
+// inside Start's Accept loop — triggered by closing the listener while the quit
+// channel is still open, so the select falls through to slog.Error + continue.
+func TestDaemonStart_AcceptErrorDefaultBranch(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	errCh := startDaemonGoroutine(d)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(cfg.SocketPath); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if _, err := os.Stat(cfg.SocketPath); err != nil {
+		t.Fatalf("socket not created: %v", err)
+	}
+
+	// Close the listener directly (not via Stop) while quit is still open.
+	// The goroutine will loop through default: continue until Stop closes quit.
+	if ln := d.currentListener(); ln != nil {
+		_ = ln.Close()
+	}
+	time.Sleep(10 * time.Millisecond) // let the default branch execute at least once
+
+	d.Stop()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start returned unexpected error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("Start did not return within 3s")
+	}
+}
+
+// TestDaemonStart_StopRefusesAConnectionItCannotWaitFor arranges the window the
+// accept loop's registration in d.wg lives in, and dials into it.
+//
+// Two things have to be true for the accept loop's d.wg.Add(1) to be the
+// transition from zero — which is the ordering Add's own documentation forbids
+// while a Wait is running. The bridge reconciler has to have returned, which it
+// does at once with Docker coexistence off, and the counter ticker has to have
+// returned too, which it does only when usage.interval is 0. The default is 300
+// seconds, so the ticker normally holds a slot for the daemon's whole life and
+// the counter never reaches zero at all; the interval is therefore set here
+// explicitly rather than left to newTestConfig.
+//
+// Then Stop runs while a dial storm is in flight, so an accept lands in the
+// instant between Stop taking d.mu and Stop reaching d.wg.Wait(). Either the
+// connection is registered before Stop begins waiting, or it is refused and
+// closed — never counted into a WaitGroup nobody is waiting on any more.
+func TestDaemonStart_StopRefusesAConnectionItCannotWaitFor(t *testing.T) {
+	cfg := newTestConfig(t)
+	off := 0
+	cfg.Usage.Interval = &off
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	errCh := startDaemonGoroutine(d)
+	waitForSocket(t, cfg.SocketPath)
+
+	dialing := make(chan struct{})
+	go func() {
+		defer close(dialing)
+		payload, _ := json.Marshal(shared.Command{Type: shared.CmdGetStatus})
+		for {
+			conn, err := net.Dial("unix", cfg.SocketPath)
+			if err != nil {
+				return // the socket is gone: Stop got there
+			}
+			_, _ = conn.Write(payload)
+			_ = conn.Close()
+		}
+	}()
+
+	d.Stop()
+	<-dialing
+	if err := <-errCh; err != nil {
+		t.Errorf("Start returned %v after Stop", err)
+	}
+}
+
+func TestDaemonStart_AcceptsAndResponds(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	startTestDaemon(t, d)
+
+	resp := sendDaemonCmd(t, cfg.SocketPath, shared.Command{Type: shared.CmdGetStatus})
+	if !resp.Success {
+		t.Fatalf("GetStatus via running Start: %s", resp.Error)
+	}
+}
+
+// waitForSocket blocks until the daemon's socket accepts a connection.
+func waitForSocket(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("unix", path, 200*time.Millisecond)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("socket %s never came up", path)
+}
+
+// The daemon must have run a restore attempt at startup.
+//
+// What this pins: that a restore is attempted at all, and that it happens on the
+// way up rather than in response to a request.
+//
+// What it does not pin, measured rather than assumed: the ordering. Move the
+// restore into `go func(){ … }()` and this test still passes, every time — the
+// restore's own audit write is far quicker than the test's dial, write and read,
+// so it always wins the race it is supposed to detect. The same is true of
+// TestDaemonStart_NoCommandIsServedBeforeTheRestoreHasRun below. The ordering is
+// held by the structure of Daemon.Start, and it is
+// TestDaemonStart_SourceRestoresBeforeItListens in daemon_source_order_test.go
+// that asserts that structure.
+func TestDaemonStart_RestoresAtStartup(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	// A restore only has something to put back on a host somebody configured.
+	configureTestFirewall(t, fw)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	startTestDaemon(t, d)
+
+	// The restore fails on the nil netlink connection, and that failure is the
+	// observable proof it was attempted.
+	got := auditActions(t, cfg)
+	if len(got) == 0 || got[0] != "boot_enforce_failed" {
+		t.Errorf("want a restore attempt recorded at startup, got %v", got)
+	}
+}
+
+// No command is served before the restore attempt has completed. This holds by
+// construction: the restore runs before the socket exists, so the first
+// successful dial to the socket proves the restore has already completed.
+//
+// What this pins is that a served command is answered on a machine whose restore
+// has already been attempted — the observable half of the guarantee.
+//
+// It does not pin the construction that makes it true, and the difference has
+// been measured: with the restore moved into a goroutine this test still passes,
+// because the restore's audit write beats the test's dial-write-read every time.
+// The structure itself is asserted by
+// TestDaemonStart_SourceRestoresBeforeItListens in daemon_source_order_test.go,
+// which reads daemon.go and fails on both the reordering and the goroutine.
+func TestDaemonStart_NoCommandIsServedBeforeTheRestoreHasRun(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+	configureTestFirewall(t, fw)
+	d := &Daemon{cfg: cfg, firewall: fw, quit: make(chan struct{})}
+
+	startTestDaemon(t, d)
+
+	// Send a GetStatus command and wait for the response.
+	resp := sendDaemonCmd(t, cfg.SocketPath, shared.Command{Type: shared.CmdGetStatus})
+	if !resp.Success {
+		t.Fatalf("GetStatus failed: %s", resp.Error)
+	}
+
+	// By the time this response has arrived, the restore must already have
+	// recorded its audit entry. If the restore were moved after the accept loop
+	// this assertion would fail — a client connection served before the restore
+	// wrote anything. A restore merely moved into a goroutine ahead of the
+	// listener is a different mutation and this assertion does not catch it; see
+	// the note above the function.
+	got := auditActions(t, cfg)
+	if len(got) == 0 || got[0] != "boot_enforce_failed" {
+		t.Errorf("restore must have completed before command was served, got audit %v", got)
+	}
+}
+
+func TestStatus_ReportsPanicMode(t *testing.T) {
+	cfg := newTestConfig(t)
+	fw := newTestFirewall(t, cfg)
+
+	if fw.Status().Panic {
+		t.Error("a fresh install is not in panic mode")
+	}
+	if err := EngagePanic(cfg.PanicMarkerPath()); err != nil {
+		t.Fatalf("EngagePanic: %v", err)
+	}
+	if !fw.Status().Panic {
+		t.Error("Status must report panic mode so the interface can show it on every page")
+	}
+}

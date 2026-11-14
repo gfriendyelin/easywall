@@ -1,0 +1,1235 @@
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/jp1337/easywall/internal/core"
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// coreSocket serves one command from a fake daemon and returns the socket path.
+func coreSocket(t *testing.T, resp shared.Response) string {
+	t.Helper()
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "core.sock")
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	done := make(chan struct{})
+
+	// Registration order is load-bearing, and t.Cleanup runs LIFO: the wait has
+	// to be registered *before* the close so that the close runs first. The
+	// other way round — which is how this helper was written — the wait blocks
+	// on an Accept that nothing will ever return from, and a test that reaches
+	// this socket without dialling it hangs instead of failing. That was found
+	// by mutation: deleting `case "health"` from the dispatch switch left every
+	// health test with a socket nobody dials, and `go test` sat there until the
+	// package timeout. A hang in CI reads like nothing at all, the same way an
+	// absent-precondition t.Skip reads like a pass.
+	t.Cleanup(func() { <-done })
+	t.Cleanup(func() { _ = ln.Close() })
+
+	go func() {
+		defer close(done)
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.ReadAll(io.LimitReader(conn, 1<<20))
+		out, _ := json.Marshal(resp)
+		_, _ = conn.Write(out)
+	}()
+	return socketPath
+}
+
+// writeConfig writes a minimal core config pointing at socketPath.
+func writeConfig(t *testing.T, socketPath string) string {
+	t.Helper()
+	path, _ := writeConfigDir(t, socketPath)
+	return path
+}
+
+// writeConfigDir is writeConfig, also returning the data directory — which is
+// where the self-test stamp lives, so `selftest`'s tests need both.
+func writeConfigDir(t *testing.T, socketPath string) (cfgPath, dir string) {
+	t.Helper()
+	dir = t.TempDir()
+	cfgPath = filepath.Join(dir, "easywall.toml")
+	body := "socket_path = \"" + socketPath + "\"\n" +
+		"data_dir = \"" + dir + "\"\n" +
+		"log_dir = \"" + dir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return cfgPath, dir
+}
+
+func TestRunSubcommand_StatusPrintsWhatTheKernelHolds(t *testing.T) {
+	status, err := json.Marshal(shared.FirewallStatus{
+		Active:     true,
+		Acceptance: shared.AcceptanceIdle,
+		LastApply:  "2026-08-16T10:00:00Z",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: status}))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("status", []string{"-config", cfgPath}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, errOut.String())
+	}
+	got := out.String()
+	for _, want := range []string{"enforcing", "2026-08-16T10:00:00Z"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("status output does not mention %q:\n%s", want, got)
+		}
+	}
+}
+
+// 2.24 D5: a Docker network the rules in force do not know is named, with the
+// action that fixes it, and the exit code does not change — the firewall is
+// enforcing.
+func TestRunSubcommand_StatusNamesAnUnknownBridge(t *testing.T) {
+	status, err := json.Marshal(shared.FirewallStatus{
+		Active: true, Acceptance: shared.AcceptanceIdle,
+		UnknownBridges: []shared.UnknownBridge{{Interface: "br-4f2a", CIDRs: []string{"172.20.0.0/24", "fd00:ea5e::/64"}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: status}))
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("status", []string{"-config", cfgPath}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code %d: an unknown bridge is a warning, not a failure", code)
+	}
+	const want = "docker:     network br-4f2a (172.20.0.0/24, fd00:ea5e::/64) exists and is not in the rules in force: apply to name it"
+	if !strings.Contains(out.String(), want+"\n") {
+		t.Errorf("status does not name the bridge:\n  want %q\n  got:\n%s", want, out.String())
+	}
+}
+
+// `acceptance: idle` is two states in one word: a window waiting to be used,
+// and no window at all. A host with acceptance switched off applies rules that
+// nothing will ever undo, and until 2.20.1 the only surface recovery.md sends a
+// monitoring check to could not say which of the two it was looking at.
+//
+// The `acceptance:` line itself must not change shape — a check matching it
+// exactly predates this — so the answer is a continuation line under it, in the
+// indentation `panic mode:` already uses.
+func TestRunSubcommand_StatusSaysWhenThereIsNoAcceptanceWindow(t *testing.T) {
+	const noWindow = "no window is configured"
+	for _, tc := range []struct {
+		name    string
+		enabled bool
+	}{
+		{"no window configured", false},
+		{"a window configured", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, err := json.Marshal(shared.FirewallStatus{
+				Active:            true,
+				Acceptance:        shared.AcceptanceIdle,
+				AcceptanceEnabled: tc.enabled,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: status}))
+
+			var out, errOut bytes.Buffer
+			if code := runSubcommand("status", []string{"-config", cfgPath}, &out, &errOut); code != 0 {
+				t.Fatalf("exit code %d, stderr: %s", code, errOut.String())
+			}
+			got := out.String()
+
+			// The line a script greps for, unqualified, in both cases.
+			if !strings.Contains(got, "acceptance: idle\n") {
+				t.Errorf("the acceptance line changed shape, and a check matching it "+
+					"exactly no longer matches:\n%s", got)
+			}
+			if said := strings.Contains(got, noWindow); said != !tc.enabled {
+				t.Errorf("the no-window line was %v with acceptance.enabled = %v; "+
+					"an apply on such a host is final and the status has to say so:\n%s",
+					said, tc.enabled, got)
+			}
+		})
+	}
+}
+
+// The exit code is the part a script reads. Not enforcing must not be 0: a
+// monitoring check that treats an unfiltered machine as healthy is worse than
+// no check.
+func TestRunSubcommand_StatusExitsNonZeroWhenNotEnforcing(t *testing.T) {
+	status, err := json.Marshal(shared.FirewallStatus{Active: false, Acceptance: shared.AcceptanceIdle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: status}))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("status", []string{"-config", cfgPath}, &out, &errOut); code == 0 {
+		t.Errorf("exit code 0 for a machine that is not filtering:\n%s", out.String())
+	}
+}
+
+func TestRunSubcommand_PanicReportsSuccess(t *testing.T) {
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true}))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("panic", []string{"-config", cfgPath}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "unfiltered") {
+		t.Errorf("panic must say plainly what state the machine is in now:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "easywall-core resume") {
+		t.Errorf("panic must name the way back:\n%s", out.String())
+	}
+}
+
+func TestRunSubcommand_ResumeReportsSuccess(t *testing.T) {
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true,
+		Data: json.RawMessage(`{"was_engaged":true,"restored":true}`)}))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("resume", []string{"-config", cfgPath}, &out, &errOut); code != 0 {
+		t.Fatalf("exit code %d, stderr: %s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "back in force") {
+		t.Errorf("resume must say plainly that the stored rules are back in force:\n%s", out.String())
+	}
+}
+
+// Every other reply says what happened instead. "Back in force" used to follow
+// any successful RESUME, including one that ended nothing and restored nothing.
+func TestRunSubcommand_ResumeSaysWhatActuallyHappened(t *testing.T) {
+	for _, tc := range []struct {
+		data, want string
+	}{
+		{`{"was_engaged":true,"restored":false}`, "no rules to put back"},
+		{`{"was_engaged":false,"restored":true}`, "was not engaged. The stored rules were written again"},
+		{`{"was_engaged":false,"restored":false}`, "Nothing changed"},
+	} {
+		cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: json.RawMessage(tc.data)}))
+		var out, errOut bytes.Buffer
+		if code := runSubcommand("resume", []string{"-config", cfgPath}, &out, &errOut); code != 0 {
+			t.Fatalf("%s: exit code %d, stderr: %s", tc.data, code, errOut.String())
+		}
+		if !strings.Contains(out.String(), tc.want) || strings.Contains(out.String(), "back in force") {
+			t.Errorf("%s: want %q and no \"back in force\", got:\n%s", tc.data, tc.want, out.String())
+		}
+	}
+}
+
+// An error from the core is the operator's, not a stack trace.
+func TestRunSubcommand_CoreErrorIsReported(t *testing.T) {
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: false, Error: "tear down the table: no permission"}))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("panic", []string{"-config", cfgPath}, &out, &errOut); code == 0 {
+		t.Error("a refused command must not exit 0")
+	}
+	if !strings.Contains(errOut.String(), "no permission") {
+		t.Errorf("the core's reason must reach stderr:\n%s", errOut.String())
+	}
+}
+
+func TestRunSubcommand_UnknownSubcommand(t *testing.T) {
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("frobnicate", nil, &out, &errOut); code == 0 {
+		t.Error("an unknown subcommand must not exit 0")
+	}
+	if !strings.Contains(errOut.String(), "status") {
+		t.Errorf("the error should list the subcommands that do exist:\n%s", errOut.String())
+	}
+}
+
+// The help block is the only place an operator finds out a command exists.
+// This used to be the line above — a substring check for "status" — which
+// proved that one command was named and nothing about the rest; 2.17 added two,
+// and neither would have been noticed missing.
+//
+// Line-anchored on purpose. A plain substring check for "panic" is satisfied by
+// resume's description ("end panic mode and put the stored rules back"), so
+// deleting the panic line entirely would still have passed it. That is the
+// shape of defect this release has produced four times: a test that goes green
+// for the wrong reason.
+func TestUsageNamesEverySubcommand(t *testing.T) {
+	// A guard that inspects nothing passes. An empty or truncated list would
+	// make the loop below vacuous, so the list's own size is asserted first.
+	if len(subcommands) < 5 {
+		t.Fatalf("the command list has %d entries; status, health, selftest, panic and "+
+			"resume all exist, so a shorter list means this guard is inspecting nothing",
+			len(subcommands))
+	}
+
+	var out, errOut bytes.Buffer
+	runSubcommand("frobnicate", nil, &out, &errOut)
+	unknown := errOut.String()
+
+	for _, c := range subcommands {
+		line := "\n  " + c.name + " "
+		if !strings.Contains(subcommandUsage, line) {
+			t.Errorf("the usage text has no line for %q — a command that is dispatched and "+
+				"not printed is a command nobody runs:\n%s", c.name, subcommandUsage)
+		}
+		if c.help == "" {
+			t.Errorf("%q has no description in the help", c.name)
+		}
+		if !strings.Contains(unknown, line) {
+			t.Errorf("the unknown-command error does not list %q:\n%s", c.name, unknown)
+		}
+	}
+}
+
+// The table is the only place a command is written down, so the compiler now
+// enforces most of what used to need a test: an entry carries its own run
+// function, and "listed but not dispatched" is no longer reachable by editing
+// one copy of the five names and not another. One hole is left that the
+// compiler cannot see — a nil `run` — and this is the walk that closes it, at
+// test time rather than at an operator's shell.
+//
+// Not a substitute for the runtime refusal in runSubcommand: this test is what
+// makes the mistake impossible to commit, and that refusal is what makes it
+// harmless if it ever reaches a binary anyway. The previous shape of "nothing
+// dispatches this" was `default: return runResume(...)`, which put the rules
+// back on a machine somebody had deliberately unfiltered.
+func TestEverySubcommandIsRunnable(t *testing.T) {
+	// A guard that inspects nothing passes: an empty table would make every
+	// loop in this file vacuous.
+	if len(subcommands) < 5 {
+		t.Fatalf("the command table has %d entries; status, health, selftest, panic and "+
+			"resume all exist, so a shorter table means this guard is inspecting nothing",
+			len(subcommands))
+	}
+	for i, c := range subcommands {
+		if c.name == "" {
+			t.Errorf("entry %d has no name", i)
+		}
+		if c.help == "" {
+			t.Errorf("%q has no description, so the help block cannot describe it", c.name)
+		}
+		if c.run == nil {
+			t.Errorf("%q has no function to run — the table is the dispatch, so an entry "+
+				"without one is a command that exists in the help and does nothing", c.name)
+		}
+	}
+}
+
+// And if one ever reaches a shipped binary, it is refused rather than ignored.
+// Loud beats plausible: this is the position the old `default: return
+// runResume(...)` occupied.
+func TestASubcommandWithNoFunctionIsRefused(t *testing.T) {
+	previous := subcommands
+	subcommands = append(slices.Clone(subcommands), subcommand{"frobnicate", "does nothing at all", nil})
+	t.Cleanup(func() { subcommands = previous })
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("frobnicate", nil, &out, &errOut); code == exitOK {
+		t.Errorf("an entry with no function exited 0:\n%s%s", out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "no function to run") {
+		t.Errorf("it must say what is wrong, not merely fail:\n%s", errOut.String())
+	}
+	// And it must refuse before touching anything: no config was read, and the
+	// default config path does not exist on a test machine, so a message about
+	// /etc/easywall would mean the refusal came too late.
+	if strings.Contains(errOut.String(), "/etc/easywall") {
+		t.Errorf("it read the config before refusing:\n%s", errOut.String())
+	}
+}
+
+// health's exit codes are the contract a monitoring check and a Docker
+// HEALTHCHECK both read. They are not status's: status exits 0 under panic
+// deliberately, because a machine somebody chose to unfilter is in a state
+// somebody chose, and health answers a different question.
+func TestHealthExitCodes(t *testing.T) {
+	cases := []struct {
+		state  shared.HealthState
+		reason shared.HealthReason
+		want   int
+	}{
+		{shared.HealthOK, shared.HealthReasonHealthy, exitOK},
+		{shared.HealthDegraded, shared.HealthReasonStatefulDead, exitFailed},
+		{shared.HealthFail, shared.HealthReasonNotEnforcing, exitNotFiltered},
+	}
+
+	for _, c := range cases {
+		t.Run(string(c.state), func(t *testing.T) {
+			health, err := json.Marshal(shared.HealthResult{
+				State:  c.state,
+				Reason: c.reason,
+				Selftest: shared.HealthSelftest{
+					Version: "2.17.0",
+					Kernel:  "6.11.0-19-generic",
+					Result:  shared.SelftestPassed,
+					At:      time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC),
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: health}))
+
+			var out, errOut bytes.Buffer
+			if code := runSubcommand("health", []string{"-config", cfgPath}, &out, &errOut); code != c.want {
+				t.Errorf("health for state %q = %d, want %d (stderr %s)",
+					c.state, code, c.want, errOut.String())
+			}
+			// The state and the reason both have to be readable without
+			// parsing the exit code back into words: an operator reads the text
+			// and a script reads the code, and the two must agree.
+			for _, want := range []string{string(c.state), string(c.reason), "2.17.0", "6.11.0-19-generic"} {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("health output does not mention %q:\n%s", want, out.String())
+				}
+			}
+		})
+	}
+}
+
+// A state this binary has no code for is not a healthy one. That happens on a
+// machine where the package upgraded and the binary on PATH did not, which is
+// exactly the moment an operator must not read a 0.
+func TestHealthRefusesAStateItDoesNotKnow(t *testing.T) {
+	health, err := json.Marshal(shared.HealthResult{State: "splendid", Reason: shared.HealthReasonHealthy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: health}))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("health", []string{"-config", cfgPath}, &out, &errOut); code == exitOK {
+		t.Errorf("an unknown state exited 0:\n%s%s", out.String(), errOut.String())
+	}
+	if !strings.Contains(errOut.String(), "splendid") {
+		t.Errorf("it must name the state it could not read:\n%s", errOut.String())
+	}
+}
+
+// Panic mode: status says 0, health says 2. The divergence closes
+// carried-forward's 2.7 entry — "a forgotten panic mode is invisible to
+// monitoring" — and is pinned here so it stays a decision rather than being
+// rediscovered as a bug and "fixed" in either direction.
+//
+// **2 and not 1, corrected on 2026-09-09.** This test wanted 1, because spec §2
+// said panic reads `degraded`. It could not happen on a real host: Firewall.Panic
+// calls nft.Reset, which leaves the input chain empty, and Enforcing() reports an
+// empty input chain as not enforcing — so computeHealth returned in its first
+// branch and the `panic` reason was unreachable. The spec was corrected rather
+// than worked around: `fail` with reason `panic`. A panicked machine is not
+// filtering at all, and `degraded` — "still filtering, something is off" — would
+// understate it, which is the failure this release exists to remove whichever
+// direction it points in.
+//
+// So the divergence gets wider, not narrower. exitNotFiltered is the code
+// `status` uses when it cannot confirm a firewall is up and the code `health`
+// uses with no daemon at all, and it is the honest one here for the same
+// reason: nothing is being filtered. What still separates the two commands is
+// the question they answer — `status` asks after intent and a machine somebody
+// chose to unfilter is in a state somebody chose, so 0; `health` asks after
+// effect, and the effect is that this host is open.
+//
+// The reason is asserted as well as the code, and that is what makes the change
+// an improvement rather than a louder alarm: `not_enforcing` would have said the
+// kernel has lost its rules, where `panic` says a human took them away and a
+// reboot will not bring them back — Daemon.Start declines to filter while the
+// marker is on disk.
+func TestHealthAndStatusDisagreeUnderPanic(t *testing.T) {
+	status, err := json.Marshal(shared.FirewallStatus{Panic: true, Acceptance: shared.AcceptanceIdle})
+	if err != nil {
+		t.Fatal(err)
+	}
+	statusCfg := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: status}))
+
+	var statusOut, statusErr bytes.Buffer
+	if code := runSubcommand("status", []string{"-config", statusCfg}, &statusOut, &statusErr); code != exitOK {
+		t.Errorf("status under panic = %d, want %d — a machine somebody chose to unfilter is "+
+			"in a state somebody chose, and that exit code was ruled on (stderr %s)",
+			code, exitOK, statusErr.String())
+	}
+
+	// What computeHealth actually answers for a panicked host — asserted there
+	// by TestHealthStateMachine's "no table with the marker engaged names panic
+	// as the cause", so the reply this console is driven with is the reply the
+	// core produces rather than one written to suit the assertion below.
+	health, err := json.Marshal(shared.HealthResult{
+		State:  shared.HealthFail,
+		Reason: shared.HealthReasonPanic,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthCfg := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: health}))
+
+	var healthOut, healthErr bytes.Buffer
+	if code := runSubcommand("health", []string{"-config", healthCfg}, &healthOut, &healthErr); code != exitNotFiltered {
+		t.Errorf("health under panic = %d, want %d — a monitoring system asking after health "+
+			"asks a different question from a console asking after intent, and nothing on this "+
+			"host is being filtered (stderr %s)",
+			code, exitNotFiltered, healthErr.String())
+	}
+	// The cause, not only the code. not_enforcing here would send whoever reads
+	// the alert hunting a kernel that lost its rules.
+	if !strings.Contains(healthOut.String(), string(shared.HealthReasonPanic)) {
+		t.Errorf("health must name panic as the reason, or the 2 is unexplained:\n%s",
+			healthOut.String())
+	}
+	if strings.Contains(healthOut.String(), string(shared.HealthReasonNotEnforcing)) {
+		t.Errorf("health named not_enforcing for a deliberately unfiltered machine:\n%s",
+			healthOut.String())
+	}
+}
+
+// With no daemon, health exits 2 — the code status uses for the same situation
+// and for the same reason: being unable to confirm a firewall is up is not the
+// same as it being up.
+func TestHealthWithoutADaemon(t *testing.T) {
+	cfgPath := writeConfig(t, filepath.Join(t.TempDir(), "absent.sock"))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("health", []string{"-config", cfgPath}, &out, &errOut); code != exitNotFiltered {
+		t.Errorf("health with no daemon = %d, want %d (stderr %s)",
+			code, exitNotFiltered, errOut.String())
+	}
+	if !strings.Contains(out.String(), "not running") {
+		t.Errorf("it must say the daemon is not running:\n%s", out.String())
+	}
+	// The text and the exit code are the same claim, so the text has to carry
+	// the state as well: a script greps the word and a monitoring check reads
+	// the code, and the two must not be able to disagree.
+	if !strings.Contains(out.String(), string(shared.HealthFail)) {
+		t.Errorf("it must name the state, not only the cause:\n%s", out.String())
+	}
+}
+
+// A stamp whose kernel is empty must render no kernel at all, not an empty
+// label. The demo core answers GET_HEALTH with exactly that: internal/web has
+// no path to the privileged core.KernelRelease(), by design.
+func TestHealthOmitsAnEmptyKernel(t *testing.T) {
+	health, err := json.Marshal(shared.HealthResult{
+		State:  shared.HealthOK,
+		Reason: shared.HealthReasonHealthy,
+		Selftest: shared.HealthSelftest{
+			Version: "2.17.0",
+			Result:  shared.SelftestUnprovable,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := writeConfig(t, coreSocket(t, shared.Response{Success: true, Data: health}))
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("health", []string{"-config", cfgPath}, &out, &errOut); code != exitOK {
+		t.Fatalf("exit code %d, stderr: %s", code, errOut.String())
+	}
+	if strings.Contains(out.String(), " on ") {
+		t.Errorf("an empty kernel must render nothing, not a label with nothing after it:\n%s",
+			out.String())
+	}
+	// And it still says what it does know, or "omit the empty one" would be
+	// satisfied by printing nothing at all.
+	for _, want := range []string{string(shared.SelftestUnprovable), "2.17.0"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("health output does not mention %q:\n%s", want, out.String())
+		}
+	}
+}
+
+// fakeCapSysAdmin replaces the capability probe for the duration of one test,
+// the same var-swap fakeSelftest uses for the prover below — describeProof's
+// capability branch needs no /proc and no real process to drive either way.
+func fakeCapSysAdmin(t *testing.T, available bool) {
+	t.Helper()
+	previous := capSysAdminAvailable
+	capSysAdminAvailable = func() bool { return available }
+	t.Cleanup(func() { capSysAdminAvailable = previous })
+}
+
+// TestDescribeProofEmptyResult is the anchor for 2.20.1 Task 3: an empty
+// stamp is a capability question, not a history one. It asserts against the
+// proofNeverRecorded/proofUnavailableHere constants, not against a sentence
+// of English copy, so a later wording change updates the test along with the
+// source instead of breaking it for no behavioural reason.
+func TestDescribeProofEmptyResult(t *testing.T) {
+	tests := []struct {
+		name      string
+		available bool
+		want      string
+	}{
+		{name: "capability present: nobody has run it yet", available: true, want: proofNeverRecorded},
+		{name: "capability absent: it never can be, by design", available: false, want: proofUnavailableHere},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeCapSysAdmin(t, tt.available)
+			if got := describeProof("2.20.1", "6.11.0", "", time.Time{}); got != tt.want {
+				t.Errorf("describeProof() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// The probe itself, which the var-swap above deliberately steps around — and so
+// left untested. Two mutations of it stayed green through 2.20.1's review: the
+// bit moved from 21 to 22, and the fail-open turned into a fail-closed.
+//
+// The masks are hex CapEff values as /proc/self/status writes them. Bit 21 is
+// CAP_SYS_ADMIN and bit 22 is CAP_SYS_BOOT, so the two single-bit rows below are
+// what pins the number: a root mask has both and would notice neither.
+func TestCapEffHasSysAdmin(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status string
+		want   bool
+	}{
+		{"root, holding everything", "Name:\tbash\nCapEff:\t000001ffffffffff\n", true},
+		{"CAP_SYS_ADMIN and nothing else", "CapEff:\t0000000000200000\n", true},
+		{"CAP_SYS_BOOT, the bit next to it", "CapEff:\t0000000000400000\n", false},
+		{"a container's default set, which drops it", "CapEff:\t00000000a80425fb\n", false},
+		{"an unprivileged process", "CapEff:\t0000000000000000\n", false},
+		// Every "cannot read this" answer is true: reporting the capability
+		// absent on a host where it may well be there sends an operator after a
+		// permission that was never the problem.
+		{"garbage where the mask should be", "CapEff:\tnot-a-number\n", true},
+		{"no CapEff line at all", "Name:\tbash\nCapInh:\t0000000000000000\n", true},
+		{"nothing at all, which is an unreadable /proc", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := capEffHasSysAdmin([]byte(tc.status)); got != tc.want {
+				t.Errorf("capEffHasSysAdmin(%q) = %v, want %v", tc.status, got, tc.want)
+			}
+		})
+	}
+}
+
+// fakeSelftest replaces the prover with a counter for the duration of one test.
+// The subcommand's job is the stamp comparison and the exit code; the proof
+// itself needs a network namespace and CAP_SYS_ADMIN, and internal/core's
+// integration tests are where it is exercised against a real kernel.
+func fakeSelftest(t *testing.T, stamp shared.SelftestStamp) *int {
+	t.Helper()
+	calls := 0
+	previous := selftestRunner
+	selftestRunner = func() shared.SelftestStamp {
+		calls++
+		return stamp
+	}
+	t.Cleanup(func() { selftestRunner = previous })
+	return &calls
+}
+
+// writeStamp records a proof for this exact version and kernel, which is what
+// StampStore.Stale compares against.
+func writeStamp(t *testing.T, dir string, stamp shared.SelftestStamp) {
+	t.Helper()
+	data, err := json.Marshal(stamp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "selftest.json"), data, 0o600); err != nil {
+		t.Fatalf("write stamp: %v", err)
+	}
+}
+
+func freshStamp() shared.SelftestStamp {
+	return shared.SelftestStamp{
+		Version: shared.CurrentVersion,
+		Kernel:  core.KernelRelease(),
+		Result:  shared.SelftestPassed,
+		At:      time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+// --if-stale is what the systemd unit runs on every start. The defect class it
+// proves against is a build defect — identical on every start of the same
+// binary — so proving it once per version and kernel is exactly enough, and
+// running it again on every boot would spend twelve seconds of every start on a
+// question already answered.
+func TestSelftestIfStaleSkipsAFreshStamp(t *testing.T) {
+	cfgPath, dir := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+	writeStamp(t, dir, freshStamp())
+	calls := fakeSelftest(t, shared.SelftestStamp{Result: shared.SelftestFailed})
+
+	var out, errOut bytes.Buffer
+	code := runSubcommand("selftest", []string{"-config", cfgPath, "-if-stale"}, &out, &errOut)
+
+	if *calls != 0 {
+		t.Errorf("the proof ran %d times against a stamp that already matches this version "+
+			"and kernel; --if-stale exists so a start does not pay for it twice", *calls)
+	}
+	if code != exitOK {
+		t.Errorf("exit code %d, want %d — the recorded proof passed (stderr %s)",
+			code, exitOK, errOut.String())
+	}
+	if !strings.Contains(out.String(), string(shared.SelftestPassed)) {
+		t.Errorf("it must still report what is recorded:\n%s", out.String())
+	}
+}
+
+// And the bare subcommand always runs, because that is the maintainer's
+// invocation after changing a builder: the whole reason to run it by hand is to
+// distrust what is recorded.
+func TestSelftestWithoutIfStaleAlwaysRuns(t *testing.T) {
+	cfgPath, dir := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+	writeStamp(t, dir, freshStamp())
+	calls := fakeSelftest(t, shared.SelftestStamp{
+		Version: shared.CurrentVersion,
+		Kernel:  core.KernelRelease(),
+		Result:  shared.SelftestUnprovable,
+		At:      time.Date(2026, 9, 8, 9, 0, 0, 0, time.UTC),
+		Detail:  "a reply on an established connection passes — clone: operation not permitted",
+	})
+
+	var out, errOut bytes.Buffer
+	code := runSubcommand("selftest", []string{"-config", cfgPath}, &out, &errOut)
+
+	if *calls != 1 {
+		t.Fatalf("the proof ran %d times, want 1 — the bare subcommand must not consult the "+
+			"stamp (stderr %s)", *calls, errOut.String())
+	}
+	if code != exitOK {
+		t.Errorf("exit code %d, want %d", code, exitOK)
+	}
+
+	// And it rewrote the stamp: a run whose result is not recorded leaves the
+	// daemon and every health surface reading the old verdict.
+	data, err := os.ReadFile(filepath.Join(dir, "selftest.json"))
+	if err != nil {
+		t.Fatalf("read stamp: %v", err)
+	}
+	var stored shared.SelftestStamp
+	if err := json.Unmarshal(data, &stored); err != nil {
+		t.Fatalf("stamp is not JSON: %s", data)
+	}
+	if stored.Result != shared.SelftestUnprovable {
+		t.Errorf("the stored stamp still reads %q; the bare subcommand must always rewrite it",
+			stored.Result)
+	}
+}
+
+// SelftestStamp.Detail is deliberately absent from HealthResult, because
+// /healthz is unauthenticated by necessity and the detail names a port number
+// and the claim that failed. This console is where it reaches a human, and it
+// is the only place — a field written by RunSelftest and read by nobody is a
+// field the next maintainer deletes as dead weight, having no way to tell it
+// from some.
+func TestSelftestPrintsTheDetail(t *testing.T) {
+	cfgPath, _ := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+	const detail = "an open port accepts a connection — port 12227 was dropped"
+	fakeSelftest(t, shared.SelftestStamp{
+		Version: shared.CurrentVersion,
+		Kernel:  core.KernelRelease(),
+		Result:  shared.SelftestFailed,
+		At:      time.Now().UTC(),
+		Detail:  detail,
+	})
+
+	var out, errOut bytes.Buffer
+	code := runSubcommand("selftest", []string{"-config", cfgPath}, &out, &errOut)
+
+	if !strings.Contains(out.String(), detail) {
+		t.Errorf("the detail is the only thing that says *which* claim failed, and this is the "+
+			"one surface that carries it:\n%s", out.String())
+	}
+	if code != exitFailed {
+		t.Errorf("a failed proof = %d, want %d (stderr %s)", code, exitFailed, errOut.String())
+	}
+}
+
+// unprovable exits 0. The systemd unit lists SuccessExitStatus=0 1 2 so it
+// cannot fail a boot either way, but a non-zero code meaning "this kernel
+// cannot be asked" would show red in `systemctl status` on every container and
+// every hardened host — and it is the ordinary production state, since the
+// daemon holds CAP_NET_ADMIN and not CAP_SYS_ADMIN. A red that means nothing
+// gets ignored within a week, and takes the reds that mean something with it.
+func TestSelftestUnprovableExitsZero(t *testing.T) {
+	cfgPath, _ := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+	fakeSelftest(t, shared.SelftestStamp{
+		Version: shared.CurrentVersion,
+		Kernel:  core.KernelRelease(),
+		Result:  shared.SelftestUnprovable,
+		At:      time.Now().UTC(),
+		Detail:  "a reply on an established connection passes — clone: operation not permitted",
+	})
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("selftest", []string{"-config", cfgPath}, &out, &errOut); code != exitOK {
+		t.Errorf("unprovable = %d, want %d — being unable to prove something is not the same "+
+			"as it being broken (stderr %s)", code, exitOK, errOut.String())
+	}
+	if !strings.Contains(out.String(), string(shared.SelftestUnprovable)) {
+		t.Errorf("it must say plainly that nothing was proven:\n%s", out.String())
+	}
+}
+
+// A stamp recorded as failed for this version and kernel keeps exiting 1 under
+// --if-stale. It is not re-run — the answer would be the same, since the class
+// is a build defect — but it must not report success by virtue of being skipped.
+func TestSelftestIfStaleKeepsAFailedVerdict(t *testing.T) {
+	cfgPath, dir := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+	stamp := freshStamp()
+	stamp.Result = shared.SelftestFailed
+	stamp.Detail = "a closed port does not — port 12233 answered"
+	writeStamp(t, dir, stamp)
+	calls := fakeSelftest(t, shared.SelftestStamp{Result: shared.SelftestPassed})
+
+	var out, errOut bytes.Buffer
+	code := runSubcommand("selftest", []string{"-config", cfgPath, "-if-stale"}, &out, &errOut)
+
+	if *calls != 0 {
+		t.Errorf("the proof ran %d times; a recorded verdict for this version and kernel is "+
+			"not stale, whichever way it went", *calls)
+	}
+	if code != exitFailed {
+		t.Errorf("a recorded failure = %d, want %d — skipping the run must not turn a red "+
+			"verdict green (stderr %s)", code, exitFailed, errOut.String())
+	}
+	if !strings.Contains(out.String(), stamp.Detail) {
+		t.Errorf("the recorded detail must reach the operator too:\n%s", out.String())
+	}
+}
+
+// With no daemon at all, panic still has to work — that is the situation it
+// exists for. It writes the marker directly, so the next start of the daemon
+// does not put the rules back.
+func TestRunSubcommand_PanicWithoutADaemonWritesTheMarker(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "easywall.toml")
+	body := "socket_path = \"" + filepath.Join(dir, "absent.sock") + "\"\n" +
+		"data_dir = \"" + dir + "\"\n" +
+		"log_dir = \"" + dir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := runSubcommand("panic", []string{"-config", cfgPath}, &out, &errOut)
+
+	// Tearing down the table needs CAP_NET_ADMIN, which the test process does
+	// not have, so the exit code depends on the environment. The marker does
+	// not: it must be there either way.
+	if _, err := os.Stat(filepath.Join(dir, "panic")); err != nil {
+		t.Errorf("the marker must be written even with no daemon running: %v (exit %d, stderr %s)",
+			err, code, errOut.String())
+	}
+	if !strings.Contains(out.String()+errOut.String(), "not running") {
+		t.Errorf("the output must say the daemon was not running:\n%s%s", out.String(), errOut.String())
+	}
+}
+
+// fakeTimeoutErr is a synthetic net.Error whose Timeout() is true, standing in
+// for what shared.SendCommand returns when CommandTimeout(CmdPanic) — 35 s —
+// elapses. Driving panicTimeoutReport with this avoids paying that 35 s in
+// every `go test ./cmd/...`: dialing a socket that never answers would take
+// the real deadline to reach the branch under test.
+type fakeTimeoutErr struct{}
+
+func (fakeTimeoutErr) Error() string   { return "i/o timeout" }
+func (fakeTimeoutErr) Timeout() bool   { return true }
+func (fakeTimeoutErr) Temporary() bool { return true }
+
+// TestPanicTimesOutAndSaysWhatTheMarkerHolds closes an entry carried since 2.7.
+//
+// daemonAbsent is false for a timeout, and that is deliberate: a slow daemon is
+// still a daemon, and two writers to the table would be worse than one slow
+// one. So a timeout reports "the core daemon is not answering" — while the
+// daemon has already put the marker on disk in the first millisecond, for the
+// same reason the no-daemon fallback below writes it first, and the teardown
+// lands moments later.
+//
+// The operator was told a failure for work that succeeded. The exit code stays
+// exitFailed, because the command did not complete as asked and claiming
+// success for an unconfirmed teardown is the opposite defect. What changes is
+// that the message reports what the marker says.
+func TestPanicTimesOutAndSaysWhatTheMarkerHolds(t *testing.T) {
+	cfgPath, dir := writeConfigDir(t, filepath.Join(t.TempDir(), "core.sock"))
+	cfg, err := core.LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "panic"), nil, 0o600); err != nil {
+		t.Fatalf("write the panic marker: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	code := panicTimeoutReport(cfg, fakeTimeoutErr{}, &stderr)
+
+	if code != exitFailed {
+		t.Errorf("exit code %d, want exitFailed — the command did not complete as asked", code)
+	}
+	out := stderr.String()
+	if !strings.Contains(out, "panic mode is recorded") {
+		t.Errorf("a timeout with the marker on disk does not say so:\n%s", out)
+	}
+	if !strings.Contains(out, "easywall-core status") {
+		t.Errorf("the operator is not told how to find out what actually happened:\n%s", out)
+	}
+}
+
+func TestRunSubcommand_ResumeWithoutADaemonClearsTheMarker(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "easywall.toml")
+	body := "socket_path = \"" + filepath.Join(dir, "absent.sock") + "\"\n" +
+		"data_dir = \"" + dir + "\"\n" +
+		"log_dir = \"" + dir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "panic"), nil, 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	runSubcommand("resume", []string{"-config", cfgPath}, &out, &errOut)
+
+	if _, err := os.Stat(filepath.Join(dir, "panic")); !os.IsNotExist(err) {
+		t.Errorf("the marker must be cleared with no daemon running, stat err = %v", err)
+	}
+}
+
+// status without a daemon must still say something useful, and must not exit 0.
+func TestRunSubcommand_StatusWithoutADaemon(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "easywall.toml")
+	body := "socket_path = \"" + filepath.Join(dir, "absent.sock") + "\"\n" +
+		"data_dir = \"" + dir + "\"\n" +
+		"log_dir = \"" + dir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("status", []string{"-config", cfgPath}, &out, &errOut); code == 0 {
+		t.Error("no daemon must not exit 0")
+	}
+	if !strings.Contains(out.String()+errOut.String(), "not running") {
+		t.Errorf("it must say the daemon is not running:\n%s%s", out.String(), errOut.String())
+	}
+}
+
+// status exits 2 even when panic mode is engaged but no daemon is running,
+// because the machine is not in the state it should be: nothing will restore
+// the rules when the daemon starts.
+func TestRunSubcommand_StatusWithPanicButNoDaemon(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "easywall.toml")
+	panicMarkerPath := filepath.Join(dir, "panic")
+	body := "socket_path = \"" + filepath.Join(dir, "absent.sock") + "\"\n" +
+		"data_dir = \"" + dir + "\"\n" +
+		"log_dir = \"" + dir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	// Write the panic marker
+	if err := os.WriteFile(panicMarkerPath, nil, 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	code := runSubcommand("status", []string{"-config", cfgPath}, &out, &errOut)
+	if code != 2 {
+		t.Errorf("status with panic marker but no daemon must exit 2, got %d; output:\n%s%s", code, out.String(), errOut.String())
+	}
+	combined := out.String() + errOut.String()
+	if !strings.Contains(combined, "panic mode") {
+		t.Errorf("output must mention panic mode:\n%s", combined)
+	}
+}
+
+// TestDaemonAbsent pins the classification daemonAbsent exists to make: the
+// three tests above all dial a path that never existed, so on their own they
+// only ever exercise the ENOENT branch. Hard-code daemonAbsent to `return
+// true` and every test in this package still goes green — nothing else here
+// ever produces a transport error at all, let alone one of the other shapes.
+// This is the test that actually pins the verdicts, including that EACCES and
+// a full accept backlog must not read as "no daemon". It does not pin the
+// order of the two checks inside daemonAbsent — see the EAGAIN case below for
+// why that ordering exists and why none of these cases can prove it.
+func TestDaemonAbsent(t *testing.T) {
+	// wrapDial mimics exactly what shared.SendCommand produces on a failed
+	// dial: net.DialTimeout returns a *net.OpError wrapping a *os.SyscallError
+	// wrapping the raw errno, and SendCommand wraps that again with
+	// fmt.Errorf("connect to core: %w", ...).
+	wrapDial := func(errno syscall.Errno) error {
+		return fmt.Errorf("connect to core: %w", &net.OpError{
+			Op:  "dial",
+			Net: "unix",
+			Err: &os.SyscallError{Syscall: "connect", Err: errno},
+		})
+	}
+	wrapRead := func(err error) error {
+		return fmt.Errorf("read response: %w", &net.OpError{Op: "read", Net: "unix", Err: err})
+	}
+
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "a deadline exceeded reads as a timeout: a slow daemon is still a daemon",
+			err:  wrapRead(os.ErrDeadlineExceeded),
+			want: false,
+		},
+		{
+			// A full accept backlog returns EAGAIN, and syscall.Errno.Timeout()
+			// reports EAGAIN (with EWOULDBLOCK and ETIMEDOUT) as a timeout, so this
+			// falls out on the timeout branch. It does not, however, prove the
+			// timeout check has to run first: EAGAIN was never in the errno list
+			// below to begin with, so swapping the two checks would not change
+			// this verdict either. The ordering is defence against a *future*
+			// errno joining that list which also satisfies Timeout() — none of
+			// today's three (ENOENT, ECONNREFUSED, fs.ErrNotExist) do.
+			name: "a full accept backlog (EAGAIN) falls out on the timeout branch, not the errno list",
+			err:  wrapDial(syscall.EAGAIN),
+			want: false,
+		},
+		{
+			name: "EACCES: a live daemon whose socket denies this caller",
+			err:  wrapDial(syscall.EACCES),
+			want: false,
+		},
+		{
+			name: "EPIPE: the write failed after connecting, so a daemon was there",
+			err:  fmt.Errorf("send command: %w", syscall.EPIPE),
+			want: false,
+		},
+		{
+			name: "ECONNRESET: the read failed after connecting, so a daemon was there",
+			err:  fmt.Errorf("read response: %w", syscall.ECONNRESET),
+			want: false,
+		},
+		{
+			name: "ENOENT wrapped the way SendCommand wraps a dial failure",
+			err:  wrapDial(syscall.ENOENT),
+			want: true,
+		},
+		{
+			name: "ECONNREFUSED wrapped the way SendCommand wraps a dial failure",
+			err:  wrapDial(syscall.ECONNREFUSED),
+			want: true,
+		},
+		{
+			name: "a plain error that is not an errno at all",
+			err:  errors.New("parse response: unexpected end of JSON input"),
+			want: false,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := daemonAbsent(c.err); got != c.want {
+				t.Errorf("daemonAbsent(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// The audit user string has no map and no view function: it renders literally in
+// the log table, so a rename here leaves two spellings for the same event and
+// nothing notices. Pinned the honest way — the fallback path is made to write an
+// entry and the entry's user is read back — rather than by comparing the constant
+// with itself.
+//
+// resume, not panic, because resume's fallback needs no CAP_NET_ADMIN: it clears
+// the marker and writes the entry, and never touches nftables.
+func TestRunSubcommand_NoDaemonFallbackNamesItselfInTheAuditLog(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "easywall.toml")
+	body := "socket_path = \"" + filepath.Join(dir, "absent.sock") + "\"\n" +
+		"data_dir = \"" + dir + "\"\n" +
+		"log_dir = \"" + dir + "\"\n"
+	if err := os.WriteFile(cfgPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "panic"), nil, 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+
+	var out, errOut bytes.Buffer
+	if code := runSubcommand("resume", []string{"-config", cfgPath}, &out, &errOut); code != exitOK {
+		t.Fatalf("resume with no daemon = %d, want %d (stderr %s)", code, exitOK, errOut.String())
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "audit.log"))
+	if err != nil {
+		t.Fatalf("read audit log: %v", err)
+	}
+	var entry shared.AuditLogEntry
+	line := strings.TrimSpace(string(data))
+	if err := json.Unmarshal([]byte(line), &entry); err != nil {
+		t.Fatalf("audit line is not JSON: %q", line)
+	}
+	if entry.Action != "panic_resumed" {
+		t.Errorf("action = %q, want panic_resumed", entry.Action)
+	}
+	if entry.User != "console-no-daemon" {
+		t.Errorf("audit user = %q, want console-no-daemon — this string is rendered "+
+			"literally in the log table, and `console` is what the daemon-mediated "+
+			"route writes for the same action", entry.User)
+	}
+}
+
+// readAudit returns the audit entries a subcommand wrote into the log under
+// dir, in the order they were appended.
+func readAudit(t *testing.T, dir string) []shared.AuditLogEntry {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(dir, "audit.log"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("read audit log: %v", err)
+	}
+	var out []shared.AuditLogEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if line == "" {
+			continue
+		}
+		var e shared.AuditLogEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("audit line %q: %v", line, err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// What the proof found reaches the audit log, with its detail.
+//
+// The detail is the whole point of the entry. HealthResult deliberately drops
+// SelftestStamp.Detail — /healthz is unauthenticated by necessity and the text
+// names a port number and the claim that failed — and printStamp puts it on a
+// terminal that scrolls away. Without this the field is written by RunSelftest
+// and read by nothing that outlives the invocation, which is how a field gets
+// deleted as dead weight by somebody with no way to tell it from some.
+func TestSelftestWritesWhatItProvedToTheAuditLog(t *testing.T) {
+	cases := []struct {
+		name       string
+		result     shared.SelftestResult
+		detail     string
+		wantAction string
+	}{
+		{"passed", shared.SelftestPassed, "four claims held", "selftest_passed"},
+		{"failed", shared.SelftestFailed,
+			"an open port accepts a connection — port 12227 was dropped", "selftest_failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfgPath, dir := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+			fakeSelftest(t, shared.SelftestStamp{
+				Version: shared.CurrentVersion,
+				Kernel:  core.KernelRelease(),
+				Result:  tc.result,
+				Detail:  tc.detail,
+			})
+
+			var out, errOut bytes.Buffer
+			runSubcommand("selftest", []string{"-config", cfgPath}, &out, &errOut)
+
+			entries := readAudit(t, dir)
+			if len(entries) != 1 {
+				t.Fatalf("the proof wrote %d audit entries, want 1: %+v", len(entries), entries)
+			}
+			got := entries[0]
+			if got.Action != tc.wantAction {
+				t.Errorf("audit action = %q, want %q", got.Action, tc.wantAction)
+			}
+			if got.Detail != tc.detail {
+				t.Errorf("audit detail = %q, want %q — the proof's own text is kept here and "+
+					"nowhere else that survives the invocation", got.Detail, tc.detail)
+			}
+			if got.User != auditUserSelftest {
+				t.Errorf("audit user = %q, want %q; the log has to say which process wrote a "+
+					"line without an operator inferring it from the timestamp",
+					got.User, auditUserSelftest)
+			}
+		})
+	}
+}
+
+// unprovable writes nothing, and neither does a skipped run.
+//
+// unprovable is the ordinary state on every container and on every host whose
+// daemon holds CAP_NET_ADMIN and not CAP_SYS_ADMIN, which is the normal systemd
+// installation. One line per boot saying the proof could not be attempted would
+// be the whole audit log on a machine that reboots, and it would push out the
+// apply and panic entries an operator greps for. A skipped run proved nothing
+// now, so it has nothing to record either.
+func TestSelftestWritesNoAuditEntryWithNothingProven(t *testing.T) {
+	t.Run("unprovable", func(t *testing.T) {
+		cfgPath, dir := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+		fakeSelftest(t, shared.SelftestStamp{
+			Version: shared.CurrentVersion,
+			Kernel:  core.KernelRelease(),
+			Result:  shared.SelftestUnprovable,
+			Detail:  "this kernel cannot be asked without CAP_SYS_ADMIN",
+		})
+
+		var out, errOut bytes.Buffer
+		runSubcommand("selftest", []string{"-config", cfgPath}, &out, &errOut)
+
+		if entries := readAudit(t, dir); len(entries) != 0 {
+			t.Errorf("unprovable wrote %+v; the normal production state must not fill the "+
+				"audit log one line per boot", entries)
+		}
+		// The result still reached the operator, or "wrote nothing" would be
+		// satisfied by a subcommand that did nothing at all.
+		if !strings.Contains(out.String(), string(shared.SelftestUnprovable)) {
+			t.Errorf("the console did not report the result:\n%s", out.String())
+		}
+	})
+
+	t.Run("skipped as fresh", func(t *testing.T) {
+		cfgPath, dir := writeConfigDir(t, filepath.Join(t.TempDir(), "absent.sock"))
+		writeStamp(t, dir, freshStamp())
+		fakeSelftest(t, shared.SelftestStamp{Result: shared.SelftestFailed})
+
+		var out, errOut bytes.Buffer
+		runSubcommand("selftest", []string{"-config", cfgPath, "-if-stale"}, &out, &errOut)
+
+		if entries := readAudit(t, dir); len(entries) != 0 {
+			t.Errorf("a skipped run wrote %+v; nothing was proven this time", entries)
+		}
+	})
+}
+
+// `easywall-core -config X panic` used to start a second daemon: only os.Args[1]
+// is a subcommand, and flag.Parse left `panic` in flag.Args, which nothing read.
+// That daemon ran the startup restore and took over the live core's socket — in
+// a lockout, the opposite of panic. Run as a child so main's os.Exit is real.
+func TestAFlagBeforeASubcommandIsRefused(t *testing.T) {
+	if os.Getenv("EASYWALL_TEST_MAIN") == "1" {
+		os.Args = []string{"easywall-core", "-config", "/nonexistent/easywall.toml", "panic"}
+		main()
+		return
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAFlagBeforeASubcommandIsRefused$")
+	cmd.Env = append(os.Environ(), "EASYWALL_TEST_MAIN=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected a non-zero exit, got success:\n%s", out)
+	}
+	if !strings.Contains(string(out), `unexpected argument "panic"`) ||
+		strings.Contains(string(out), "failed to load config") {
+		t.Fatalf("the stray subcommand must be refused before the daemon path runs:\n%s", out)
+	}
+}

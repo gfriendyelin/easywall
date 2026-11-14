@@ -1,0 +1,388 @@
+package web
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/gorilla/sessions"
+	"golang.org/x/crypto/argon2"
+)
+
+const (
+	SessionName     = "easywall"
+	SessionLifetime = 600 // seconds
+	SessionUserKey  = "user"
+
+	// SessionCredentialKey holds a fingerprint of the password hash that was in
+	// force when the session was created.
+	SessionCredentialKey = "cred"
+
+	// maxHashPart bounds the salt and the key read out of a stored hash. Both are
+	// tens of bytes in anything easywall writes.
+	maxHashPart = 1024
+
+	// minPasswordLen is the shortest password accepted, by the first-run wizard
+	// and by the change-password page. It was written as a bare 12 in both,
+	// which is one place too many for a rule the interface also states in words.
+	minPasswordLen = 12
+)
+
+// What a password must be, and it is not configurable.
+//
+// Twelve characters has been the rule since the wizard existed, and it accepted
+// twelve lower-case letters — a rule about effort rather than about strength.
+// This adds a digit and a symbol to it.
+//
+// It is deliberately not a setting. A minimum somebody can lower is not a
+// minimum, and the operator who would lower it is the one this protects.
+//
+// A note for whoever revisits this: NIST SP 800-63B advises verifiers NOT to
+// impose composition rules, on the measured ground that they produce
+// `Password1!` — and to prefer length plus a check against known-breached
+// passwords. That argument was put to the maintainer and the composition rule
+// was chosen anyway, with the length kept at 12 rather than lowered to the 8
+// originally asked for. The breach-list alternative is the better idea and is
+// the thing to build if this is ever revisited; it needs a list to ship or
+// query, and the web process is not allowed to telephone anybody.
+func passwordPolicyError(password string) string {
+	// Characters a reader sees, counted in runes — not bytes, or six umlauts
+	// would be twelve characters — and not counting the invisible ones.
+	//
+	// The count was utf8.RuneCountInString and the symbol test !unicode.IsLetter,
+	// so a zero-width space (U+200B), a soft hyphen (U+00AD) or a combining mark
+	// counted toward twelve and satisfied the symbol rule: "abcdefghij1" plus one
+	// U+200B passed with nothing visible where its symbol was. Format, control
+	// and non-spacing/enclosing mark runes now count for neither, so a
+	// decomposed é (e + U+0301) is one character, as its precomposed form is.
+	var length int
+	var hasDigit, hasSymbol bool
+	for _, r := range password {
+		if unicode.In(r, unicode.Cf, unicode.Cc, unicode.Mn, unicode.Me) {
+			continue
+		}
+		length++
+		switch {
+		case unicode.IsDigit(r):
+			hasDigit = true
+		case unicode.IsPunct(r) || unicode.IsSymbol(r) || unicode.Is(unicode.Zs, r):
+			// Any punctuation, symbol or space, rather than a list of accepted
+			// punctuation. A list rejects §, € and an en dash, which are no
+			// weaker than !, and it rejects a space — which would punish a
+			// passphrase for being one.
+			hasSymbol = true
+		}
+	}
+	if length < minPasswordLen {
+		return "password_too_short"
+	}
+
+	// The first unmet requirement, not all of them: the hint under the field
+	// states all three before anything is typed, so one specific sentence is
+	// more use than three at once.
+	switch {
+	case !hasDigit:
+		return "password_needs_digit"
+	case !hasSymbol:
+		return "password_needs_symbol"
+	}
+	return ""
+}
+
+// newSessionStore builds the cookie store every session is signed with.
+//
+// It exists so there is one place that gets the lifetime right, and because
+// getting it right is not obvious. A session cookie carries a timestamp inside
+// the signed value, and the server refuses one older than the codec's max age.
+// That max age is set by NewCookieStore from its own default — thirty days —
+// and assigning a fresh Options struct afterwards does not change it. Every
+// caller here did exactly that, so the cookie the browser dropped after ten
+// minutes stayed valid to the server for thirty days.
+//
+// It made logging out temporary rather than permanent. A logged-out session is
+// remembered as revoked for one SessionLifetime and then forgotten, on the
+// stated ground that the cookie expires on its own by then; it did not, so
+// replaying the same cookie eleven minutes after logging out signed you back
+// in. Measured before this change: /dashboard answered 200 with a cookie 29
+// days old, and 200 again after a logout had been garbage-collected.
+//
+// store.MaxAge sets both halves — the Max-Age the browser sees and the age the
+// server enforces — so use it rather than writing Options.MaxAge.
+//
+// Wrapped in sessionStore, so no save can re-sign a revoked session.
+func newSessionStore(key string) *sessionStore {
+	store := sessions.NewCookieStore([]byte(key))
+	store.Options = &sessions.Options{
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	}
+	store.MaxAge(SessionLifetime)
+	return &sessionStore{store}
+}
+
+// newPendingStore builds the store for the login's intermediate state.
+//
+// Separate from the session store, and every difference is deliberate:
+//
+//   - Path "/login", so the cookie is sent to /login and /login/verify and
+//     nowhere else. A half-login has no business appearing in a proxy log for
+//     /ports.
+//   - MaxAge pendingLifetime, three minutes: long enough to read a code off a
+//     phone, short enough that a shoulder-surfed screen is not a standing
+//     invitation.
+//   - store.MaxAge, never Options.MaxAge — for the reason newSessionStore
+//     spells out above. Assigning a fresh Options struct leaves the codec's own
+//     thirty-day max age in place, and a three-minute cookie the *server*
+//     accepts for a month is the same bug that made logging out temporary.
+//
+// It is a cookie rather than a server-side table because unauthenticated
+// requests create it: a map any stranger can fill is memory any stranger
+// occupies.
+func newPendingStore(key string) *sessions.CookieStore {
+	store := sessions.NewCookieStore([]byte(key))
+	store.Options = &sessions.Options{
+		Path:     "/login",
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteLaxMode,
+	}
+	store.MaxAge(pendingLifetime)
+	return store
+}
+
+// credentialFingerprint derives a short, non-reversible marker from the stored
+// password hash.
+//
+// Sessions live in a signed cookie, so there is no server-side list to clear:
+// changing the password left every existing session working until it timed out.
+// Comparing this marker on each request ends them instead, which is what an
+// operator changing the password because they suspect someone else is signed in
+// is actually asking for. It is derived from the hash, never from the password,
+// and it is only ever compared with itself.
+//
+// CodeQL reports this as password hashing with a weak algorithm
+// (go/weak-sensitive-data-hashing, alert 197) and it is dismissed as a false
+// positive. What goes in is an argon2id digest — 16 random salt bytes and a
+// 32-byte key, already slow-hashed — not a password; what comes out is a marker
+// compared on every request, which is precisely where the remedy the query asks
+// for, an expensive KDF, cannot go. Read that before "fixing" it.
+//
+// It hashes the password hash, the TOTP secret from 2.8 on, and the passkey set
+// from 2.18 on. Enabling or disabling any factor therefore ends every other
+// session at that moment, and the acting one is re-stamped exactly as a
+// password change already does.
+//
+// The passkey half is what makes removing a lost device mean something.
+// Without it, taking the credential out of passkeys.json would stop the device
+// being able to sign in again and leave every session it had already opened
+// running — which is the case the mechanism exists for.
+//
+// passkeySet is passkeyStore.fingerprintInput(): the credential IDs, sorted,
+// joined. Deliberately not the signature counters, which change on every login
+// and would make each request invalidate its own session.
+//
+// The domain separator went v2 → v3 with that change, so every session in
+// flight across the upgrade ends once. That is the correct direction and it is
+// worth a changelog line, as v1 → v2 was in 2.8.
+func credentialFingerprint(passwordHash, totpSecret, passkeySet string) string {
+	sum := sha256.Sum256([]byte("easywall-session-v3:" + passwordHash + "\x00" + totpSecret + "\x00" + passkeySet))
+	return base64.RawStdEncoding.EncodeToString(sum[:16])
+}
+
+type argon2Params struct {
+	memory      uint32
+	iterations  uint32
+	parallelism uint8
+	saltLength  uint32
+	keyLength   uint32
+}
+
+var defaultArgon2Params = argon2Params{
+	memory:      64 * 1024,
+	iterations:  3,
+	parallelism: 4,
+	saltLength:  16,
+	keyLength:   32,
+}
+
+// argon2Slots is how many Argon2id runs may hold their 64 MiB at once; the
+// rest wait for a slot, which costs a goroutine and not 64 MiB. Unbounded, ten
+// parallel sign-in attempts took the process to 668 MiB (runtime Sys), on
+// hosts docs/_docs/installation/requirements.md sizes at ~32 MB idle.
+var argon2Slots = make(chan struct{}, 1)
+
+// loginHashWait is how long a sign-in waits for argon2Slots before it is
+// answered 503. A flood from many sources can keep the slot busy; without a
+// limit the backlog grew without one and the operator's own attempt queued
+// behind all of it, still running after the flood had stopped. A var so a
+// test need not wait it out.
+var loginHashWait = 5 * time.Second
+
+// idKey is argon2.IDKey behind argon2Slots. Every hash this process computes
+// goes through here, or the bound above stops being one. It gives up when ctx
+// ends — a deadline, or a client that has gone away.
+func idKey(ctx context.Context, password, salt []byte, p argon2Params) ([]byte, error) {
+	select {
+	case argon2Slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-argon2Slots }()
+	return argon2.IDKey(password, salt, p.iterations, p.memory, p.parallelism, p.keyLength), nil
+}
+
+// HashPassword returns an argon2id encoded hash of the given password.
+func HashPassword(password string) (string, error) {
+	p := defaultArgon2Params
+	salt := make([]byte, p.saltLength)
+	if _, err := rand.Read(salt); err != nil {
+		return "", fmt.Errorf("generate salt: %w", err)
+	}
+
+	hash, _ := idKey(context.Background(), []byte(password), salt, p) // waits as long as it takes
+
+	b64salt := base64.RawStdEncoding.EncodeToString(salt)
+	b64hash := base64.RawStdEncoding.EncodeToString(hash)
+
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+		argon2.Version, p.memory, p.iterations, p.parallelism, b64salt, b64hash), nil
+}
+
+// Why a stored hash cannot be used, in words that carry nothing from the value
+// itself.
+//
+// A fixed set rather than an error wrapped around the parser's, and that is the
+// point: this text is written to the journal, the value it describes is the
+// credential, and an error built by wrapping a parser can carry pieces of its
+// input along with it — `fmt.Errorf("decode salt: %w", err)` is one library
+// change away from printing what it failed to decode. Constants cannot.
+var (
+	errHashFormat      = errors.New("it is not the $argon2id$… form easywall writes")
+	errHashVersion     = errors.New("it names an argon2 version this build cannot read")
+	errHashParams      = errors.New("its cost parameters cannot be read")
+	errHashSaltEncode  = errors.New("its salt is not valid base64")
+	errHashKeyEncode   = errors.New("its key is not valid base64")
+	errHashEmptySalt   = errors.New("it has an empty salt")
+	errHashEmptyKey    = errors.New("it has an empty key; the value looks truncated")
+	errHashParallelism = errors.New("its parallelism is below 1")
+	errHashIterations  = errors.New("its iteration count is below 1")
+	errHashMemory      = errors.New("its memory cost is below argon2's minimum for that parallelism")
+	errHashOversized   = errors.New("its salt or key is longer than any hash easywall writes")
+)
+
+// VerifyPassword returns true if password matches the argon2id encoded hash.
+//
+// A stored hash that cannot be used is reported, not just refused. This is the
+// one place that discovers it, and the operator needs to be told: docs/_docs/security.md
+// offers no password recovery beyond "editing web.toml on the host", so a hash
+// that got mangled on the way into that file is reached by someone who is already
+// locked out and has no other way in. The log line is what turns a login that
+// will never work into something they can fix.
+//
+// Logging here is safe from the outside: the hash comes from the config file, so
+// a wrong password never reaches this branch and nobody can make it noisy. And
+// safe on the inside because the reason is one of the constants above — the
+// stored credential does not reach the journal even in pieces.
+func VerifyPassword(password, encodedHash string) bool {
+	ok, _ := verifyPasswordCtx(context.Background(), password, encodedHash)
+	return ok
+}
+
+// verifyPasswordCtx is VerifyPassword for the sign-in, which must not wait for
+// a hashing slot past ctx: an error means it was not checked at all.
+func verifyPasswordCtx(ctx context.Context, password, encodedHash string) (bool, error) {
+	p, salt, hash, err := decodeArgon2Hash(encodedHash)
+	if err != nil {
+		slog.Error("the stored password hash cannot be used, so no password can match it; "+
+			"replace the password line in web.toml with a hash easywall produced, or clear it "+
+			"to reopen the first-run wizard", "reason", err.Error())
+		return false, nil
+	}
+	other, err := idKey(ctx, []byte(password), salt, p)
+	if err != nil {
+		return false, err
+	}
+	return subtle.ConstantTimeCompare(hash, other) == 1, nil
+}
+
+// decodeArgon2Hash parses a $argon2id$... encoded hash.
+func decodeArgon2Hash(encoded string) (argon2Params, []byte, []byte, error) {
+	parts := strings.Split(encoded, "$")
+	// expected: ["", "argon2id", "v=19", "m=65536,t=3,p=4", "<salt>", "<hash>"]
+	if len(parts) != 6 || parts[1] != "argon2id" {
+		return argon2Params{}, nil, nil, errHashFormat
+	}
+
+	var version int
+	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
+		return argon2Params{}, nil, nil, errHashVersion
+	}
+
+	var p argon2Params
+	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &p.memory, &p.iterations, &p.parallelism); err != nil {
+		return argon2Params{}, nil, nil, errHashParams
+	}
+
+	salt, err := base64.RawStdEncoding.DecodeString(parts[4])
+	if err != nil {
+		return argon2Params{}, nil, nil, errHashSaltEncode
+	}
+
+	hash, err := base64.RawStdEncoding.DecodeString(parts[5])
+	if err != nil {
+		return argon2Params{}, nil, nil, errHashKeyEncode
+	}
+
+	// Bounded before the conversion, not after: these two widths are handed
+	// straight to argon2.IDKey, which allocates from them. easywall writes a
+	// 16-byte salt and a 32-byte key; anything past a kilobyte is not a hash this
+	// program produced, and there is no reason to let a config file ask for an
+	// arbitrary allocation on every login attempt.
+	if len(salt) > maxHashPart || len(hash) > maxHashPart {
+		return argon2Params{}, nil, nil, errHashOversized
+	}
+	// #nosec G115 -- both lengths are bounded by maxHashPart immediately above.
+	p.saltLength = uint32(len(salt))
+	// #nosec G115 -- likewise.
+	p.keyLength = uint32(len(hash))
+
+	// The parameters were parsed but never checked for being usable, and
+	// argon2.IDKey does not tolerate degenerate ones — it panics. Measured against
+	// the running server with the trailing segment of the hash missing, which is
+	// what a hash truncated while being pasted in looks like:
+	//
+	//	POST /login -> HTTP 500
+	//	panic: runtime error: invalid memory address or nil pointer dereference
+	//	  golang.org/x/crypto/blake2b.(*digest).Write
+	//
+	// p=0 and t=0 panic with their own messages. middleware.Recoverer turns each
+	// into a 500 and a stack trace in the journal, so the only documented way back
+	// into a locked-out installation answers with neither a login nor a reason.
+	// Refused with a description instead, which VerifyPassword logs.
+	switch {
+	case len(salt) == 0:
+		return argon2Params{}, nil, nil, errHashEmptySalt
+	case len(hash) == 0:
+		return argon2Params{}, nil, nil, errHashEmptyKey
+	case p.parallelism < 1:
+		return argon2Params{}, nil, nil, errHashParallelism
+	case p.iterations < 1:
+		return argon2Params{}, nil, nil, errHashIterations
+	case p.memory < 8*uint32(p.parallelism):
+		// argon2's own lower bound: fewer blocks than lanes has no meaning.
+		return argon2Params{}, nil, nil, errHashMemory
+	}
+
+	return p, salt, hash, nil
+}

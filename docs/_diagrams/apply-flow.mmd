@@ -1,0 +1,10 @@
+flowchart LR
+  S["Staged"] -->|"apply"| L["Live"]
+  L -->|"confirm within<br/>the window"| C["Confirmed"]
+  L -->|"window expires"| R["Rolled back"]
+  R -->|"edits are still there"| S
+  L -.- N1["Open a second connection<br/>and check before confirming"]
+  R -.- N2["Previous rules are back.<br/>Nothing staged was lost."]
+
+  classDef note fill:none,stroke-dasharray:3 3
+  class N1,N2 note

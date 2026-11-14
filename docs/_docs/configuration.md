@@ -1,0 +1,532 @@
+---
+layout: default
+title: Configuration
+description: All TOML configuration keys for easywall-core and easywall-web explained.
+---
+
+# Configuration
+
+Two TOML files in `/etc/easywall/`, one per process, read at startup.
+
+A value that cannot be interpreted stops the daemon with a message naming the key —
+an unknown `ipv6.mode`, a missing path. A value that is merely out of range is brought
+into range and **said out loud** in the log. A firewall daemon that refuses to start is
+a worse outcome than one running a documented default. `acceptance.duration` is clamped
+to 10–3600. A rate limit of zero on an enabled module becomes that module's default.
+
+The same value arriving through the interface is refused instead, with the key named.
+Nothing is substituted quietly in either direction — that used to be five rate limits,
+and the file and the running firewall could disagree with nothing to say so.
+
+| | Owner and mode | Holds |
+|---|---|---|
+| `easywall.toml` | `root:root` `0600` | firewall options, acceptance window, IPv6, Docker, routing |
+| `web.toml` | `easywall:easywall` `0600` | bind address, TLS, session secret, credentials |
+
+The split is the point: the web process rewrites its own file. The wizard and the
+password page write into it. It must not be able to touch the one the root daemon
+reads.
+
+The package and the container install both, already filled in — from
+`*.toml.template`. Both are created once and never touched again: easywall edits
+both files itself, and a file a program rewrites must not be managed by the
+package manager. An upgrade replaces the templates and leaves your two files
+alone. Either binary can also write a commented default — it carries one, so this
+works on a host that has nothing but the binary:
+
+```bash
+sudo easywall-core --write-config /etc/easywall/easywall.toml
+sudo easywall-web  --write-config /etc/easywall/web.toml
+```
+
+**It never overwrites.** Both paths hold a working firewall's settings once
+easywall is running, and `web.toml` also holds the session key and the password
+hash. Pointed at a file that exists, the command says so and changes nothing.
+
+## The command line
+
+Both binaries take three flags; `easywall-web` takes a fourth.
+
+| | |
+|---|---|
+| `-config <path>` | which file to read. Defaults to `/etc/easywall/easywall.toml` and `/etc/easywall/web.toml` |
+| `-write-config <path>` | write the commented default to that path, `0600`, and exit. Refuses if the file exists, and does not create the directory |
+| `-version` | print the version and exit — what the binary was actually built as |
+| `-healthcheck` | `easywall-web` only: ask `/healthz` at `bind_addr`, exit 0 on a 200 — the container's [health check]({{ '/docs/features/health/' | relative_url }}) |
+
+`easywall-core` also has five subcommands: `health` and `selftest`
+([health]({{ '/docs/features/health/' | relative_url }})), `status`, `panic` and `resume`
+([recovery]({{ '/docs/features/recovery/' | relative_url }})). `easywall-core -h` lists them.
+
+```bash
+easywall-core --version     # easywall-core {{ site.version }}
+```
+
+---
+
+## easywall-core (`/etc/easywall/easywall.toml`)
+
+### Top-Level Keys
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `socket_path` | string | `/run/easywall/core.sock` | Unix socket path — must be accessible to the `easywall` group |
+| `data_dir` | string | `/var/lib/easywall` | Directory for `rules.json`, the apply state and the panic marker. Root's alone: the web process writes only `web/` inside it |
+| `log_dir` | string | `/var/log/easywall` | Directory for audit log and rule snapshots |
+
+### `[acceptance]`
+
+The two-step activation safety mechanism. When a ruleset is applied, the core waits up to `duration` seconds for an explicit acceptance signal. If no signal arrives, the previous ruleset is automatically restored.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Two-step activation safety. The installed `easywall.toml` sets `true` |
+| `duration` | int | `120` | Seconds before auto-rollback if not confirmed — 10 to 3600 |
+
+Set `duration` to a value long enough for you to verify connectivity from a second terminal after applying rules.
+
+> **A key the file omits reads as its shipped default**, so a file naming only
+> `duration` still has the window on. `enabled = false` is not clamped or refused. The
+> daemon warns at every start when it is off: *applies take effect immediately and
+> nothing will undo them*.
+
+The range is enforced, not merely suggested. Below ten seconds the window closes before
+the confirmation page can be read, so every apply rolls back and the firewall can no
+longer be changed through the interface. A value outside the range in an existing file
+is brought to the nearest permitted one, with a warning, rather than keeping the daemon
+from starting. That includes `0`, which becomes 10; `enabled = false` is what switches
+the window off. A missing `duration` is 120. A value set through the interface is rejected outright.
+
+### `[usage]`
+
+How often the per-rule packet counters are read out of the kernel. It is what the
+**Last used** column on the [port pages]({{ '/docs/features/ports/' | relative_url }})
+is built from.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `interval` | int | `300` | Seconds between counter reads — `0` stops the ticker |
+
+`0` stops the **ticker**, not the counting. An apply reads the counters
+immediately before it writes, because writing the rules resets every one of
+them. So **Last used** still advances at every apply, even on a host with the
+ticker switched off. What you lose is the resolution in between: a port used
+an hour after your last apply is dated at your next one.
+
+### `[packet_log]`
+
+Where the packets the [`*_log` switches]({{ '/docs/features/filters/' | relative_url }}#logging)
+log are kept — what the [Blocked page]({{ '/docs/features/blocked-traffic/' | relative_url }})
+reads. Read at start; a `SIGHUP` reports a change here and ignores it.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `nflog_group` | int | `12227` | The NFLOG group `easywall-core` binds |
+| `entries` | int | `20000` | Packets kept, newest first — `1000` to `200000` |
+| `persist` | bool | `false` | Also write them to `log_dir/packets.log`, so the page survives a restart |
+
+A group binds once per network namespace (per host, for a host-network
+install). If ulogd2 already holds `12227`, the core logs
+*could not bind its NFLOG group*, falls back to the kernel log as before
+2.21, and the page says the same. Pick a free group.
+
+`entries` outside its range is brought to the nearest end with a warning.
+`nflog_group` outside `0`–`65535` stops the daemon with the key named.
+
+### `[ipv6]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | `"filter"` | What happens to IPv6: `filter` puts it through every rule, `passthrough` accepts it before any rule, `block` drops it except loopback. `block` also removes IPv6 from the container networks the forward chain is built over — what then reaches a container follows `routing.mode` (drop under `closed`/`networks` unless `routing.networks` names it, passed through under `open`) |
+| `icmp_allow_router_advertisement` | bool | `true` | Allow ICMPv6 types 133 and 134 — required for SLAAC address autoconfiguration |
+| `icmp_allow_neighbor_advertisement` | bool | `true` | Allow ICMPv6 types 135/136 — required for Neighbor Discovery Protocol |
+
+Both ICMPv6 keys apply only under `mode = "filter"`. Under `passthrough` the traffic
+is already accepted and under `block` already gone.
+
+> **`enabled` is obsolete.** It was documented as "off means IPv6 traffic is not
+> filtered at all," and did the opposite. The table is `inet`, so every rule and the
+> drop policy still applied to IPv6, and only the ICMPv6 exemptions were removed —
+> IPv6 came out filtered *and* non-functional. A config still carrying the key loads,
+> and both old values become `mode = "filter"`.
+
+Turning either ICMPv6 key off breaks IPv6 on most networks — SLAAC and neighbour
+discovery are how an address is obtained and kept reachable. They exist for hosts
+with static addressing that genuinely need neither.
+
+### `[docker]`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `true` | Auto-detect Docker bridge interfaces and allowlist them |
+| `allow_bridge_networks` | bool | `true` | Allowlist auto-detected bridge network CIDRs |
+| `custom_networks` | list | `[]` | Additional CIDRs to allowlist unconditionally (processed when `enabled = true`) |
+| `published_ports` | string | `"open"` | `open` or `filtered`. Under `filtered`, only a port rule with scope `forwarded` lets anything reach a published container port — covers IPv6 container networks too since 2.24 |
+
+> **`enabled` ships `true` since 2.22.** A host with no `docker*`/`br-*`
+> interface gets no rule change either way. One that has such an interface
+> and shipped `false` lost every container's network at the first apply.
+> The acceptance window is blind to that: it proves the operator's own
+> connection on the `input` chain, and container traffic crosses the
+> `forward` chain instead. Existing files keep whatever they already say;
+> only a fresh install or `--write-config` sees the new default. A
+> non-Docker `br-*` interface — OpenWrt's `br-lan` is one, an OpenStack
+> `br-ex` another — is trusted too. Its global or unique-local IPv6 prefixes
+> are trusted the same way since 2.24; set `enabled = false` on a host like
+> that.
+
+> **`published_ports` has no control in the interface, deliberately.** One press
+> could take every container on this host off the network. The acceptance window
+> cannot catch that: it proves your own connection, and yours arrives on the
+> `input` chain. Edit it here, apply once, and read
+> [Docker Coexistence]({{ '/docs/features/docker/' | relative_url }}) first.
+> `filtered` is refused at startup and on `SIGHUP` when `enabled = false`, and
+> so is any value that is neither `open` nor `filtered`.
+
+See [Docker Coexistence]({{ '/docs/features/docker/' | relative_url }}) for the full setup guide.
+
+Both this list and `routing.networks` below hold **CIDR networks** — `192.168.1.0/24`,
+not `192.168.1.5`. A blank line or a line beginning with `#` is a comment, as in the
+address list editors, and is skipped. Anything else stops the daemon with the entry
+named, at startup and on `SIGHUP`.
+
+> **Nothing checked these two lists when they arrived in the file.** Only the
+> Network page checked, and only on the way in — so an entry edited in by hand
+> reached the kernel as no rule at all. With `routing.mode = "networks"` and
+> `networks = ["10.8.0.0/24", "10.9.0.0-24"]` the daemon started with no warning.
+> The `forward` chain came up holding the accept for the first network and
+> none for the second, which the drop policy then destroyed. The page had the
+> opposite failure: it validated with the address-list rules, which accept a bare
+> address. So `192.168.1.5` passed there, was refused by the core, and was
+> reported as *Failed to save changes. Check core connection.*
+
+### `[routing]`
+
+Traffic this host passes on rather than receives — between two interfaces, out of a
+container, into a published container port.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `mode` | string | `"closed"` | `closed`, `networks` or `open` — see below |
+| `networks` | list | `[]` | CIDRs that may be routed, in either direction. Read only under `mode = "networks"` |
+
+| `mode` | What crosses the `forward` chain |
+|---|---|
+| `closed` | Nothing, beyond what `[docker]` allows. Correct for a plain server |
+| `networks` | Also anything with a source *or* a destination in `networks` |
+| `open` | Everything. easywall filters only what arrives for this host |
+
+> **A closed `forward` chain is not the same as an unfiltered one.** A base chain
+> whose rules give no verdict falls through to its policy, so an empty chain with
+> `policy drop` destroys every routed packet. That includes packets another table's
+> forward chain has already accepted. Until 2.5.0 that was the only behaviour and
+> nothing said so, which meant every Docker container lost its network the moment
+> easywall applied. Docker's networks now cross regardless of `mode`; anything else
+> that routes needs this key.
+
+### `[firewall]` — Protection Modules
+
+One row per module: the switch that turns it on, what it may be tuned with, and
+its own logging switch. Every threshold is **per source address**. All booleans
+default to what the "on" column says; the numbers are the defaults shown.
+
+What each module actually drops is on
+[Firewall Filters]({{ '/docs/features/filters/' | relative_url }}); this is the key
+reference.
+
+| Module | Switch — default | Tuning | Logging |
+|---|---|---|---|
+| SSH brute-force | `ssh_brute_force` — **on** | `ssh_brute_force_connection_limit` `5`/min | `ssh_brute_force_log`, `ssh_brute_force_log_limit` `60`/min |
+| Answer pings | `icmp_allow_echo_request` — **on** | — | — |
+| ICMP flood | `icmp_flood` — **on** | `icmp_flood_connection_limit` `10`/s | `icmp_flood_log`, `icmp_flood_log_limit` `60`/min |
+| SYN flood | `syn_flood` — **on** | `syn_flood_limit` `100`/s | `syn_flood_log` |
+| Port scan | `port_scan` — **on** | — | `port_scan_log` |
+| Invalid packets | `drop_invalid_packets` — **on** | — | `drop_invalid_packets_log` |
+| Fragments (IPv4) | `drop_fragments` — off | — | `drop_fragments_log` |
+| Bogon filter (IPv4) | `bogon_filter` — off | — | `bogon_filter_log` |
+| Connection limit | `connection_limit_per_ip` — off | `connection_limit_max` `100` | — |
+| TCP RST flood | `tcp_rst_flood` — off | `tcp_rst_flood_limit` `100`/s | `tcp_rst_flood_log` |
+| Broadcast | `drop_broadcast` — off | — | — |
+| Multicast | `drop_multicast` — off | — | — |
+| Anycast | `drop_anycast` — off | — | — |
+
+A file without `icmp_allow_echo_request` — every `easywall.toml` from before 2.25 — reads it as on.
+
+Every number above has a permitted range, and it is the daemon that holds it.
+The `max` on the options page and the `maximum` in the JSON Schema are hints to a
+browser and an editor. Neither reaches a `curl` or a hand-edited file:
+
+| Key | Range | Default |
+|---|---|---|
+| `ssh_brute_force_connection_limit` | 1–100 | 5 |
+| `ssh_brute_force_log_limit` | 1–10000 | 60 |
+| `icmp_flood_connection_limit` | 1–1000 | 10 |
+| `icmp_flood_log_limit` | 1–10000 | 60 |
+| `syn_flood_limit` | 1–10000 | 100 |
+| `tcp_rst_flood_limit` | 1–10000 | 100 |
+| `connection_limit_max` | 1–100000 | 100 |
+| `log_blocked_connections_limit` | 1–10000 | 60 |
+| `log_blocklist_connections_limit` | 1–10000 | 60 |
+| `log_feed_connections_limit` | 1–10000 | 60 |
+
+Out of range in the file is clamped and logged; out of range from the interface is
+refused with the key named — the same split as `acceptance.duration`.
+
+> **There was no upper bound at all until now, and these numbers reach 32-bit
+> fields.** So too large did not fail, it wrapped. Measured against a kernel:
+> `connection_limit_max = 5000000000` arrived as `ct count over 705032704`, and
+> `4294967296` arrived as `ct count over 0` — a rule matching every connection
+> from every source and dropping it. One number, entered on a page whose product
+> promises it cannot lock you out, with nothing logged.
+
+Three logging switches belong to no module and are set here as well:
+
+| | Logs | Rate |
+|---|---|---|
+| `log_blocked_connections` | everything the final policy drops | `log_blocked_connections_limit` `60`/min |
+| `log_blocklist_connections` | blocklist hits, before the drop | `log_blocklist_connections_limit` `60`/min |
+| `log_feed_connections` | feed hits, before the drop | `log_feed_connections_limit` `60`/min per feed and address family |
+
+---
+
+## easywall-web (`/etc/easywall/web.toml`)
+
+### Top-Level Keys
+
+| Key | Type | Description |
+|---|---|---|
+| `bind_addr` | string | Listen address and port — e.g. `"0.0.0.0:12227"` or `"127.0.0.1:12227"` |
+| `socket_path` | string | Path to the core Unix socket — must match `easywall.toml` |
+| `ssl_dir` | string | Directory where the auto-generated TLS cert/key are stored |
+| `data_dir` | string | The data directory, `/var/lib/easywall` by default. This process keeps its state in `web/` inside it: passkeys, the TOTP replay guard, the version cache, the installation identifier, the country table |
+| `language` | string | Fallback UI locale — any code `locales/` holds a catalogue for; `en`, `de`, `fr` and `zh` ship. Only used when the browser asks for a language easywall does not have and no choice has been made in the interface |
+| `session_key` | string | Hex secret that signs the session cookie — `openssl rand -hex 32`, which is 64 characters. Optional: one is generated on first start and written back here if the key is missing, shorter than 32 characters, or still the shipped placeholder |
+| `username` | string | Login username — set via the first-run wizard |
+| `password` | string | Argon2id hash — set via the first-run wizard, do not edit by hand |
+| `totp_secret` | string | Base32 shared secret for the second factor, written by the interface — empty means none is enrolled. Clear this, `recovery_codes` and `<data_dir>/web/passkeys.json`, then restart, for password-only sign-in |
+| `recovery_codes` | array of strings | Argon2id hashes of the eight one-time recovery codes — never the codes themselves, which are shown once. One entry is removed each time a code is used |
+| `update_check` | bool | Ask github.com once a day whether a newer release exists — `true` by default. One of six possible outbound requests, and one of the two on by default; see below |
+| `telemetry` | bool | Whether this installation may be counted — off unless switched on, and asked during the first run. See below |
+| `notify_kind` | string | Notification transport — `"webhook"`, `"ntfy"`, or `""` for off, which is the default. See [Every request that leaves the host](#every-request-that-leaves-the-host) |
+| `notify_url` | string | Where the notification is posted. A credential: an ntfy topic is readable by anyone who knows it. Redirects are refused |
+| `notify_on_rolled_back` | bool | Notify when an apply was not confirmed and undid itself — `false` by default |
+| `notify_on_accepted` | bool | Notify when an apply was confirmed — `false` by default |
+| `notify_on_panic` | bool | Notify when panic mode engaged or ended — `false` by default |
+| `notify_on_failed_logins` | bool | Notify on repeated failed sign-ins from one address — `false` by default |
+| `country_lookup` | bool | Name, on **Blocked traffic**, the country each refused source is registered to — `true` by default. On, ipverse's list is downloaded daily; `false` makes no request. See [Every request that leaves the host](#every-request-that-leaves-the-host) |
+| `demo_mode` | bool | Run against an in-memory mock instead of the core. For the public demo only — never on a host you are protecting |
+| `trusted_proxies` | array of strings | Addresses and networks whose `X-Forwarded-For` header is believed. Empty by default, which means the TCP peer is authoritative. See [Behind a reverse proxy](#behind-a-reverse-proxy) for what listing one costs |
+| `health_allow` | array of strings | Addresses and networks that may read `/healthz`. Loopback by default. See [Who may read /healthz](#who-may-read-healthz) |
+
+### Who may read `/healthz`
+
+```toml
+health_allow = ["127.0.0.1/8", "::1/128", "10.20.0.0/24"]
+```
+
+`/healthz` is the one route that answers without a session, because the
+orchestrator asking whether easywall-web is alive does not hold one. It returns
+`ok`, `degraded` or `fail` as JSON, and nothing about your rules.
+
+| Answer | HTTP | Meaning |
+|---|---|---|
+| `ok` | 200 | Filtering, and the self-test agrees |
+| `degraded` | 200 | Still filtering, with something to look at |
+| `fail` | 503 | Not filtering, or the core cannot be reached |
+
+`degraded` is deliberately 200: a container restarted for it would be a working
+firewall dropping every established connection through it. Alert on the `state`
+in the body instead.
+
+Loopback only unless you widen it. The list is matched against the TCP peer and
+never against `X-Forwarded-For`, so a proxy in front of easywall cannot pass a
+monitoring host through — list the proxy. An empty list turns the endpoint off;
+leaving the key out means the loopback default, so an upgrade keeps working.
+
+### Behind a reverse proxy
+
+```toml
+trusted_proxies = ["127.0.0.1", "10.1.0.5"]
+```
+
+Each entry is an address or a CIDR network whose `X-Forwarded-For` easywall
+believes. Empty by default, which means the TCP peer is authoritative.
+
+**Being on this list is total trust in that peer.** List the proxies
+themselves, never the network they live in: every host in `10.0.0.0/8` can then
+choose the address easywall records, decides lockouts on, and rate limits.
+
+The whole task — nginx in front, the value to use, the Docker case, and how to
+check it took — is [Behind a reverse proxy]({{ '/docs/installation/reverse-proxy/' | relative_url }}).
+
+**If a listed proxy sends no `X-Forwarded-For`,** the request still resolves —
+to the proxy's own address. That's marked `via-proxy` in the audit log and reported
+as *cannot tell* on the apply screen. That marker is the symptom of the release's
+most likely misconfiguration: a proxy added to `trusted_proxies` without a
+matching `proxy_set_header X-Forwarded-For` in the proxy's own config. Every
+client behind it then shares that one address's rate-limit bucket, same as
+before the list existed — set the header and it goes away.
+
+### How the interface picks a language
+
+Highest priority first:
+
+1. **An explicit choice in the interface.** The switch in the sidebar footer — and
+   on the login page, so an operator who cannot read it can still get in — stores
+   `easywall_lang` for a year. This outranks everything below: the browser header
+   describes the machine, and this describes the person using it.
+2. **The browser's `Accept-Language` header.**
+3. **`language` in the config**, the setting above.
+4. **English.**
+
+The languages on offer are whatever `locales/*.json` contains, and each file names
+itself through its own `language_name` key. So `Deutsch` reads as `Deutsch` and
+`Français` as `Français` and `简体中文` as `简体中文`, whatever language the interface is currently in. A
+language nobody has reviewed yet says so in the switch, and a coverage report
+says how much of it is there. Adding a locale file is all it takes for it to
+appear; see
+[Adding a language]({{ '/docs/contributing/' | relative_url }}#adding-a-language).
+
+```bash
+openssl rand -hex 32     # session_key
+```
+
+**Keep `session_key` private.** Anyone holding it can forge a valid session cookie —
+no password required. easywall generates one on first start if the key is missing, too
+short, or still the placeholder the sample config ships with, and writes it back to
+`web.toml`.
+
+> **There is no `csrf_key`.** CSRF protection is Go 1.25's
+> `net/http.CrossOriginProtection`, which checks `Origin` and `Sec-Fetch-Site` rather
+> than issuing tokens. A `csrf_key` left over from an older config is read by nothing.
+
+### `[tls]`
+
+Leave both keys empty to use an auto-generated self-signed certificate in `ssl_dir`.
+
+| Key | Description |
+|---|---|
+| `cert` | Absolute path to a custom TLS certificate PEM file (e.g. Let's Encrypt fullchain) |
+| `key` | Absolute path to the matching private key PEM file |
+| `hostname` | The name this installation is reached by. One field, two consumers: the domain ACME issues for, and the WebAuthn Relying Party ID for passkeys |
+| `acme` | Fetch and renew a certificate automatically via ACME (Let's Encrypt by default). Requires `hostname` and `acme_agree_tos`; mutually exclusive with `cert`/`key` |
+| `acme_email` | Optional contact address the certificate authority sends expiry warnings to |
+| `acme_agree_tos` | Your agreement to the certificate authority's subscriber agreement. Has **no default** — easywall never agrees to a third party's terms on your behalf, so `acme = true` without this set is refused at startup |
+| `acme_directory` | ACME directory URL override. Empty is Let's Encrypt production; point it at a staging endpoint while getting DNS and port 80 right |
+
+`acme = true` also opens a fixed HTTP-01 listener on port 80. See
+[Security → Transport]({{ '/docs/security/' | relative_url }}#transport) for what
+has to be true before it can answer — including the one thing easywall will not
+do for you.
+
+The auto-generated certificate is valid for a year and is replaced once it comes within
+30 days of expiry. That's checked at startup and twice a day while the service runs, so a
+server that stays up past its own certificate keeps working.
+
+A custom certificate is **never** overwritten. It is re-read when the file changes, so
+an ACME client renewing it in place takes effect on the next connection without a
+restart.
+
+Set both `cert` and `key` or neither. Setting one alone is refused at startup: easywall
+would otherwise pair your file with the other half of its own generated pair. TLS then
+fails with a key-mismatch error naming a certificate you never configured.
+
+## Every request that leaves the host
+
+Six, and this is the whole list.
+
+| | Update check | Counting installations | Notifications | Feeds | Country lookup | A certificate |
+|---|---|---|---|---|---|---|
+| Key | `update_check` | `telemetry` | `notify_kind` | none — **Blocklist** in the interface | `country_lookup` | `tls.acme` |
+| Default | **on** | **off** until you switch it on | **off** until you switch it on | **off**, each one | **on** | **off** until you switch it on |
+| Destination | `api.github.com` | `telemetry.wdkro.de` | `notify_url` — yours, not ours | each list's own address, a country's on `raw.githubusercontent.com`; an own feed's is yours | `github.com`, redirected to `release-assets.githubusercontent.com` | `tls.acme_directory`, Let's Encrypt if unset |
+| How often | once a day | once a day | when something happens | on the list's schedule, hourly to daily | once a day | on first need, then before expiry |
+| Carries | nothing about you — a plain GET for the newest release | a random identifier and the version, in full below | what happened to your firewall | a GET; an own feed's user and password to its own URL | a GET | `tls.hostname`, an account key made here, and `tls.acme_email` if set |
+| Switched off by | `update_check = false` | `telemetry = false`, or **System** in the interface | `notify_kind = ""`, or **Notifications** in the interface | the feed's switch | `country_lookup = false` | `acme = false` — easywall then issues its own certificate |
+
+Two are on by default: the update check and the country lookup.
+
+`notify_url` and an own feed's URL are the only destinations easywall does not
+name. The authority is a default you may replace; the rest are fixed. That is why
+the notification address is treated as a credential and kept in `web.toml` at
+`0600`, beside `session_key`, and why an own feed's password is never shown back.
+
+The first five never delay a page. The update check is served from a cache on
+disk and refreshed in the background. A failure is remembered for an hour so a
+host with no route out is not retrying on every load. The count runs in the
+background and gives up after ten seconds. A feed refreshes in the background
+too, and a failed refresh keeps the copy already loaded; so does the country
+lookup. The certificate is the one that can stop a page, because it is what
+serves it.
+
+### The update check
+
+A banner appears when a newer release exists. Switching it off changes nothing
+else — the version easywall is running is shown either way.
+
+### Counting installations
+
+The first-run wizard asks rather than assumes. A critical bug matters differently
+at ten installations than at ten thousand. The count is the only way to know
+which this is — or to say a fix has reached most of them.
+
+What it sends, in full — once a day, nothing else, ever:
+
+```
+GET https://telemetry.wdkro.de/v1/count?id=<32 hex characters>&v=<version>
+```
+
+| | |
+|---|---|
+| **Not** sent | the hostname, any address, any rule, any count of what you have configured |
+| The identifier | 16 random bytes generated on your machine, in `<data_dir>/web/telemetry.json`. Delete the file and the next report is a new installation as far as anyone can tell |
+| Why random | a value derived from the hostname or machine-id can be reproduced by anyone who knows the host, which turns a count into a lookup |
+| At the far end | one line — timestamp, identifier, version — and a 204. **Your address is not recorded**: it rate-limits the endpoint and never reaches disk. Lines are kept 35 days, then only the rolled-up number |
+
+Turning it off does not need the core process to be running — consent that can only
+be withdrawn while another daemon is reachable would not be consent.
+
+#### Asked again after an update
+
+<figure class="docs-shot">
+  {% include themed-figure.html base="/assets/img/screens/telemetry-ask" ext="png"
+     alt="A card at the top of the dashboard asking whether this installation may be counted, showing the request it would send, with the buttons Yes, count it and No, thanks and a link-styled Don't ask again." %}
+</figure>
+
+| | |
+|---|---|
+| When | the first dashboard after a **minor or major** update (2.27 → 2.28), while counting is off. A patch release (2.28.0 → 2.28.1) does not ask |
+| Never asked | counting is on · *Don't ask again* was chosen · `EASYWALL_WEB_TELEMETRY` is set (the deployment decided) · demo mode |
+| An answer | *Yes*, *No*, the first-run wizard and the switch under **System** all count as the answer for this version |
+| Where it is kept | `<data_dir>/web/telemetry_prompt.json`. Delete it and the next dashboard asks again |
+
+It is a card, not a page in the way: signing in to roll something back never
+waits on it.
+
+> The number is a lower bound and cannot be made tamper-proof: the endpoint is open, so
+> anyone can invent identifiers. It is good enough to tell ten installations from ten
+> thousand, and to see whether a fix has spread. It is not good for anything else, and
+> is not claimed to be.
+
+---
+
+## Editor autocompletion
+
+Both files ship a JSON Schema. Point [Taplo](https://taplo.tamasfe.dev/) at them for
+inline validation in VS Code, Neovim and anything else speaking LSP:
+
+```toml
+# taplo.toml (project root)
+[[rule]]
+include = ["config/easywall.toml"]
+url = "https://easywall-project.org/schemas/easywall.schema.json"
+
+[[rule]]
+include = ["config/web.toml"]
+url = "https://easywall-project.org/schemas/web.schema.json"
+```
+
+Direct schema links:
+
+- [easywall.schema.json]({{ '/schemas/easywall.schema.json' | relative_url }})
+- [web.schema.json]({{ '/schemas/web.schema.json' | relative_url }})

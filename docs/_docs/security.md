@@ -1,0 +1,416 @@
+---
+layout: default
+title: Security Model
+description: What the design defends against, what it does not, and the CVE in the Python version that shaped it.
+---
+
+# Security Model
+
+The whole design follows from one decision: the process reachable from the network
+holds no privilege worth stealing.
+
+{% include themed-figure.html base="/assets/diagrams/architecture" ext="svg"
+   alt="Browser talks HTTPS to easywall-web, which runs unprivileged; easywall-web talks typed JSON over a Unix socket to easywall-core, which runs as root and speaks netlink to the nftables table inet easywall." %}
+
+## Threat model
+
+| Threat | Mitigation |
+|---|---|
+| Rule or command injection | Every typed rule goes to the kernel as a Go struct over netlink — no shell, no argv, nothing to escape. Custom rules are the one exception and are handled below |
+| Escalation from the web process | It has no kernel access. Reaching nftables needs a command the typed protocol accepts |
+| Auth brute force | Argon2id, plus 5 attempts per 10 minutes per source address |
+| CSRF | Go 1.25 `net/http.CrossOriginProtection` — `Origin` and `Sec-Fetch-Site` on every unsafe method |
+| XSS | `html/template` escapes by default; CSP with no `'unsafe-inline'` and no external origin |
+| Session hijacking | HTTPS only, `HttpOnly`, `Secure`, `SameSite=Lax`, ends 600 seconds after last use, and every session ends the moment the password changes |
+| Locking the admin out | The acceptance window rolls back on its own; if it already has and you are still shut out, `easywall-core panic` reaches the firewall from the console — see [Panic mode](#panic-mode) |
+| A clock that blocks the mandatory second factor | A board with no real-time clock, or one that is simply wrong, can make every code fail. Enrolling does not need console access to recover from that — see [If the clock is wrong](#if-the-clock-is-wrong) |
+| Known CVEs in dependencies | `govulncheck` on every pull request and weekly, plus CodeQL and `gosec` |
+| Dependency hijacking | Renovate raises every update, patch releases auto-merge only once CI is green, minor and major wait for a person; plus secret scanning and dependency review |
+| A spoofed source address | `X-Forwarded-For` is **not** trusted — see [behind a reverse proxy](#behind-a-reverse-proxy) |
+
+## Authentication
+
+| | |
+|---|---|
+| Hash | Argon2id — 64 MiB, 3 iterations, parallelism 4, 16-byte salt per password. One at a time — see [what the limits cost](#what-the-sign-in-limits-cost) |
+| Password floor | at least 12 characters, with a digit and a symbol — punctuation, a symbol or a space. Invisible characters (a zero-width space, a soft hyphen, a combining accent) count as neither. Not configurable |
+| Default password | none. The first-run wizard is mandatory |
+| First run | only with the setup token easywall-web prints to its log at start — [First Run]({{ '/docs/installation/first-run/' | relative_url }}#the-setup-token) |
+| Rate limit | 5 attempts per 10 minutes per source address — an IPv6 source counts as its /64. One returned every 10 minutes |
+| Session | ends 600 s after last use. A page polling on its own is not use, except the apply screen during a window · `HttpOnly` · `Secure` · `SameSite=Lax` |
+| Cookie signing key | generated on first start unless configured. Anyone holding it can forge a session, and the placeholder in the sample config is published here — so a missing, short or placeholder key is replaced and written back |
+| Logout | ends that session immediately, and only that one. The identifier is recorded as revoked, because a signed cookie is self-contained and telling the browser to drop it leaves the value working. The record is in memory: a restart within ten minutes forgets it |
+| Password change | ends every **other** session at once. Each carries a fingerprint of the password hash it was issued under and is refused once that stops matching |
+| Recovery | none by design — no mail, no outside service. [Clear the password line]({{ '/docs/installation/first-run/' | relative_url }}#if-you-lose-the-password) on the host |
+| Second factor | mandatory, per the single account — [TOTP or a passkey, plus eight recovery codes]({{ '/docs/features/two-factor/' | relative_url }}). Enabling or disabling one ends every other session, the same way a password change does |
+
+With a second factor enrolled, the password step ends in a redirect, not a
+session. The second step is checked at `/login/verify`, in either order: a
+typed code, a recovery code, or a passkey assertion. That step has no rate
+limit of its own and does not need one. One intermediate state allows three
+attempts against the code field **or** the passkey button — the two share one
+counter — and a new intermediate state costs a password round. Five password
+rounds are allowed per ten minutes per address, so **fifteen attempts per ten
+minutes per address**, code and passkey combined, against a target that rotates
+every thirty seconds.
+
+That count is the server's, held in memory against a random identifier the
+intermediate cookie carries. Until 2.18 it lived in the cookie itself, so the
+three bound a browser that kept sending back what the server handed it. A
+client replaying one frozen cookie went on guessing. Nothing is written back to
+that cookie now, so there is nothing for a client to decline to keep. Each
+attempt is taken from the count before the code is checked, so attempts sent
+all at once get three checks between them, not one each.
+
+A restart empties the table, and a half-finished login then starts again with
+the full three. That direction is deliberate: forgetting costs an attacker one
+extra password round, and those are limited to five per ten minutes. Refusing
+instead would lock an operator out of their own firewall after a service
+restart.
+
+Both halves are held by tests. Three attempts end the attempt whichever door
+they came through, and the sixteenth in ten minutes does not get through.
+
+### What the sign-in limits cost
+
+Each limit closes a flood, and each has a price somebody else can make you pay.
+
+| Limit | Closes | The price |
+|---|---|---|
+| 5 attempts per 10 minutes, IPv6 per /64 | guessing; one host rotating through its /64 | whoever shares your /64, or your IPv4 address behind NAT, spends your budget |
+| One password hash at a time, 5 s wait | 64 MiB per attempt — ten at once took 668 MiB | a flood from many sources can keep the slot busy: your sign-in is answered `503` and still counts against your budget |
+| 65,536 sources tracked | memory chosen by strangers | while that many have tried in the last 15 minutes, a new source is answered `429` until one ages out. A source already tracked is unaffected |
+
+Nothing at the ceiling is let in by forgetting another source: that would
+hand an exhausted budget back to whoever sent from enough addresses.
+
+### Passkeys are a second factor, never a replacement
+
+A passkey is offered at `/login/verify`, after the password, exactly where the
+code field already is — never instead of it, and never in place of the
+password step. `POST /login/passkey/begin` and `/finish` both refuse without a
+`pendingLogin` behind them, the same guard `/login/verify` itself opens with:
+a stolen authenticator is not a login on its own. A challenge answers once:
+the server remembers the ones it has spent, so a captured assertion resent with
+its cookies is refused. Where an authenticator reports a signature counter that
+is checked too, and one that did not advance is refused as
+`passkey_clone_suspected`. Either is a failed attempt and never a lockout,
+since TOTP, a recovery code and another passkey are all still there. Most
+platform passkeys report no counter at all, so that second check is an extra
+rather than the guarantee.
+
+Mandatory since 2.18 means an upgrade with only a password meets the same gate
+a fresh first run does. Every authenticated route redirects to `/password`
+until a factor — TOTP or a passkey — is enrolled. Nothing about a passkey
+being available changes that; TOTP alone still satisfies the gate.
+
+A passkey can be unavailable, and the interface says which of three reasons is
+in the way rather than showing a control that fails silently in the browser:
+
+| Reason | Why |
+|---|---|
+| The demo | Anyone can open it, and a passkey left there would stay |
+| No `tls.hostname` | WebAuthn's Relying Party ID must be a registrable domain; an installation reached by its bare IP address has none |
+| A self-signed certificate | No browser trusts the pair easywall generates itself by default, and a ceremony begun anyway fails in the browser with a `SecurityError` the operator cannot act on |
+
+The eight recovery codes are unaffected by all three, and are issued whichever
+factor came first. They are the way in when a passkey cannot be offered at all.
+TOTP is not: an account whose only factor is a passkey never had one.
+
+### If the clock is wrong
+
+A code that will never verify does not have to end an enrolment attempt. The
+most common cause is a board with no real-time clock, still at whatever it
+booted to until NTP catches up. After one failed code, both the first-run
+wizard and `/password` offer a second way through. An explicit
+acknowledgement stores the secret already shown on screen and issues eight
+recovery codes, and the account is usable immediately. Until the clock is
+fixed, one of the eight codes is the way in; once it is, the authenticator
+already paired works and normal sign-in works again.
+
+This is gated on being the first factor. An operator who already has one is
+not locked out by a failed code on `/password` and can simply leave the
+page. The escape exists only for the account that cannot otherwise be used
+at all.
+
+## Panic mode
+
+Since 2.7, `easywall-core` puts the last confirmed rule set back into the kernel
+at startup. A reboot no longer empties the firewall the way it used to, and no
+longer works as an accidental way back in. `easywall-core panic` is the
+deliberate one that replaces it: a console command that takes the firewall down
+immediately, whether or not the web interface is reachable at all.
+
+It is a new way to disable the firewall, in full, from the console — and that
+belongs on this page whether or not it feels like a feature. Two things about it
+matter for the rest of this model:
+
+- **It survives a restart on purpose.** Panic mode is recorded in a marker file
+  and the startup restore refuses to run while it exists. Otherwise the next
+  reboot would put the very rules back that panic mode exists to remove.
+- **While the marker exists, an apply is refused and the acceptance rollback
+  stops at the kernel.** The stored rules are still reverted: an apply nobody
+  confirmed never gets to keep `Current`, or the next restore would install it
+  with no window of its own. The same holds when the core dies inside the
+  window: the next start reverts first ([recovery]({{ '/docs/features/recovery/' | relative_url }})). But the previous rules are not written back into a
+  table the console has deliberately torn down. That kernel half is the one place
+  in easywall where the central promise — every apply reverts itself unless you
+  confirm it — is switched off outright. That is because there is nothing
+  running to roll back onto. Both take effect the instant the marker is written and end the
+  instant `easywall-core resume` clears it.
+
+Ending panic mode is console-only, without exception: the banner the interface
+shows carries no button. A control there would let the process reachable from
+the network re-arm a firewall a human just disarmed at the machine — on
+purpose, possibly using a stolen session. Full detail, real output, and the
+marker's path: [Recovery & Panic Mode]({{ '/docs/features/recovery/' | relative_url }}).
+
+## Behind a reverse proxy
+
+easywall terminates TLS itself and does **not** believe `X-Forwarded-For` —
+unless the peer sending the request is on `trusted_proxies`. `trusted_proxies` is
+a list configured explicitly, never a boolean. easywall never believes
+`X-Real-IP`, `True-Client-IP` or `Forwarded`. A client that can set its own
+source address and is not on that list walks straight past the login rate limiter.
+
+| | |
+|---|---|
+| What stays authoritative | `r.RemoteAddr` — the actual TCP peer, unless it is a listed proxy |
+| The cost of an untrusted proxy | every request looks like it comes from the proxy, so the limit of five attempts per ten minutes is shared by everyone. One person getting it wrong repeatedly locks the rest out until it refills |
+| What to do about it | list the proxy in `trusted_proxies` — [Behind a reverse proxy]({{ '/docs/installation/reverse-proxy/' | relative_url }}) is the whole task, with nginx and Docker |
+
+This only affects the *login* limiter. The firewall's own protection modules count
+per source address in the kernel and are unaffected by any HTTP header.
+
+## Transport
+
+HTTPS only, TLS 1.2+. Without a configured certificate easywall generates a
+self-signed **ECDSA P-256** one into `ssl_dir`. It replaces that certificate
+once it comes within 30 days of expiry — checked at startup, and twice a day
+while the service is running. The certificate is read per handshake rather
+than once at startup, so a renewal takes effect without a restart. That
+matters for a service that may well outlive its own one-year certificate.
+
+A certificate you configure yourself is never overwritten. It is re-read when the file
+changes, so an ACME client renewing it in place needs no restart either.
+
+```toml
+[tls]
+cert = "/etc/letsencrypt/live/example.com/fullchain.pem"
+key  = "/etc/letsencrypt/live/example.com/privkey.pem"
+```
+
+### The one exception: ACME's port 80
+
+No other plaintext port is opened, but `tls.acme = true` opens one. A
+certificate authority proves you control `tls.hostname` by connecting to port
+80 over plain HTTP and reading back a token (HTTP-01). That is the inbound half.
+The outbound half — what easywall sends the authority, and when — is a row in
+[Every request that goes out](#every-request-that-goes-out) below.
+
+easywall's listener answers that one path and nothing else — 404 for
+everything else. It is deliberately not a second web interface, and
+deliberately not autocert's own default, whose fallback redirects to
+`https://host/` where easywall is not listening.
+
+It runs for as long as the service does, not only while a certificate is first
+being issued. Renewal happens on autocert's own schedule, and a listener that
+only exists for the first issuance has silently stopped working by the time a
+renewal needs it.
+
+Three things have to be true before that listener can answer at all, and
+easywall does none of them for you:
+
+1. `tls.hostname` resolves to this host from the public internet.
+2. The service can bind port 80. The packaged systemd unit grants exactly
+   `AmbientCapabilities=CAP_NET_BIND_SERVICE` for this; a unit built by hand
+   needs the same line.
+3. **Port 80 is open in your own easywall rules.** easywall will not open a
+   port by itself — a firewall that opens ports on its own initiative is not
+   one you can reason about. So this is the one precondition on this list
+   that is actually your job.
+
+   The System page reports whether it is, in your *live* rules, restricted or
+   not. A rule for 80 whose `sources` excludes the public internet does not
+   let the certificate authority in, even though the port is technically "in
+   your rules".
+
+   The report does not see everything that decides reachability, though. A
+   blocklist entry, a custom rule, or IPv6 mode = `block` can each keep a
+   certificate authority out even when the row says open. Let's Encrypt
+   prefers IPv6 when an AAAA record exists, and the report reads the ports
+   table only.
+
+A bind failure on port 80 is fatal to the whole interface, not only to ACME.
+`Start()` refuses rather than run with a configuration it cannot honor — the
+same choice this project already makes for a missing certificate file or
+missing templates. If something else already holds port 80 — nginx in front,
+another service — free it or turn `tls.acme` off. Nothing here retries in the
+background or falls back to serving without it.
+
+### The one place a string reaches a command
+
+Every typed rule reaches the kernel as a Go struct over netlink. **Custom rules are
+the exception**: the netlink library takes typed expressions rather than text, so a
+statement you write by hand is applied by putting
+`add rule inet easywall input <your rule>` into `nft -f -`. Saying "no subprocess
+in the apply path", as this page once did, was not true.
+
+| | |
+|---|---|
+| The risk | `nft` reads a newline and a semicolon as the end of one command and the start of the next, so a rule carrying either is a **second command run by the root daemon** |
+| Demonstrated | not theoretical — an imported rule containing a newline wrote into a neighbouring table on a real kernel |
+| The mitigation | both characters refused on save, on import, and again inside the core, by the same check |
+| Why on the *shape* | a check that parsed nftables would depend on nft's grammar, on a subprocess being available, and on the syntax-check wrapper happening to be balanced. This one depends on none of them |
+| Also bounded | 256 statements per check |
+
+What remains is what the feature is for: an operator with an account can write
+firewall rules, which is also true of every other page.
+
+### Nothing is loaded from a third party
+
+Fonts, stylesheet, icons and htmx are served by easywall itself, and the policy
+permits no external origin:
+
+```
+default-src 'self'; script-src 'self' 'nonce-<per-request>'; style-src 'self';
+font-src 'self'; img-src 'self' data:; connect-src 'self'
+```
+
+Two reasons, both practical. An administrative interface should not report a visit
+to anyone — the earlier build loaded its typefaces from Google Fonts, which did
+exactly that. And easywall often runs on hosts with no outbound route, where that
+request simply failed and left the typography broken on the machines the tool is
+built for.
+
+> **A constraint on contributions.** `style-src` has no `'unsafe-inline'`, so
+> assigning `element.style.*` from JavaScript, or letting a library inject a
+> `<style>` block, is blocked. Scripts toggle a class instead.
+
+### Every request that goes out
+
+Six, and this is the whole list.
+
+| | Destination | When | Carries | Default |
+|---|---|---|---|---|
+| Update check | `api.github.com` | once a day | nothing about you — a plain GET for the newest release | **on**, `update_check = false` removes it |
+| Installation count | `telemetry.wdkro.de` | once a day | a random identifier generated on your machine, and the version | **off** until you switch it on |
+| Notifications | **an address you choose** | when one of the four things you ticked happens, and whenever you press **Send a test** | the event, its detail, this host's name and the version | **off** until you set an address |
+| Feeds | each list you switch on, at the address the catalogue names, a country's on `raw.githubusercontent.com` — or **an address you choose** for an own feed | on the list's schedule, hourly to daily | nothing about you — a GET with the version in the User-Agent; to an own feed, the user and password you gave it | **off**, each one, until you switch it on |
+| Country lookup | `github.com`, which redirects to `release-assets.githubusercontent.com` — no other host, never over plain HTTP | once a day; after a failure, retried from an hour on | nothing about you — a GET with the version in the User-Agent | **on**, `country_lookup = false` removes it |
+| A certificate | the ACME directory, Let's Encrypt unless `acme_directory` names another | on first need, and again before expiry | the one name in `tls.hostname`, your agreement to the authority's subscriber terms, the public half of an account key made here, and `acme_email` if you set one | **off** until `acme = true` |
+
+Two run by default. Once a day the update check asks `api.github.com`, and the
+country lookup downloads ipverse's country list from `github.com` and
+`release-assets.githubusercontent.com` — after a failure, retried from an hour on. `update_check = false` and
+`country_lookup = false` in `web.toml` switch them off.
+
+The first five are not on the path of a page. On a host with no route out they
+simply fail, and nothing else changes. The exact request the count makes is printed
+verbatim under [Configuration]({{ '/docs/configuration/' | relative_url }}#counting-installations).
+
+**The certificate is not one of those.** It is on the path of every page, because
+it is what serves them. A host that cannot reach the authority goes on answering
+while the certificate cached in `<ssl_dir>/acme` is still valid — weeks, normally.
+It stops when there is nothing valid left to serve, and the first issuance is the
+unforgiving one: there is no cache yet. The inbound half of that exchange, and the port 80 bind that is
+fatal when it fails, are [above](#the-one-exception-acmes-port-80).
+
+The private half of the account key never leaves the host. What goes out is its
+public half, signing each request.
+
+> **The notification and an own feed are the two easywall cannot name at all.**
+> `api.github.com`, `telemetry.wdkro.de` and the catalogue's lists are fixed, and
+> the certificate authority is a default you may replace. Where a notification
+> goes is yours from the start, so nothing here can promise where it lands. Only
+> that it goes nowhere until you set an address, that redirects are refused, and
+> that the address is a credential. See
+> [Notifications]({{ '/docs/features/notifications/' | relative_url }}). An own
+> feed is held to `https://`, or `http://` to this host only; redirects are
+> refused there too, and its password is never shown back or logged. It is kept
+> in plain text in `<data_dir>/web/feed_fetch.json`, readable by the web user
+> alone, because the web process has to send it.
+
+> **Fixed in v2.4.0.** htmx was configured through a listener for an `htmx:config`
+> event, which htmx does not emit. So `allowEval` stayed at its default of `true`
+> and the script nonce was never applied. It goes through the
+> `meta[name=htmx-config]` tag now. Found by tightening `style-src`, which surfaced
+> an inline `<style>` block htmx had been injecting unnoticed.
+
+## What the audit log actually records
+
+One JSON object per line in `<log_dir>/audit.log`, rotated daily, 30 days kept:
+
+```json
+{"time":"2026-08-04T14:25:13Z","action":"apply_started","rule_type":"all","detail":"","user":"web"}
+{"time":"2026-08-04T14:25:43Z","action":"apply_accepted","rule_type":"all","detail":"","user":"web"}
+{"time":"2026-08-04T14:30:00Z","action":"apply_rolledback","rule_type":"all","detail":"timeout","user":"web"}
+```
+
+`user` is always `web`, whichever account signed in: the socket protocol carries
+no identity yet. It names the process, not the person — see the
+[roadmap]({{ '/docs/roadmap/' | relative_url }}).
+
+| Recorded | **Not** recorded |
+|---|---|
+| `apply_started` · `apply_accepted` · `apply_rolledback` · `apply_failed` | the source address of a change |
+| `rollback_failed` — new rules did not take *and* the old ones did not return | which account made the change |
+| `rules_saved` · `rules_imported` | |
+| `options_saved` · `settings_saved` · `system_saved` | |
+
+> **Since 2.8, logins are in the audit log.** Thirteen events: signed in,
+> sign-in failed, second factor failed, a recovery code used, sign-in attempts
+> blocked, and signed out. A factor switched on, off or regenerated, a passkey
+> used, enrolled or removed, and a passkey whose counter did not advance.
+> See [the thirteen login events]({{ '/docs/features/audit-log/' | relative_url }}#the-thirteen-login-events).
+> None of them carries colour: a sign-in does not move the firewall.
+
+Reading it: [Audit log]({{ '/docs/features/audit-log/' | relative_url }}).
+
+### Refused packets
+
+The Blocked page holds the source and destination address of every packet the
+enabled log switches refuse. That is personal data, so here is exactly where it
+lives:
+
+| | |
+|---|---|
+| Memory | easywall-core only, the last `entries` packets (20 000 by default), lost on restart |
+| Disk | **nothing, by default.** With `persist = true`: `/var/log/easywall/packets.log`, `0600 root` — it rewrites itself to the ring, oldest first out, once it holds more than twice `entries` lines, and needs no logrotate |
+| Leaves the host | never. The web process asks the core over the socket; nothing is sent anywhere |
+| Erase it | `systemctl stop easywall-core && rm /var/log/easywall/packets.log` — also the repair for a corrupt file: a line over 64 KiB stops the replay and the log falls back to memory-only until the file is removed and the core restarts |
+
+The country column is looked up in the copy of ipverse's list kept on this
+host; no address leaves it for that.
+
+Retention is bounded by count, not time: at the default sixty lines a minute,
+20 000 entries is about five and a half hours, and a flood shortens it.
+
+## The CVE that shaped this
+
+easywall v0.3.1 — Python, Flask, `iptables` — was archived in 2022 after a
+disclosure. Four root causes, and what replaced each:
+
+| v1 | v2 |
+|---|---|
+| Web process ran as root — one injection was full compromise | Web runs unprivileged; there is no kernel access to misuse |
+| `iptables` through `subprocess` with user-controlled strings | `google/nftables` over netlink — no shell, no argv |
+| File-based IPC with sentinel files — racy | A typed protocol over a Unix socket |
+| SHA-512 salted with the hostname — trivially reversed | Argon2id with a random 16-byte salt per password |
+
+## What this does not protect you from
+
+| | |
+|---|---|
+| A compromised root account | root owns the core |
+| A kernel nftables vulnerability | that is below easywall entirely |
+| An administrator writing a bad rule | the [audit log]({{ '/docs/features/audit-log/' | relative_url }}) records it; nothing prevents it |
+| Anyone holding `session_key` | it signs the cookies, so it *is* a login. Keep it out of backups you share |
+
+## Reporting a vulnerability
+
+**Not as a public issue.** Use
+[GitHub Security Advisories](https://github.com/jp1337/easywall/security/advisories/new)
+for private disclosure — see [SECURITY.md](https://github.com/jp1337/easywall/blob/main/SECURITY.md).
+Research is welcome and unpaid; with your consent, a responsible report is credited in
+the advisory and the release notes. Test on your own installation, never on someone else's.

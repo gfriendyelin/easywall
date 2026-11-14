@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="easywall">
+  <title>easywall</title>
+  <!-- Bond: running-bond masonry, three courses, seven stretchers.
+       Single colour by design — see DESIGN.md § Logo.
+       Standalone use (favicon, README, docs) picks up the theme below;
+       in-app use goes through a CSS mask, where only the shape matters. -->
+  <style>
+    .brick { fill: #0f1116; }
+    @media (prefers-color-scheme: dark) { .brick { fill: #f1f3f6; } }
+  </style>
+  <g class="brick">
+    <rect x="4.5" y="4" width="6.6" height="3.7" rx="0.9"/>
+    <rect x="12.9" y="4" width="6.6" height="3.7" rx="0.9"/>
+    <rect x="3" y="10.15" width="3.9" height="3.7" rx="0.9"/>
+    <rect x="8.7" y="10.15" width="6.6" height="3.7" rx="0.9"/>
+    <rect x="17.1" y="10.15" width="3.9" height="3.7" rx="0.9"/>
+    <rect x="4.5" y="16.3" width="6.6" height="3.7" rx="0.9"/>
+    <rect x="12.9" y="16.3" width="6.6" height="3.7" rx="0.9"/>
+  </g>
+</svg>

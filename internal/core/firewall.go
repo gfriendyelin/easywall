@@ -1,0 +1,1036 @@
+package core
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// Firewall orchestrates the full rule-application lifecycle:
+// backup → apply → acceptance window → commit or rollback.
+type Firewall struct {
+	cfg        *Config
+	nft        *NftablesManager
+	rules      *RulesStore
+	acceptance *Acceptance
+
+	shrink map[string]shrinkWatch // UpdateFeed only, under the apply slot
+
+	// applyMu guards applying, which records that a cycle is running.
+	//
+	// This was a plain mutex that Apply held for the whole cycle, so a second
+	// apply did not fail — it *waited*, for as long as the acceptance window had
+	// left. See ErrApplyInProgress for what that cost.
+	applyMu  sync.Mutex
+	applying bool
+
+	// lastApplyMu guards lastApply, deliberately separate: a cycle runs for the
+	// whole acceptance window — up to an hour — and the dashboard polls Status
+	// throughout exactly that window. Sharing one lock would make the status
+	// page hang for the entire time it matters most.
+	lastApplyMu sync.Mutex
+	lastApply   time.Time
+
+	// bootBridgesMu guards bootBridges, which has exactly one writer and one
+	// reader in different goroutines. RestoreCurrent writes it while holding the
+	// apply slot; reconcileDockerBridges only ever reads it, from the goroutine
+	// Daemon.Start launches — twice, once before its loop and once per tick, and
+	// it deliberately does not write the field at all (dockerreconcile.go says
+	// why). So this is a plain data race on a slice header and nothing more: no
+	// read-then-write pair anywhere holds this lock across two operations, and an
+	// earlier version of this comment claiming "a lock held across the
+	// read-then-write in the reconciler's loop" described a mechanism that does
+	// not exist.
+	//
+	// Neither existing lock fits. applyMu's scope is "is a cycle running",
+	// answered without waiting; lastApplyMu's is kept deliberately short so the
+	// dashboard's Status calls never wait on an apply in flight, and bootBridges
+	// has nothing to do with that promise. A field this narrow gets a lock this
+	// narrow.
+	//
+	// The overlap is real now, which it was not when the lock was added: RESUME
+	// is wired to the socket (daemon.go's CmdResume case), so a Resume can reach
+	// RestoreCurrent's write at any moment, including while the reconciler is
+	// still polling.
+	bootBridgesMu sync.Mutex
+	// bootBridges records the Docker bridge networks the most recent restore
+	// baked into the rules — not only the boot one. RestoreCurrent is shared
+	// with Resume, so this is overwritten on every restore, whichever reason
+	// triggered it. It exists so reconcileDockerBridges can tell "none yet"
+	// from "none at all" the one time it checks, right after the boot restore.
+	// See dockerreconcile.go.
+	bootBridges []string
+
+	// panicMu serialises Panic and Resume against each other.
+	//
+	// They are the two console commands that write the marker, and they were
+	// racing on it. Panic writes the marker and then tears the table down;
+	// Resume clears the marker and then restores. A Resume landing between
+	// Panic's EngagePanic and its nft.Reset leaves exactly the state neither
+	// command can produce on its own: no marker, and an empty table. The machine
+	// is unfiltered, nothing on it records that anybody chose that, and the next
+	// boot restores the rules as though nothing had happened.
+	//
+	// Not applyMu: Panic deliberately does not take the apply slot, because it
+	// has to interrupt a cycle that already holds it — that is the whole point
+	// of a panic button. This lock is only ever held for the length of one of
+	// these two commands, and nothing inside either reaches back for it.
+	panicMu sync.Mutex
+
+	// reconcilePoll and reconcileWait bound that watch. Fields rather than
+	// constants so the tests do not take ninety seconds.
+	reconcilePoll time.Duration
+	reconcileWait time.Duration
+
+	// appliedConfigErrMu guards appliedConfigLastErr, which appliedConfig uses
+	// to log a corrupt snapshot once per distinct error rather than on every
+	// read. Status calls appliedConfig, and /apply polls Status every 2s, so an
+	// unparsing file that never changes would otherwise fill the journal with
+	// the same line for as long as the page stays open.
+	appliedConfigErrMu   sync.Mutex
+	appliedConfigLastErr string
+
+	// usage owns DataDir/usage.json: what each rule has carried, and the
+	// persisted baseline the next delta is measured from. Written by the ticker
+	// Daemon.Start launches and by apply(), read by GET_USAGE.
+	usage *UsageStore
+
+	// stamp owns DataDir/selftest.json: what the self-test last proved, and
+	// against which version and kernel. Read by Health, written by the proof.
+	// Never nil — NewFirewall always builds one, and Read answers a missing
+	// file with the zero stamp, which is what an installation whose proof has
+	// not run looks like.
+	stamp *StampStore
+
+	// feeds owns DataDir/feeds.json, the core's copy of every feed. Every
+	// kernel write loads the enabled feeds' sets from it; see feedContents.
+	feeds *FeedStore
+}
+
+// ErrApplyInProgress is returned when an apply is asked for while a cycle is
+// already running.
+//
+// It used to be queued instead. Apply serialised on a mutex it holds for the
+// whole acceptance window, so a second APPLY_RULES sat in that lock until the
+// first window closed and then ran on its own. Two consequences, both measured
+// against a real kernel:
+//
+//   - The queued apply promoted the staged set again the instant the first one
+//     rolled back. An operator whose rules cut their connection, who waited out
+//     the window to get back in, was cut off again by an apply nobody
+//     re-requested. That is the product's central promise running backwards.
+//   - Stop cancels the window that is open, not the ones queued behind it. Four
+//     APPLY commands made shutdown wait three further full windows: 6.1 s at a
+//     2 s window, and six minutes at the shipped 120 s default — past systemd's
+//     90 s TimeoutStopSec, after which SIGKILL leaves the unconfirmed rules live
+//     and no rollback runs at all.
+//
+// The web interface hides the Start button while a window is open, which is why
+// this went unnoticed; a second tab, a double-click before the redirect lands,
+// or the back button all still reach the endpoint, and the privileged side does
+// not get to depend on the browser hiding a control.
+var ErrApplyInProgress = errors.New(shared.ErrApplyInProgressText)
+
+// ErrPanicEngaged is returned when an apply is asked for while panic mode is
+// engaged.
+//
+// beginApply claims the slot before this is checked, so a refused apply still
+// releases it immediately — nothing is left holding it open. The check has to
+// live in apply, not Apply: the daemon calls beginApply() and then apply()
+// directly (see dispatch's CmdApplyRules case), so a guard only on the
+// exported wrapper would never run on the path a real request actually takes.
+//
+// This is what makes Panic's refusal to be undone by the browser. Nothing
+// stops an operator's other browser tab, or a request queued before they ran
+// `panic` at the console, from reaching this function afterwards; without the
+// check it would re-open the table the console just closed, which is exactly
+// the outcome panic mode exists to rule out.
+var ErrPanicEngaged = errors.New(shared.ErrPanicEngagedText)
+
+// beginApply claims the right to run one apply cycle, reporting false when one
+// is already running. endApply releases it.
+//
+// A flag rather than a mutex because the answer has to be available *without*
+// waiting: the caller's job is to tell the operator whether their apply
+// started, and "it will start in an hour" is not one of the answers.
+func (f *Firewall) beginApply() bool {
+	f.applyMu.Lock()
+	defer f.applyMu.Unlock()
+	if f.applying {
+		return false
+	}
+	f.applying = true
+	return true
+}
+
+func (f *Firewall) endApply() {
+	f.applyMu.Lock()
+	f.applying = false
+	f.applyMu.Unlock()
+}
+
+// NewFirewall creates a Firewall with all sub-components initialised.
+func NewFirewall(cfg *Config) (*Firewall, error) {
+	nft, err := NewNftablesManager()
+	if err != nil {
+		return nil, fmt.Errorf("init nftables: %w", err)
+	}
+
+	store, err := NewRulesStore(cfg.RulesPath())
+	if err != nil {
+		return nil, fmt.Errorf("init rules store: %w", err)
+	}
+
+	f := &Firewall{
+		cfg:           cfg,
+		nft:           nft,
+		rules:         store,
+		acceptance:    NewAcceptance(cfg.AcceptanceDuration()),
+		reconcilePoll: 2 * time.Second,
+		reconcileWait: 90 * time.Second,
+		usage:         NewUsageStore(cfg.UsagePath()),
+		stamp:         NewStampStore(cfg.SelftestStampPath()),
+		feeds:         NewFeedStore(cfg.FeedsPath()),
+	}
+	f.lastApply = readLastApply(cfg.LastApplyPath())
+	return f, nil
+}
+
+// readLastApply loads the recorded time of the last accepted apply. A missing
+// or unreadable file means "not known", which is what a fresh install is.
+//
+// O_NOFOLLOW: the parse error below quotes what it read, so a link planted in
+// place of this file would copy the start of any file root can read into the
+// journal. Nothing can plant one in the 2.22 layout; this keeps it that way on
+// a layout the package does not control.
+//
+// O_NONBLOCK, and the Stat check below: a FIFO planted in this name would
+// otherwise block this call — and the core with it — forever.
+func readLastApply(path string) time.Time {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0) // #nosec G304 -- path is built from the daemon's own config
+	if err != nil {
+		return time.Time{}
+	}
+	if info, err := f.Stat(); err != nil || !info.Mode().IsRegular() {
+		_ = f.Close()
+		return time.Time{}
+	}
+	data, err := io.ReadAll(f)
+	_ = f.Close()
+	if err != nil {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, strings.TrimSpace(string(data)))
+	if err != nil {
+		slog.Warn("ignoring unreadable last-apply marker", "path", path, "error", err)
+		return time.Time{}
+	}
+	return t
+}
+
+// setBootBridges records the Docker bridges an apply just baked into the
+// rules, so reconcileDockerBridges can compare against them later. Guarded by
+// bootBridgesMu — see the comment on that field for why it is not applyMu or
+// lastApplyMu.
+func (f *Firewall) setBootBridges(bridges []string) {
+	f.bootBridgesMu.Lock()
+	f.bootBridges = bridges
+	f.bootBridgesMu.Unlock()
+}
+
+// getBootBridges returns what setBootBridges last recorded.
+func (f *Firewall) getBootBridges() []string {
+	f.bootBridgesMu.Lock()
+	defer f.bootBridgesMu.Unlock()
+	return f.bootBridges
+}
+
+// setLastApply records the time of an accepted apply, in memory and on disk.
+func (f *Firewall) setLastApply(t time.Time) {
+	f.lastApplyMu.Lock()
+	f.lastApply = t
+	f.lastApplyMu.Unlock()
+
+	path := f.cfg.LastApplyPath()
+	// Not fatal: the rules are applied and accepted either way. The dashboard
+	// will just show "never" again after a restart.
+	if err := writeLastApply(path, t); err != nil {
+		slog.Warn("could not record last apply time", "path", path, "error", err)
+	}
+}
+
+// writeLastApply writes the marker atomically — a temporary file, then a
+// rename — like every other file the core keeps in data_dir.
+//
+// It was the one os.WriteFile among them, and os.WriteFile follows a symlink.
+// Until 2.22 data_dir was root:easywall 0770, so the web user could put
+// `last_apply -> /etc/shadow` there and the next accepted apply had root write
+// a timestamp into the target: a root write to any file, driven by the
+// network-facing process. CreateTemp opens with O_EXCL, which never follows a
+// link, and rename replaces a link rather than writing through it.
+//
+// 0600 — CreateTemp's own mode — for the same reason as the audit log: only
+// this process reads it; the dashboard's "last apply" comes over the socket.
+func writeLastApply(path string, t time.Time) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "last_apply-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.WriteString(t.UTC().Format(time.RFC3339)); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// Apply starts a full rule-application cycle.
+// It blocks until the acceptance window completes (accepted or timed out).
+//
+// A second Apply arriving while one is running is refused with
+// ErrApplyInProgress rather than queued behind the open window — read the note
+// on that error before changing it back.
+func (f *Firewall) Apply(user string) error {
+	if !f.beginApply() {
+		return ErrApplyInProgress
+	}
+	defer f.endApply()
+	return f.apply(user)
+}
+
+// apply runs the cycle. The caller must already hold the slot from beginApply,
+// which is why this is separate: the daemon has to claim the slot
+// *synchronously*, so it can answer the request truthfully, and only then hand
+// the cycle itself to a goroutine.
+func (f *Firewall) apply(user string) error {
+	// The marker outranks the slot. beginApply only proves nobody else is
+	// mid-cycle; it says nothing about whether the console has taken the
+	// firewall down since. Checking here, inside the function every real
+	// request path reaches, means a request that arrived before `panic` ran,
+	// one queued in another tab, or a client that simply has not been told
+	// yet all land on the same refusal rather than three different races
+	// against Reset().
+	if f.PanicEngaged() {
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_refused_panic", "all",
+			"an apply was refused because panic mode is engaged at the console", user)
+		slog.Warn("apply refused: panic mode is engaged", "user", user)
+		return ErrPanicEngaged
+	}
+
+	// Before anything else this function does, because everything it does next
+	// leads to a kernel write that zeroes every counter. The rules file reads,
+	// the snapshot and the promote all sit between here and nft.Apply, and none
+	// of them touches the kernel — so this is as late as it can be read and as
+	// early as it needs to be.
+	f.collectUsageBeforeWrite()
+
+	slog.Info("starting rule apply", "user", user)
+
+	state, err := f.rules.GetState()
+	if err != nil {
+		// The audit log is what the operator looks at when the interface says
+		// the firewall is off; a failure that only reaches the journal is invisible.
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_failed", "all", err.Error(), user)
+		return fmt.Errorf("get rules: %w", err)
+	}
+
+	// 1. Backup current rules (for rollback)
+	if err := f.rules.BackupCurrent(); err != nil {
+		// Audited, like the GetState above it. This is the step that makes the
+		// rollback possible at all: failing here means the apply below would have
+		// had nothing to go back to, and an operator reading the log has to be
+		// able to see that the cycle stopped before anything was risked.
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_failed", "all",
+			"the current rules could not be backed up, so nothing was applied: "+err.Error(), user)
+		return fmt.Errorf("backup rules: %w", err)
+	}
+
+	// 2. Take nftables snapshot for emergency recovery
+	snap, err := f.nft.Snapshot()
+	if err != nil {
+		slog.Warn("could not take nftables snapshot", "error", err)
+	} else if f.cfg.LogDir != "" {
+		_ = SaveSnapshot(f.cfg.LogDir, snap)
+	}
+
+	// One snapshot of the configuration for the whole apply, so the rules that
+	// reach the kernel describe a single configuration rather than whatever each
+	// field happened to hold as it was read — and so recordAppliedConfig below
+	// records exactly what nft.Apply was given, not whatever f.cfg holds by the
+	// time it runs. The acceptance switch is read from the same snapshot, for
+	// the same reason, and before the promote, because it decides whether the
+	// promote is provisional.
+	opts, nets := f.cfg.FirewallOptions(), f.cfg.NetworkSettings()
+	acceptanceOn := f.cfg.SystemSettings().Acceptance.Enabled
+
+	// What a rollback goes back to, for the configuration half: the snapshot of
+	// what is live now, before this apply writes anything. BackupCurrent above
+	// is the rules half. Every rollback used to rebuild the table from f.cfg,
+	// which already held the change under trial, so an options or network
+	// change survived the rollback it had caused. See configToRestore.
+	before := f.appliedConfig()
+
+	// 3. Promote staged → current in state — provisionally, when a window will
+	// judge it. The marker goes down first, so there is no instant at which the
+	// file holds an unconfirmed Current that a restart would mistake for a
+	// confirmed one. See unconfirmed.go.
+	if acceptanceOn {
+		if err := markUnconfirmed(f.cfg.UnconfirmedMarkerPath(), before); err != nil {
+			WriteAuditLog(f.cfg.AuditLogPath(), "apply_failed", "all",
+				"the apply could not be marked unconfirmed, so nothing was applied: "+err.Error(), user)
+			return fmt.Errorf("mark apply unconfirmed: %w", err)
+		}
+	}
+	if err := f.rules.PromoteStaged(); err != nil {
+		// Nothing was promoted, so there is nothing for a restart to revert.
+		clearUnconfirmed(f.cfg.UnconfirmedMarkerPath())
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_failed", "all",
+			"the staged rules could not be promoted, so nothing was applied: "+err.Error(), user)
+		return fmt.Errorf("promote staged rules: %w", err)
+	}
+
+	updatedState, err := f.rules.GetState()
+	if err != nil {
+		// The promote above succeeded, so the stored Current is already the set
+		// this apply was trying out — and this return leaves it there. The entry
+		// says so, because "nothing was applied" would be false: nothing reached
+		// the kernel, and the file did change. The unconfirmed marker stays
+		// with it, so the next restore puts Backup back rather than enforce it.
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_failed", "all",
+			"the rules could not be re-read after promoting them; nothing reached the "+
+				"kernel, and the stored rules now hold the set this apply was trying: "+err.Error(), user)
+		return fmt.Errorf("re-read rules after promote: %w", err)
+	}
+
+	// 4. The acceptance window opens *before* the kernel write.
+	//
+	// acceptance.enabled was never read until 2.5.0. The system settings page
+	// offers the switch and documents "Off — an apply is final. There is no
+	// automatic way back", but the window ran regardless: an operator who
+	// deliberately turned it off, on a machine they can physically reach, still
+	// had the change rolled out from under them when the timer expired.
+	//
+	// The order here is the fix 2.14 shipped. Start's doc comment has always
+	// said "It must be called before nftables rules are applied" and the call
+	// site did the opposite, leaving a gap — a panic-marker stat, an
+	// applied-config write, a settings read, an audit write — during which the
+	// kernel held unconfirmed rules while Status() answered idle and the
+	// interface showed no window at all. The consequence of the move, stated
+	// plainly: the kernel write and the two file writes are now inside the
+	// window rather than before it. Milliseconds on a fast host, perhaps a
+	// second or two of 120 on an SD card. That is the right direction — the
+	// moment an operator can be locked out is the moment the rules land, not
+	// the moment the bookkeeping finishes.
+	if acceptanceOn {
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_started", "all", "", user)
+		if err := f.acceptance.Start(f.cfg.AcceptanceDuration()); err != nil {
+			// Unreachable today — Start returns nil on every path — and it is
+			// guarded anyway, because what it would leave behind is the 2.7
+			// lockout chain reached by a different door. PromoteStaged has run,
+			// so the stored Current is a set nobody confirmed; the kernel has not
+			// been written, so the machine is still enforcing the old rules. Leave
+			// the file as it is and the next boot or `resume` installs the
+			// unconfirmed set with no acceptance window, because RestoreCurrent's
+			// whole justification is that Current already survived one.
+			//
+			// rollback puts Current back and, since nothing was written, its
+			// kernel half simply rewrites the rules already in force.
+			WriteAuditLog(f.cfg.AuditLogPath(), "apply_failed", "all",
+				"the acceptance window could not be opened, so nothing was applied: "+err.Error(), user)
+			f.rollback(state, before, user)
+			return err
+		}
+		// Registered where the window opens, not after Wait returns. Everything
+		// between the two is now real work — the kernel write, the panic-marker
+		// check, the applied-config write — and the apply goroutine's recover()
+		// in daemon.go logs and returns without touching acceptance. Start arms
+		// no timer of its own, so a panic in that span would leave the status
+		// Pending with nothing left to roll it back: the interface counts down
+		// forever, and the next apply is poisoned too, because Start is
+		// idempotent on Pending and its Wait then sees a deadline already past.
+		//
+		// Only a window still Pending, though. This was an unconditional
+		// Reset(), so the outcome Wait had just recorded — accepted, or
+		// rolled_back with its reason — was idle again the instant apply
+		// returned. Visible for milliseconds: the notifier, which polls every
+		// 15 s, never saw either, so notify_on_accepted and
+		// notify_on_rolled_back never fired, and the interface's
+		// rolled-back wording never showed outside the demo. The outcome now
+		// stands until the next Start.
+		defer func() {
+			if f.acceptance.Status() == shared.AcceptancePending {
+				f.acceptance.Reset()
+			}
+		}()
+	}
+
+	// 5. Apply new rules to kernel
+	if err := f.nft.ApplyWithFeeds(updatedState, opts, nets, f.feedContents(updatedState.Current)); err != nil {
+		// The window is open and nothing will ever confirm it. Without this the
+		// status stays pending for the full duration on a machine whose apply
+		// failed and was rolled back on the next line, and the interface counts
+		// down towards a rollback that has already happened.
+		f.acceptance.Reset()
+
+		// Rule application failed — roll back immediately without waiting
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_failed", "all", err.Error(), user)
+		// The marker before the rollback, on the failure path too. nft.Apply can
+		// return an error with real rules live in the kernel — the custom-rules
+		// subprocess and the final-log flush both fail after the ruleset has been
+		// committed — so a panic landing here without this check left the marker
+		// on disk, the machine filtering, and nothing to take it down. Running it
+		// before rollback also matters: rollback then sees the marker and leaves
+		// the kernel alone rather than writing the previous rules on top of a
+		// teardown, which is the guard F1 rests on.
+		f.panicLandedDuringWrite(
+			f.PanicEngaged(),
+			"apply_refused_panic",
+			"panic mode was engaged while a failing apply was writing, and rules can "+
+				"reach the kernel before nft.Apply reports an error",
+			user,
+		)
+		f.rollback(state, before, user)
+		return fmt.Errorf("apply nftables rules: %w", err)
+	}
+
+	// The table has been rebuilt, so every baseline in usage.json describes
+	// counters that no longer exist. After the call and not before it: nft.Apply
+	// returns before touching the table when ValidateRules refuses, and a
+	// baseline zeroed there would re-book the whole lifetime of every live rule
+	// at the next collect.
+	//
+	// On this branch only, and Amendment A4's own wording — "after the call, both
+	// outcomes are a rebuilt table" — was wrong about why. nft.Apply's error is
+	// two different situations: a refusal before the table is touched, where a
+	// reset would re-book every rule's whole lifetime, and a failure after the
+	// ruleset is committed, where the table *has* been rebuilt. They want
+	// opposite things and the error does not distinguish them, so the reset stays
+	// on the success path. What covers the post-commit case is that the error
+	// branch above calls f.rollback, whose own write resets the baselines as its
+	// last step — and behind that, Collect's below-baseline branch, which books a
+	// counter that restarted under it in full.
+	//
+	// A ticker tick can be mid-collect right here, having queued on the nft
+	// mutex behind the write above — see resetUsageBaselines' own comment for
+	// what that costs and why it is accepted rather than locked away.
+	f.resetUsageBaselines()
+
+	// The marker again, now that the rules are actually in the kernel. The check
+	// at the top of this function was made before two rules-file reads, two
+	// atomic rewrites and a full Snapshot(); `panic` can have landed anywhere in
+	// that gap, including through the CLI's own teardown while this daemon's
+	// socket was not yet listening — see panicLandedDuringWrite.
+	if f.panicLandedDuringWrite(
+		f.PanicEngaged(),
+		"apply_refused_panic",
+		"panic mode was engaged while this apply was being written",
+		user,
+	) {
+		// The file half matters as much as the kernel half. PromoteStaged above
+		// has already made Current the set this apply was trying out, and
+		// nobody has confirmed it — leaving it there is what would be restored,
+		// with no acceptance window, at the next boot or resume. rollback puts
+		// Current back and, because the marker is set, leaves the kernel down.
+		//
+		// The window opened above; close it before rolling back, or the status
+		// counts down on a machine the console has already taken down.
+		f.acceptance.Reset()
+		f.rollback(state, before, user)
+		return ErrPanicEngaged
+	}
+
+	// What the expression check found about the rules that just went in, if it
+	// found anything. checkBuilt never refuses a write — a layer that stops
+	// filtering when it is unsure is the failure everConfigured exists to avoid
+	// — so it logs to the journal and degrades the health state, and until this
+	// entry the audit log, which is the record an operator greps after an
+	// incident, said the apply had simply succeeded.
+	//
+	// After the panic check, for the same reason recordAppliedConfig is: a
+	// teardown means nothing went in, so there is nothing in the kernel for a
+	// finding to be about.
+	//
+	// Not covered by a test at this call site, and stated rather than left to be
+	// discovered: f.nft is a concrete *NftablesManager, and Apply cannot reach
+	// this line without a kernel to flush to, so deleting the call below turns
+	// nothing red under `go test ./internal/...`. What is covered is the
+	// function — TestAuditBuildFindings pins the entry, its detail and the
+	// omission when there is nothing to report.
+	//
+	// Closing the call site itself needs a finding to exist during a real
+	// apply, which needs a deliberately broken builder — a mutation, not a
+	// test that could live in this package. Left this way rather than chased.
+	auditBuildFindings(f.cfg.AuditLogPath(), f.nft.LastFindings(), user)
+
+	// The kernel has the rules; record the configuration that went in with them.
+	// After the panic check above, because a teardown means nothing went in.
+	// opts and nets are the values nft.Apply was actually given, not a fresh
+	// read of f.cfg — see recordAppliedConfig's own comment.
+	f.recordAppliedConfig(opts, nets)
+
+	// 6. Wait out the window, unless it was switched off above.
+	if !acceptanceOn {
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_started", "all",
+			"acceptance window disabled — applied without confirmation", user)
+		f.setLastApply(time.Now())
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_accepted", "all",
+			"no confirmation required", user)
+		slog.Info("rules applied; acceptance window is disabled", "user", user)
+		return nil
+	}
+
+	accepted := f.acceptance.Wait()
+
+	if !accepted {
+		// Read right where the literal used to sit: Reason() is either what Start
+		// set ("timeout") or what a cancel overwrote it to before waking Wait up
+		// (operator, panic mode, core stopped). Nothing races this read — it
+		// stays here, next to the write, so the two obviously agree.
+		reason := f.acceptance.Reason()
+		slog.Warn("acceptance ended without confirmation — rolling back", "reason", reason)
+		WriteAuditLog(f.cfg.AuditLogPath(), "apply_rolledback", "all", reason, user)
+		f.rollback(state, before, user)
+		return nil
+	}
+
+	// Confirmed: Current is no longer provisional.
+	clearUnconfirmed(f.cfg.UnconfirmedMarkerPath())
+	f.setLastApply(time.Now())
+	WriteAuditLog(f.cfg.AuditLogPath(), "apply_accepted", "all", "", user)
+	slog.Info("rules applied and accepted", "user", user)
+	return nil
+}
+
+// rollback restores the rule set that was in force before this apply.
+//
+// Both callers previously discarded its errors with `_ =`, which made the worst
+// outcome the quietest one: an apply that failed *and* whose rollback failed
+// left the host with whatever half-state the kernel had, and the only record
+// was the original error. A failed rollback gets its own audit entry, because
+// it is the line an operator needs to find first.
+//
+// before is the configuration snapshot that was live when the apply began; the
+// kernel half rebuilds with it and records it, so the rules and the options go
+// back together. See configToRestore.
+func (f *Firewall) rollback(previous shared.RulesState, before shared.AppliedConfigResult, user string) {
+	var failures []string
+
+	// The rules file is reverted first, and unconditionally. Panic mode does
+	// not get a say in it — read the next paragraph before adding one, because
+	// this used to be a single early return above this line and it broke the
+	// invariant the whole 2.7 release stands on.
+	//
+	// What went wrong: an apply cuts the operator's own SSH. BackupCurrent puts
+	// the last confirmed set in Backup, PromoteStaged makes Current the
+	// *unconfirmed* set, and the window opens. The operator reaches the console
+	// and runs `panic`: the marker goes on disk, the window is cancelled, the
+	// table comes down. Wait() returns false, so the apply calls this function
+	// to undo itself — and the old guard returned here, before the file was
+	// touched. Current was left holding a set nobody ever confirmed, Staged
+	// equalled it so HasPendingChanges reported nothing outstanding, and the
+	// next `resume` installed that set with no acceptance window, because
+	// RestoreCurrent's whole justification is that Current has already survived
+	// one. It had not. The operator was locked out again with every escape gone:
+	// a reboot now restores, a restore opens no window, and an apply is refused
+	// while the marker is there, so the staged correction could not be applied
+	// either.
+	//
+	// RulesStore.Rollback is a pure file operation — state.Current =
+	// state.Backup and an atomic rewrite. It cannot fight Panic's teardown,
+	// because it never speaks to the kernel. Only f.nft.Apply below can, so
+	// only f.nft.Apply is guarded.
+	// revertErr is kept rather than only logged: the rollback_skipped entry below
+	// reports what the revert did, and it cannot do that from a message that has
+	// already gone to the journal.
+	revertErr := f.rules.Rollback()
+	if revertErr != nil {
+		slog.Error("rollback rules file failed", "error", revertErr)
+		failures = append(failures, "rules file: "+revertErr.Error())
+	} else {
+		// Current is the confirmed set again. On a failed revert the marker
+		// stays, so the next restore tries again rather than enforce the
+		// unconfirmed set.
+		clearUnconfirmed(f.cfg.UnconfirmedMarkerPath())
+	}
+
+	// The check that makes Panic's marker authoritative rather than advisory,
+	// for the kernel half only.
+	//
+	// Panic does not take the apply slot — it has to be able to interrupt a
+	// cycle that already holds it, from the console, which is the whole point
+	// of a panic button. That leaves this as the only place left to stop an
+	// apply's rollback from flushing the previous rules back into the kernel
+	// on top of the teardown Panic just did: cancelling the acceptance window
+	// is what *starts* the rollback (Wait() sees the cancel and returns
+	// false), not what stops it. Refusing here, on the current state of the
+	// marker rather than on anything decided earlier in the cycle, is also
+	// what catches the slower variant: Panic landing between beginApply and
+	// acceptance.Start, where CancelAcceptance has nothing pending to cancel
+	// and the window still runs its full length before rollback is ever
+	// called.
+	//
+	// PanicState, not PanicEngaged, and the difference is the point.
+	// PanicEngaged answers "cannot read the marker" with "engaged", which is
+	// the safe default for a caller about to start filtering and the unsafe one
+	// here: it would withdraw the acceptance window's automatic undo — the
+	// promise this product is built around — because of a permission fault on
+	// the data directory, and record it as though somebody had chosen it at the
+	// console. When the state is unknown this rollback goes ahead, exactly as
+	// it did before panic mode existed. The loud report belongs at startup,
+	// once, where an operator can act on it (see Daemon.Start), not in the
+	// middle of the one operation that must not be second-guessed.
+	engaged, known, markerErr := PanicState(f.cfg.PanicMarkerPath())
+	if !known {
+		slog.Error("cannot tell whether panic mode is engaged; rolling back anyway, "+
+			"because withdrawing the acceptance window's automatic undo on an "+
+			"unreadable marker is the worse failure",
+			"marker", f.cfg.PanicMarkerPath(), "error", markerErr)
+	}
+	if engaged && known {
+		// What this function did, not what the kernel now holds, in both clauses.
+		//
+		// The second clause used to assert "the kernel was left torn down" — a
+		// claim about Panic's teardown rather than about anything observed here,
+		// and false whenever that Reset() failed. The first clause had the same
+		// defect one line earlier: it said the stored rules *were* reverted, when
+		// f.rules.Rollback() above can fail, and its error went only into the
+		// separate rollback_failed entry. The log then carried two entries for one
+		// event of which one lied, and the lying one was the entry that explains
+		// why the rollback did what it did.
+		reverted := "the stored rules were reverted to the set in force before this apply"
+		if revertErr != nil {
+			reverted = "the stored rules could not be reverted (" + revertErr.Error() +
+				"), so Current still holds the set this apply promoted"
+		}
+		WriteAuditLog(f.cfg.AuditLogPath(), "rollback_skipped", "all",
+			"panic mode is engaged ("+f.cfg.PanicMarkerPath()+"): "+reverted+
+				", and nothing was written to the kernel — the table is in whatever "+
+				"state panic mode left it", user)
+	} else {
+		// The counters, before the write below flushes them — and this is the
+		// case that matters most, because it is every unconfirmed apply. The
+		// sequence is: a tick books at T+0, an operator applies at T+2min
+		// (apply's own collect and baseline reset both run), the window expires
+		// at T+4min, and this rollback rebuilds the table. Without this call the
+		// traffic of those two minutes is gone, and on a port whose only use was
+		// in that window the interface then says "never" and the dashboard counts
+		// it unused for thirty days — advice to close a port that is in use, one
+		// missing call away from the collect written to prevent exactly that.
+		f.collectUsageBeforeWrite()
+
+		var applyErr error
+		var opts shared.FirewallOptions
+		var nets shared.NetworkSettings
+		firstApply := !f.everConfigured(previous)
+		if firstApply {
+			// Nothing has ever been applied here, so "back to where you were"
+			// is "not filtering" — not an empty rule set at policy drop, which
+			// closes SSH and the web interface with it. restore.go:98 already
+			// refuses to enforce an empty set at boot for exactly this reason;
+			// this is the same refusal on the path that runs when an operator
+			// is already in trouble.
+			//
+			// An operator who deliberately applied an empty set is unaffected:
+			// that installation has a last-apply marker, so everConfigured is
+			// true and the rules below are restored as before.
+			slog.Warn("the acceptance window closed on the first apply this installation " +
+				"has ever made; taking the table down rather than enforcing an empty " +
+				"rule set, which would close SSH and the web interface with it")
+
+			// The entry is written after the teardown and says what the teardown
+			// did, which is the shape panicLandedDuringWrite already uses and the
+			// defect the panic branch forty lines above records having fixed
+			// once: an entry asserting "the table was taken down" is false
+			// whenever that Reset() failed, and it is the entry an operator reads
+			// to find out what the rollback did. A failed teardown here is the
+			// worst outcome on this path — the host is still at policy drop with
+			// no port open — so it takes boot_enforce_failed, the crit action the
+			// restore path already uses for a teardown that could not be carried
+			// out, rather than a neutral one coloured by which branch reached it.
+			// Recorded below as before this fix: the live config, since there
+			// is no earlier configuration to go back to.
+			opts, nets = f.cfg.FirewallOptions(), f.cfg.NetworkSettings()
+			action := "boot_not_configured"
+			detail := "the first apply was not confirmed; the table was taken down and " +
+				"this host is not filtering — open the interface and apply again"
+			applyErr = f.nft.Reset()
+			if applyErr != nil {
+				action = "boot_enforce_failed"
+				detail = "the first apply was not confirmed and the table could not be " +
+					"taken down (" + applyErr.Error() + "), so this host is filtering an " +
+					"empty rule set at policy drop — run `nft delete table inet easywall`"
+			}
+			WriteAuditLog(f.cfg.AuditLogPath(), action, "all", detail, user)
+		} else {
+			opts, nets = f.configToRestore(before)
+			applyErr = f.nft.ApplyWithFeeds(previous, opts, nets, f.feedContents(previous.Current))
+		}
+		if applyErr != nil {
+			slog.Error("rollback nftables failed", "error", applyErr)
+			// One event, one entry. A failed teardown on the first-apply branch
+			// has already written boot_enforce_failed above, carrying this same
+			// error in its detail and saying what the failure leaves the host
+			// in; adding it to failures put a second crit entry — rollback_failed
+			// — in the log for the one event, which is exactly the double record
+			// the panic branch forty lines above documents having removed. The
+			// entry that explains what the rollback did stays the only one.
+			if !firstApply {
+				failures = append(failures, "nftables: "+applyErr.Error())
+			}
+		}
+		// A rebuilt table is not the table the baselines describe, and
+		// ApplyWithFeeds reports errors from two places that run after the
+		// ruleset is committed — both want the baselines back at zero. A batch
+		// the kernel refused whole is the exception: it left the previous
+		// table and its counters, and zeroing the baselines would book their
+		// whole lifetime again at the next collect.
+		if !errors.Is(applyErr, errNothingWritten) {
+			f.resetUsageBaselines()
+		}
+		// The third writer of table inet easywall, and it races `panic` exactly
+		// like the other two. The marker was read a few statements ago; a console
+		// teardown landing between that read and this write leaves the previous
+		// rules live with the marker on disk. It is reachable in the window the
+		// CLI's own fallback documents: Stop closes and unlinks the listener
+		// before cancelling the acceptance window, so a rollback can be flushing
+		// while `easywall-core panic` sees a refused socket and tears the table
+		// down itself.
+		//
+		// Called whether or not the write above reported success, for the reason
+		// the failure paths in apply and RestoreCurrent take the same care:
+		// nft.Apply can return an error with rules already committed.
+		//
+		// Gated on PanicState rather than left to the helper's own PanicEngaged,
+		// and this is not redundant. The helper defaults an unreadable marker to
+		// "engaged", which is the safe direction at a write that would start
+		// filtering — and the wrong one here, where it would tear down the very
+		// rules this rollback just restored on the strength of a permission
+		// fault. That is F5's finding again, one statement further on. Only a
+		// marker that is known to be present earns a teardown at this site.
+		//
+		// rollback_skipped, the same action the branch above writes, because the
+		// machine ends in the same state: the rules file reverted, the table
+		// down, the marker present. Requesting rollback_failed here — which is
+		// crit, while rollback_skipped is neutral — coloured one machine state
+		// two ways depending on which code path reached it, which is the exact
+		// sentence R5 exists to enforce and which is quoted in
+		// panicLandedDuringWrite's own comment. It also wrote a second
+		// rollback_failed for the same event whenever the write above had
+		// already put one in the failures list below, with a detail that
+		// contradicted it.
+		//
+		// The loud case stays loud without a second action: the substitution in
+		// panicLandedDuringWrite promotes this to boot_enforce_failed when its
+		// Reset() fails, which is the one outcome here that is genuinely worse
+		// than the branch above — a machine still filtering behind a marker
+		// that says it is not.
+		//
+		// Gated on PanicState rather than on the helper's own default, and this
+		// is not redundant: PanicEngaged answers an unreadable marker with
+		// "engaged", which is the safe direction at a write that would start
+		// filtering and the wrong one here, where it would tear down the very
+		// rules this rollback just restored on the strength of a permission
+		// fault. Only a marker known to be present earns a teardown at this
+		// site — and now that state is read once and passed on, rather than read
+		// here and read again inside the helper.
+		engagedNow, knownNow, _ := PanicState(f.cfg.PanicMarkerPath())
+		tornDownAgain := f.panicLandedDuringWrite(
+			engagedNow && knownNow,
+			"rollback_skipped",
+			"panic mode was engaged while the previous rules were being written back",
+			user,
+		)
+
+		// Only now, after the same final panic re-check apply and RestoreCurrent
+		// perform before their own recordAppliedConfig — this used to sit right
+		// after nft.Apply above, which could record a configuration for a kernel
+		// that panicLandedDuringWrite then tore back down a few lines later. The
+		// previous rules go back in with the configuration that was live before
+		// this apply — configToRestore's answer — and that is what is recorded.
+		// This said "the configuration as it is *now*" until the rollback stopped
+		// keeping the option change that caused it; recording f.cfg here made
+		// /apply report nothing pending for an option change that had just been
+		// rolled back. Only when the write actually succeeded and nothing undid
+		// it in the window right after. opts and nets are exactly what nft.Apply
+		// above was given.
+		if applyErr == nil && !tornDownAgain {
+			f.recordAppliedConfig(opts, nets)
+		}
+	}
+
+	if len(failures) > 0 {
+		WriteAuditLog(f.cfg.AuditLogPath(), "rollback_failed", "all",
+			strings.Join(failures, "; "), user)
+	}
+}
+
+// feedContents loads the stored copies of the feeds r switches on, for a
+// kernel write. Rollback, boot, resume and the Docker reconcile all rebuild
+// the table through one of the three writers that call this, so a feed's set
+// comes back with them and nothing else has to remember it (spec §3).
+//
+// It never fails the write. An unreadable file means the enabled feeds get
+// empty sets — which blocks less, and says so in the journal — where an
+// error would make a rollback or a boot restore fail and leave the host with
+// no table at all.
+//
+// A nil store is a Firewall literal built by a test; NewFirewall always sets
+// one. The zero answer is the one Health gives a nil stamp store, for its
+// reason.
+func (f *Firewall) feedContents(r shared.Rules) FeedContents {
+	if f.feeds == nil || len(r.Feeds) == 0 {
+		return nil
+	}
+	contents, err := f.feeds.Contents(r.Feeds)
+	if err != nil {
+		slog.Error("could not read the stored feeds; their sets are written empty",
+			"path", f.cfg.FeedsPath(), "error", err)
+	}
+	return contents
+}
+
+// Accept signals that the admin confirmed the new rules work correctly, and
+// reports whether a window was open to receive it.
+func (f *Firewall) Accept() bool {
+	return f.acceptance.Accept()
+}
+
+// Rollback ends an open window at the operator's request, and reports whether
+// there was one. Wait then returns false and apply's existing !accepted branch
+// runs unchanged — the same path a timeout takes, because it is the same
+// outcome reached sooner.
+//
+// It writes no audit entry of its own, and takes no user: the single
+// apply_rolledback line is written by apply, which already has one — the user
+// who ran the apply, not whoever cancelled it — and reads the reason from
+// f.acceptance.Reason(), which CancelByOperator set to "cancelled by operator"
+// before waking Wait up. So the entry names the apply's operator, and a
+// caller here has no user to contribute; that is a documented consequence of
+// one writer owning the line, not a gap. Writing a second entry would double
+// the record for one event, and the second of the two would say "timeout"
+// regardless, because that is the literal apply used to write
+// unconditionally. A second action would also need a second label, a second
+// colour and a second translation for what is, to the operator, the same
+// thing happening earlier.
+func (f *Firewall) Rollback() bool {
+	return f.acceptance.CancelByOperator()
+}
+
+// CancelAcceptance ends an open window as not accepted, so the apply that owns
+// it rolls back and returns.
+//
+// Used by Panic, which must not latch: an installation that panics and then
+// resumes has to be able to apply again. Shutdown wants ShutdownAcceptance.
+func (f *Firewall) CancelAcceptance() {
+	f.acceptance.CancelForPanic()
+}
+
+// ShutdownAcceptance ends an open window and prevents a later one, for a daemon
+// that is stopping. See Acceptance.CancelForShutdown.
+func (f *Firewall) ShutdownAcceptance() {
+	f.acceptance.CancelForShutdown()
+}
+
+// Status returns the current firewall status for dashboard display.
+func (f *Firewall) Status() shared.FirewallStatus {
+	pending, _ := f.rules.HasPendingChanges()
+
+	// The second half of "is anything pending". Firewall options and network
+	// settings are written straight into this daemon's config and take effect
+	// only at the next apply, so a rule diff alone reported nothing while
+	// /options was telling the operator to apply. Two pages contradicted each
+	// other and the false one was the page with the button.
+	//
+	// Only once a snapshot exists. An installation that has not applied or
+	// restarted under 2.10 keeps 2.9's meaning exactly, so nobody is greeted with
+	// a pending change they did not make.
+	if snapshot := f.appliedConfig(); snapshot.Recorded {
+		live := shared.AppliedConfig{
+			Firewall: f.cfg.FirewallOptions(),
+			Network:  f.cfg.NetworkSettings(),
+		}
+		pending = pending || len(shared.DiffConfig(snapshot.Config, live)) > 0
+	}
+
+	f.lastApplyMu.Lock()
+	last := f.lastApply
+	f.lastApplyMu.Unlock()
+
+	lastApply := ""
+	if !last.IsZero() {
+		lastApply = last.UTC().Format(time.RFC3339)
+	}
+
+	// Captured once so Acceptance and AcceptanceReason below describe the same
+	// instant. Acceptance.Reason() is set to "timeout" the moment a window
+	// opens, before anyone knows how it will end — reading it whenever a window
+	// is merely Pending would tell the operator a timeout has already happened.
+	// The one status where the reason is the whole point is RolledBack, which is
+	// the only one it is read for here.
+	//
+	// Kernel first, window second, remaining time third: apply opens the
+	// window before it writes the kernel, so in this order a live table always
+	// comes with the window covering it. The other way round, an Idle sampled
+	// just before Start paired with an Enforcing() that queued on the nft
+	// mutex through the whole write, and reported live rules with no window.
+	active := f.nft.Enforcing()
+	accStatus := f.acceptance.Status()
+
+	// Rounded up, so a window with 119.6 s left reads 120 and the first render
+	// of a 120-second window says 02:00 rather than 01:59. This is the only
+	// number on that screen; starting it a second in is wrong about it.
+	remaining := 0
+	if d := f.acceptance.Remaining(); d > 0 {
+		remaining = int((d + time.Second - 1) / time.Second)
+	}
+	reason := ""
+	if accStatus == shared.AcceptanceRolledBack {
+		reason = f.acceptance.Reason()
+	}
+
+	return shared.FirewallStatus{
+		// Asked of the kernel, not inferred from this process being alive. The
+		// dashboard renders this as "rules are live", which is a claim about
+		// what the kernel holds; answering it with "the daemon is running" made
+		// that sentence unverified, and green after the table had been deleted.
+		Active:              active,
+		Acceptance:          accStatus,
+		HasPending:          pending,
+		LastApply:           lastApply,
+		Panic:               f.PanicEngaged(),
+		AcceptanceRemaining: remaining,
+		AcceptanceReason:    reason,
+		// The same read the apply path makes (see acceptanceOn in apply), so a
+		// caller cannot be told a window exists by one and not by the other.
+		AcceptanceEnabled: f.cfg.SystemSettings().Acceptance.Enabled,
+		UnknownBridges:    f.unknownBridges(active),
+	}
+}
+
+// RulesStore returns the underlying rules store for direct rule manipulation.
+func (f *Firewall) RulesStore() *RulesStore {
+	return f.rules
+}
+
+// Options returns the current firewall options.
+func (f *Firewall) Options() shared.FirewallOptions {
+	return f.cfg.FirewallOptions()
+}

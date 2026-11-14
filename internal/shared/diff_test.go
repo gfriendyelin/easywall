@@ -1,0 +1,268 @@
+package shared
+
+import (
+	"strings"
+	"testing"
+)
+
+func port(p, desc string) PortRule { return PortRule{Port: p, Description: desc} }
+
+func TestDiffRules_PortsAreKeyedByPort(t *testing.T) {
+	cur := Rules{TCP: []PortRule{port("22", "SSH"), port("80", "HTTP")}}
+	// Reordered, one added, one removed, one description edited.
+	staged := Rules{TCP: []PortRule{port("80", "HTTP/1.1"), port("8443", "Nextcloud")}}
+
+	got := DiffRules(cur, staged)
+	want := []RuleDelta{
+		{Set: "tcp", Kind: DeltaChanged, Key: "80", Label: "HTTP/1.1", From: "HTTP", To: "HTTP/1.1"},
+		{Set: "tcp", Kind: DeltaAdded, Key: "8443", Label: "Nextcloud"},
+		{Set: "tcp", Kind: DeltaRemoved, Key: "22", Label: "SSH"},
+	}
+	assertDeltas(t, got, want)
+}
+
+func TestDiffRules_ReorderingPortsIsNotAChange(t *testing.T) {
+	cur := Rules{UDP: []PortRule{port("53", "DNS"), port("123", "NTP")}}
+	staged := Rules{UDP: []PortRule{port("123", "NTP"), port("53", "DNS")}}
+	if got := DiffRules(cur, staged); len(got) != 0 {
+		t.Errorf("order does not change what is accepted, got %v", got)
+	}
+}
+
+func TestDiffRules_ListsSkipCommentsAndBlanks(t *testing.T) {
+	cur := Rules{Blocklist: []string{"# scanners", "192.0.2.42", "", "192.0.2.118"}}
+	staged := Rules{Blocklist: []string{"192.0.2.118", "# a different note", "203.0.113.9"}}
+
+	got := DiffRules(cur, staged)
+	want := []RuleDelta{
+		{Set: "blocklist", Kind: DeltaAdded, Key: "203.0.113.9"},
+		{Set: "blocklist", Kind: DeltaRemoved, Key: "192.0.2.42"},
+	}
+	assertDeltas(t, got, want)
+}
+
+func TestDiffRules_ForwardingIsKeyedByProtocolAndSourcePort(t *testing.T) {
+	cur := Rules{Forwarding: []ForwardingRule{
+		{Protocol: "tcp", SourcePort: 8080, DestPort: 80},
+		{Protocol: "udp", SourcePort: 51821, DestPort: 51820},
+	}}
+	staged := Rules{Forwarding: []ForwardingRule{
+		{Protocol: "tcp", SourcePort: 8080, DestPort: 8081},
+	}}
+
+	got := DiffRules(cur, staged)
+	want := []RuleDelta{
+		{Set: "forwarding", Kind: DeltaChanged, Key: "8080/tcp",
+			From: "8080->80/tcp", To: "8080->8081/tcp"},
+		{Set: "forwarding", Kind: DeltaRemoved, Key: "51821->51820/udp"},
+	}
+	assertDeltas(t, got, want)
+}
+
+// Two identical stored forwards produce two identical + rows unless diffForwarding
+// guards against its own duplicates the way diffPorts does — ValidateRules does
+// not reject a duplicate forward, so this is reachable from an ordinary staged
+// edit, and it was visible in the apply preview's first screenshot.
+func TestDiffRules_ADuplicateForwardIsNotReportedTwice(t *testing.T) {
+	fwd := ForwardingRule{Protocol: "tcp", SourcePort: 8080, DestPort: 80}
+	staged := Rules{Forwarding: []ForwardingRule{fwd, fwd}}
+
+	got := DiffRules(Rules{}, staged)
+	want := []RuleDelta{
+		{Set: "forwarding", Kind: DeltaAdded, Key: "8080->80/tcp"},
+	}
+	assertDeltas(t, got, want)
+}
+
+func TestDiffRules_AMovedCustomRuleIsAChange(t *testing.T) {
+	cur := Rules{Custom: []string{"# note", "tcp dport 9100 accept", "udp dport 53 accept"}}
+	staged := Rules{Custom: []string{"udp dport 53 accept", "tcp dport 9100 accept"}}
+
+	got := DiffRules(cur, staged)
+	want := []RuleDelta{
+		{Set: "custom", Kind: DeltaChanged, Key: "#1",
+			From: "tcp dport 9100 accept", To: "udp dport 53 accept"},
+		{Set: "custom", Kind: DeltaChanged, Key: "#2",
+			From: "udp dport 53 accept", To: "tcp dport 9100 accept"},
+	}
+	assertDeltas(t, got, want)
+}
+
+// A duplicated custom rule is two rules to the kernel — applyCustomRules skips
+// comments and blanks, nothing else — so removing one of two identical lines
+// must be reported. Piping the sequence through listEntries (which dedups by
+// content) would make cur and staged compare equal and report no change at all,
+// which is the exact failure this preview exists to prevent.
+func TestDiffRules_ADuplicateCustomLineDeletionIsNotHidden(t *testing.T) {
+	dup := "tcp dport 9100 accept"
+	other := "udp dport 53 accept"
+	cur := Rules{Custom: []string{dup, dup, other}}
+	staged := Rules{Custom: []string{dup, other}}
+
+	got := DiffRules(cur, staged)
+	want := []RuleDelta{
+		{Set: "custom", Kind: DeltaChanged, Key: "#2", From: dup, To: other},
+		{Set: "custom", Kind: DeltaRemoved, Key: "#3", Label: other},
+	}
+	assertDeltas(t, got, want)
+}
+
+// The plan's table said Label was empty for custom added/removed deltas; the
+// maintainer ruled the code right and the table wrong, because without Label an
+// added custom rule would render as "+ #2" with no indication of what line
+// arrived. This locks that ruling in.
+func TestDiffRules_CustomAddedAndRemovedCarryTheRuleLine(t *testing.T) {
+	kept := "tcp dport 9100 accept"
+	arriving := "udp dport 53 accept"
+
+	added := DiffRules(Rules{Custom: []string{kept}}, Rules{Custom: []string{kept, arriving}})
+	assertDeltas(t, added, []RuleDelta{
+		{Set: "custom", Kind: DeltaAdded, Key: "#2", Label: arriving},
+	})
+
+	removed := DiffRules(Rules{Custom: []string{kept, arriving}}, Rules{Custom: []string{kept}})
+	assertDeltas(t, removed, []RuleDelta{
+		{Set: "custom", Kind: DeltaRemoved, Key: "#2", Label: arriving},
+	})
+}
+
+func TestDiffConfig_NamesTheTomlKeyAndBothValues(t *testing.T) {
+	applied := AppliedConfig{
+		Firewall: FirewallOptions{Fragments: false, ConnectionLimitMax: 100},
+		Network:  NetworkSettings{IPv6: IPv6Config{Mode: IPv6Filter}},
+	}
+	live := AppliedConfig{
+		Firewall: FirewallOptions{Fragments: true, ConnectionLimitMax: 250},
+		Network:  NetworkSettings{IPv6: IPv6Config{Mode: IPv6Block}},
+	}
+
+	got := DiffConfig(applied, live)
+	want := []ConfigDelta{
+		{Key: "drop_fragments", From: "off", To: "on"},
+		{Key: "connection_limit_max", From: "100", To: "250"},
+		{Key: "ipv6.mode", From: "filter", To: "block"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d deltas, want %d: %v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("delta %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// A snapshot that has been through encoding/json turns a nil slice into one
+// that comes back nil, and an empty one into one that comes back non-nil — that
+// is what Task 5 hands DiffConfig. Two zero-length slices must read as no
+// drift, or every installation shipping the stock `custom_networks = []`
+// reports a phantom change forever.
+func TestDiffConfig_NilAndEmptySliceAreNotADrift(t *testing.T) {
+	applied := AppliedConfig{Network: NetworkSettings{Docker: DockerConfig{CustomNetworks: nil}}}
+	live := AppliedConfig{Network: NetworkSettings{Docker: DockerConfig{CustomNetworks: []string{}}}}
+	if got := DiffConfig(applied, live); len(got) != 0 {
+		t.Errorf("a nil slice and an empty one are not a drift, got %v", got)
+	}
+}
+
+// The exception above must not swallow a real difference.
+func TestDiffConfig_ADifferentSliceIsStillReported(t *testing.T) {
+	applied := AppliedConfig{Network: NetworkSettings{Docker: DockerConfig{CustomNetworks: nil}}}
+	live := AppliedConfig{Network: NetworkSettings{Docker: DockerConfig{CustomNetworks: []string{"10.0.0.0/8"}}}}
+
+	got := DiffConfig(applied, live)
+	want := []ConfigDelta{{Key: "docker.custom_networks", From: "none", To: "10.0.0.0/8"}}
+	if len(got) != len(want) {
+		t.Fatalf("got %d deltas, want %d: %v", len(got), len(want), got)
+	}
+	if got[0] != want[0] {
+		t.Errorf("delta = %+v, want %+v", got[0], want[0])
+	}
+}
+
+func TestDiffConfig_NoDriftIsNoDeltas(t *testing.T) {
+	c := AppliedConfig{Firewall: FirewallOptions{SYNFlood: true, SYNFloodLimit: 100}}
+	if got := DiffConfig(c, c); len(got) != 0 {
+		t.Errorf("identical configs produced %v", got)
+	}
+}
+
+// Restricting a port that is already open is a change to the firewall, and the
+// preview is the screen that has to say so. It keyed on port and description
+// alone, so tightening a rule showed an empty diff and an apply button.
+func TestDiffPorts_SourceChangeIsAChange(t *testing.T) {
+	current := Rules{TCP: []PortRule{{Port: "8123", Description: "Home Assistant"}}}
+	staged := Rules{TCP: []PortRule{{Port: "8123", Description: "Home Assistant",
+		Sources: []string{"192.168.0.0/16"}}}}
+
+	deltas := DiffRules(current, staged)
+	if len(deltas) != 1 {
+		t.Fatalf("DiffRules reported %d deltas, want 1: %+v", len(deltas), deltas)
+	}
+	if deltas[0].Kind != DeltaChanged {
+		t.Errorf("kind = %s, want changed", deltas[0].Kind)
+	}
+	if !strings.Contains(deltas[0].To, "192.168.0.0/16") {
+		t.Errorf("the new restriction is not in the delta: %q", deltas[0].To)
+	}
+	if strings.Contains(deltas[0].From, "192.168.0.0/16") {
+		t.Errorf("the old side claims a restriction it did not have: %q", deltas[0].From)
+	}
+}
+
+// assertDeltas compares in order: the page lists what arrived before what left,
+// and a preview whose order shifts between two loads is one nobody trusts.
+func assertDeltas(t *testing.T, got, want []RuleDelta) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d deltas, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("delta %d = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// A feed is switched on and off like a list entry, and the apply screen names
+// it: "Spamhaus DROP", "Own feed 2", not the id alone.
+func TestDiffRules_FeedsAreNamed(t *testing.T) {
+	cur := Rules{Feeds: []string{"dshield", "own-1"}}
+	staged := Rules{Feeds: []string{"own-1", "spamhaus-drop", "own-2"}}
+
+	got := DiffRules(cur, staged)
+	want := []RuleDelta{
+		{Set: "feeds", Kind: DeltaAdded, Key: "spamhaus-drop", Label: "Spamhaus DROP"},
+		{Set: "feeds", Kind: DeltaAdded, Key: "own-2", Label: "Own feed 2"},
+		{Set: "feeds", Kind: DeltaRemoved, Key: "dshield", Label: "DShield top block list"},
+	}
+	assertDeltas(t, got, want)
+
+	// An id no catalogue knows — a hand-edited rules.json — keeps its key and
+	// gains no label rather than repeating itself.
+	if got := DiffRules(Rules{}, Rules{Feeds: []string{"nope"}}); len(got) != 1 || got[0].Label != "" {
+		t.Errorf("an unknown feed id diffed as %+v", got)
+	}
+}
+
+// A second rule for a port is a second kernel accept: addPortAccept builds every
+// entry, and nft takes the first that matches. diffPorts used to key on the first
+// entry alone, so adding an open copy of a source-restricted port widened it to
+// the world with an empty preview and no "Unapplied changes" — HasPendingChanges
+// is this diff.
+func TestDiffRules_ASecondRuleForAPortIsAChange(t *testing.T) {
+	ssh := PortRule{Port: "22", Description: "SSH", Sources: []string{"10.0.0.0/8"}}
+	open := PortRule{Port: "22", Description: "SSH"}
+	cur := Rules{TCP: []PortRule{ssh}}
+	widened := Rules{TCP: []PortRule{ssh, open}}
+
+	if got := DiffRules(cur, widened); len(got) != 1 || got[0].Kind != DeltaChanged {
+		t.Fatalf("an open second rule for a restricted port must show as a change, got %v", got)
+	}
+	if got := DiffRules(widened, cur); len(got) != 1 || got[0].Kind != DeltaChanged {
+		t.Fatalf("removing the second rule must show as a change, got %v", got)
+	}
+	if got := DiffRules(widened, widened); len(got) != 0 {
+		t.Errorf("an unchanged duplicate is not a change, got %v", got)
+	}
+}

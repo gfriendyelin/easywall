@@ -1,0 +1,2876 @@
+#!/usr/bin/env node
+/**
+ * Drives the interface in a real browser and fails the build on what a
+ * stylesheet diff and a Go test cannot see.
+ *
+ * Two kinds of check, and the split matters:
+ *
+ *   - Regressions. Specific bugs that shipped, each with the input that produced
+ *     them. A forwarding port of "1E+04" was stored as port 1 because the editor
+ *     re-parsed the field's text with parseInt instead of reading the number the
+ *     field holds; the page said "Changes saved.". Nothing in the Go suite can
+ *     see that, because the mistake is a disagreement with the browser about what
+ *     a number is.
+ *   - Health. No console error, no failed request, no horizontal overflow, on
+ *     every page in both themes. Cheap, and it is how a CSP violation or a
+ *     missing asset gets caught across the whole app at once.
+ *
+ * Expects easywall-web already running in demo mode with no password set, so the
+ * run starts at the first-run wizard and sets up its own account. The wizard
+ * asks for the setup token easywall-web printed at start, which this reads out
+ * of web.log beside the config (EASYWALL_WEB_LOG overrides) — the file CI's ui
+ * job sends the server's output to. Usage:
+ *
+ *   EASYWALL_URL=https://127.0.0.1:12227 node scripts/ui-check.mjs
+ *
+ * The browser is Playwright's own Chromium — install it with
+ * `npx playwright-core install chromium`. Set CHROME_PATH to use a different
+ * build instead; that is how it runs against a Chromium already on the machine.
+ *
+ * A second easywall-web is started by the script itself, from `bin/easywall-web`
+ * — see checkVerifyPage — because the second login step is unreachable in the
+ * demo, where no secret is ever stored. It reads the password hash the wizard
+ * above just wrote out of the config the demo is running, which webConfigPath()
+ * finds without being told: scripts/demo-server.sh's own directory first, then
+ * an installed /etc/easywall/web.toml. EASYWALL_CONFIG overrides both.
+ *
+ * `--screenshots` with no page names shoots the whole documented set,
+ * including the pages above cannot reach with a single signed-in session —
+ * see takeFullScreenshotSet, takeWizardScreenshots and takeVerifyScreenshot,
+ * which each spin up their own throwaway easywall-web the same way.
+ */
+import { chromium } from 'playwright-core';
+import { createHmac } from 'node:crypto';
+import { mkdtempSync, writeFileSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { tmpdir, homedir } from 'node:os';
+import { dirname, join } from 'node:path';
+import { spawn } from 'node:child_process';
+import https from 'node:https';
+import { setTimeout as sleep } from 'node:timers/promises';
+
+// "admin" matches every release screenshot before this script existed —
+// screenshot mode reuses the same account the health/regression checks sign
+// in with, so the shots this produces read as the same operator throughout
+// docs/assets/img/screens/ rather than a visibly different one on the pages
+// this script happened to touch first.
+const USER = 'admin';
+const PASS = 'ui-check-password-2026';
+
+const PAGES = [
+  '/dashboard', '/blocked', '/ports', '/ports?type=udp', '/blocklist', '/allowlist',
+  '/forwarding', '/custom', '/options', '/settings', '/system', '/password',
+  '/notify', '/log', '/apply',
+];
+
+const failures = [];
+const fail = (what, detail) => {
+  failures.push(`${what}: ${detail}`);
+  console.error(`  FAIL ${what}\n       ${detail}`);
+};
+
+/**
+ * RFC 6238, in the script, so the browser check needs no npm dependency and no
+ * agreement with the Go implementation beyond the standard both are reading.
+ *
+ * Deliberately a second implementation rather than a call into the server: if
+ * the two ever disagree, that is precisely the bug worth failing on.
+ */
+function totp(secretBase32, at = Date.now()) {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+  const clean = secretBase32.replace(/[\s=-]/g, '').toUpperCase();
+  let bits = '';
+  for (const ch of clean) bits += alphabet.indexOf(ch).toString(2).padStart(5, '0');
+  const bytes = Buffer.from(bits.match(/.{8}/g).map(b => parseInt(b, 2)));
+
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(Math.floor(at / 1000 / 30)));
+
+  const mac = createHmac('sha1', bytes).update(counter).digest();
+  const off = mac[mac.length - 1] & 0x0f;
+  const num = mac.readUInt32BE(off) & 0x7fffffff;
+  return String(num % 1e6).padStart(6, '0');
+}
+
+/**
+ * The hash comes out of the config run 1's wizard already wrote for PASS, so
+ * this needs no argon2 in JavaScript and no environment variable to carry it.
+ * A four-line regex read of the `password = "…"` line the wizard wrote.
+ */
+/**
+ * The web.toml the running instance is using.
+ *
+ * This defaulted to /etc/easywall/web.toml, which scripts/demo-server.sh has
+ * never written — it keeps its state under $HOME so that a mkcert leaf survives
+ * a reboot. So a bare `npm run check:ui` reported "could not read the password
+ * hash" and needed EASYWALL_CONFIG set by hand every time. This is the check
+ * that catches what a stylesheet diff and a Go test cannot see, and friction on
+ * it is what makes it get skipped.
+ *
+ * The order is: an explicit EASYWALL_CONFIG, then the demo's own directory
+ * (EASYWALL_DEMO_DIR, defaulted exactly as demo-server.sh defaults it), then an
+ * installed /etc/easywall/web.toml for a run against a real installation.
+ */
+function webConfigPath() {
+  if (process.env.EASYWALL_CONFIG) return process.env.EASYWALL_CONFIG;
+  const demo = join(
+    process.env.EASYWALL_DEMO_DIR || join(homedir(), '.local', 'share', 'easywall-demo'),
+    'web.toml',
+  );
+  return existsSync(demo) ? demo : '/etc/easywall/web.toml';
+}
+
+function readPasswordHash(configPath) {
+  let text;
+  try {
+    text = readFileSync(configPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const m = text.match(/^\s*password\s*=\s*"([^"]*)"/m);
+  return m && m[1] ? m[1] : null;
+}
+
+/**
+ * The TOTP secret the wizard wrote, read back the same way readPasswordHash
+ * reads the hash. Unlike the password, this is plaintext in the config — it
+ * has to be, to compute a matching code — so no argon2 problem here either.
+ */
+function readTOTPSecret(configPath) {
+  let text;
+  try {
+    text = readFileSync(configPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const m = text.match(/^\s*totp_secret\s*=\s*"([^"]*)"/m);
+  return m && m[1] ? m[1] : null;
+}
+
+/**
+ * The base URL the running instance is actually listening on.
+ *
+ * Read from the same web.toml readPasswordHash and readTOTPSecret already
+ * parse, because the alternative is what shipped: a hard-coded 12227 beside a
+ * config the script was holding open. EASYWALL_DEMO_ADDR moves the demo
+ * server, and check:ui went on driving the old port — which reported "UI
+ * checks passed" against a pre-existing easywall-web, having never loaded the
+ * stylesheet under test, in the check this repository trusts most.
+ *
+ * A bind_addr with no host means every interface; 127.0.0.1 is the address to
+ * dial then, not an empty host. "[::]:12227" is the same case with brackets.
+ */
+function readBindAddr(configPath) {
+  let text;
+  try {
+    text = readFileSync(configPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const m = text.match(/^\s*bind_addr\s*=\s*"([^"]*)"/m);
+  if (!m || !m[1]) return null;
+  const raw = m[1].trim();
+  const port = raw.slice(raw.lastIndexOf(':') + 1);
+  if (!/^\d+$/.test(port)) return null;
+  let host = raw.slice(0, raw.lastIndexOf(':'));
+  if (host === '' || host === '[::]' || host === '0.0.0.0' || host === '::') host = '127.0.0.1';
+  return `https://${host}:${port}`;
+}
+
+const CONFIG_PATH = webConfigPath();
+// EASYWALL_URL first — a run against something the config does not describe is
+// a legitimate thing to want. Then the config, which is the fix for this line's
+// own history. The literal last, so a tree with no config still runs.
+const BASE = process.env.EASYWALL_URL || readBindAddr(CONFIG_PATH) || 'https://127.0.0.1:12227';
+console.log(`check:ui → ${BASE}  (config: ${CONFIG_PATH})`);
+
+/**
+ * The floor of the acceptance window, read out of the Go source that defines
+ * it rather than typed again here. models.go explains why the bound exists at
+ * all — an HTML min="" is a hint to the browser and nothing more, the server
+ * took any positive number until it did not — and a literal 10 copied into
+ * this file would just as quietly stop matching it the next time it moves.
+ */
+function readAcceptanceDurationMin() {
+  const text = readFileSync('internal/shared/models.go', 'utf8');
+  const m = text.match(/AcceptanceDurationMin\s*=\s*(\d+)/);
+  if (!m) {
+    throw new Error('could not read AcceptanceDurationMin out of internal/shared/models.go');
+  }
+  return parseInt(m[1], 10);
+}
+// The shortest window the server will accept, used below so checkAcceptanceWindow
+// never waits anywhere near the real default of 120s.
+const WINDOW_SECONDS = readAcceptanceDurationMin();
+
+/**
+ * The setup token easywall-web printed at start, out of its JSON log. The last
+ * line that carries one, because a restart prints a new token and only the
+ * newest is valid. Since 2.22 /firstrun refuses step 1 without it, so a run
+ * that drives the wizard reads the log the way an operator does.
+ */
+function setupTokenIn(logText) {
+  let token = null;
+  for (const line of logText.split('\n')) {
+    if (!line.includes('setup token')) continue;
+    try {
+      token = JSON.parse(line).token || token;
+    } catch {
+      // not one of easywall-web's JSON lines
+    }
+  }
+  return token;
+}
+
+/** Polls read() until it yields a setup token; where names the source in the error. */
+async function waitForSetupToken(read, where, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const token = setupTokenIn(read());
+    if (token) return token;
+    if (Date.now() > deadline) {
+      throw new Error(`no "setup token" line in ${where} within ${timeoutMs}ms — ` +
+        '/firstrun refuses step 1 without it');
+    }
+    await sleep(250);
+  }
+}
+
+/** Polls an HTTPS URL, ignoring certificate errors, until it answers or times out. */
+async function waitForPort(url, timeoutMs = 15000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const up = await new Promise(resolve => {
+      const req = https.get(url, { rejectUnauthorized: false, timeout: 1000 }, res => {
+        res.resume();
+        resolve(true);
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+    });
+    if (up) return;
+    if (Date.now() > deadline) throw new Error(`${url} did not come up within ${timeoutMs}ms`);
+    await sleep(250);
+  }
+}
+
+/**
+ * Complete the first-run wizard if it is still being served.
+ *
+ * Presence of the form, not the URL: once an account exists the route is not
+ * registered at all, so the request 404s and the URL still says /firstrun. The
+ * wizard also writes the credentials into the config file, so a second run
+ * against the same config legitimately finds nothing to do.
+ *
+ * The wizard has no way past the TOTP step any more — Finish only reaches it,
+ * never the account — so this drives that step too: read the secret the page
+ * displays, compute a code for it, and confirm. The account this leaves
+ * behind always has a factor; signIn's /login/verify handling depends on that.
+ */
+async function setUpAccount(page) {
+  await page.goto(`${BASE}/firstrun`, { waitUntil: 'load' });
+  if (!(await page.$('input[name=password_confirm]'))) {
+    console.log('  ok   an account already exists; skipping the wizard');
+    return;
+  }
+  const logPath = process.env.EASYWALL_WEB_LOG || join(dirname(CONFIG_PATH), 'web.log');
+  const token = await waitForSetupToken(() => {
+    try {
+      return readFileSync(logPath, 'utf8');
+    } catch {
+      return '';
+    }
+  }, logPath);
+  await page.fill('input[name=setup_token]', token);
+  await page.fill('input[name=username]', USER);
+  await page.fill('input[name=password]', PASS);
+  await page.fill('input[name=password_confirm]', PASS);
+  await Promise.all([
+    // Not waitForLoadState('load'): the page loaded by the goto() above is
+    // already at 'load', so that resolves immediately and races the click's
+    // own navigation — reading .totp-secret off the pre-submit DOM and
+    // reporting "the wizard refused its own valid input" for a submission
+    // that actually succeeded. This step 1 POST is a real document
+    // navigation, and waitForNavigation() is what actually waits for it.
+    page.waitForNavigation(),
+    page.click("form[action='/firstrun'] button[type=submit]"),
+  ]);
+  const secretEl = await page.$('.totp-secret');
+  if (!secretEl) {
+    const alert = await page.textContent('[role=alert]').catch(() => '(none)');
+    throw new Error(`the first-run wizard refused its own valid input: ${alert}`);
+  }
+  const secret = (await secretEl.textContent()).trim();
+  await page.fill("form[action='/firstrun/confirm'] input[name=code]", totp(secret));
+  await Promise.all([
+    page.waitForLoadState('load'),
+    page.click("form[action='/firstrun/confirm'] button[type=submit]"),
+  ]);
+  if (!(await page.$('.recovery-code'))) {
+    throw new Error('firstrun/confirm did not create the account and show recovery codes');
+  }
+}
+
+/** Enter a demo instance through its login card's one button (handleLoginDemo). */
+async function enterDemo(page) {
+  await Promise.all([
+    page.waitForLoadState('load'),
+    page.click("form[action='/login/demo'] button[type=submit]"),
+  ]);
+}
+
+/**
+ * Sign in once. The result is reused by every context below.
+ *
+ * Once, and not once per context, because /login is rate limited to five
+ * attempts per ten minutes per source address — which this script used to spend
+ * three of on every run, one for each context it opened. Two runs inside ten
+ * minutes therefore hit the limiter on the sixth attempt, and the failure named
+ * the wrong thing entirely:
+ *
+ *   run 1: UI checks passed
+ *   run 2: Error: could not sign in: still at https://127.0.0.1:12227/login
+ *   server: WARN login rate limit exceeded ip=127.0.0.1
+ *
+ * CI never saw it — a fresh runner each time — so it was a trap set for whoever
+ * ran the checks locally twice while working on something, and it reads as a
+ * broken login page. The status code is now part of the message so a 429 can
+ * never be mistaken for one again.
+ */
+async function signIn(page) {
+  await page.goto(`${BASE}/login`, { waitUntil: 'load' });
+  // The demo is entered with a button and has no password form at all — see
+  // handleLoginDemo. Every non-demo instance below still signs in with one.
+  if (await page.$("form[action='/login/demo']")) {
+    await enterDemo(page);
+    if (page.url().includes('/login')) {
+      throw new Error(`could not enter the demo: still at ${page.url()}`);
+    }
+    return;
+  }
+  await page.fill('input[name=username]', USER);
+  await page.fill('input[name=password]', PASS);
+  const [response] = await Promise.all([
+    page.waitForResponse(r => r.url().endsWith('/login') && r.request().method() === 'POST'),
+    page.click("form[action='/login'] button[type=submit]"),
+  ]);
+  await page.waitForLoadState('load');
+  if (response.status() === 429) {
+    throw new Error(
+      'the login endpoint answered 429: five attempts per ten minutes per address. ' +
+      'This run did not get that far on its own — wait for the window to pass, or restart ' +
+      'easywall-web, which holds the buckets in memory.');
+  }
+
+  // The account setUpAccount just created always has a factor now, so a
+  // correct password lands on /login/verify, not /dashboard. Every account
+  // reachable through this script's wizard has one — a password alone no
+  // longer gets anyone past first run.
+  if (page.url().includes('/login/verify')) {
+    const secret = readTOTPSecret(CONFIG_PATH);
+    if (!secret) {
+      throw new Error(`landed on /login/verify but could not read totp_secret out of ` +
+        `${CONFIG_PATH} to answer it`);
+    }
+    await page.fill('input[name=code]', totp(secret));
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/login/verify'] button[type=submit]"),
+    ]);
+  }
+
+  if (page.url().includes('/login')) {
+    throw new Error(`could not sign in (POST /login -> ${response.status()}): still at ${page.url()}`);
+  }
+}
+
+/**
+ * The whole enrolment, in a browser, against a demo instance — which shows
+ * the flow and discards the final write. The TOTP maths is exercised end to
+ * end: the page's own displayed key becomes a code here, and the server has
+ * to accept it.
+ *
+ * Its own throwaway instance, not the shared session every other check in
+ * this file reuses: that account now comes out of the wizard with a factor
+ * already confirmed — the wizard has no way to produce one without it — so
+ * "/password/2fa/begin" is not on its page any more; that form only renders
+ * while TOTPEnabled is false. This one is seeded directly with a password and
+ * no secret, the shape an account upgraded from before this mandate is in,
+ * so the "begin" form is there to test. The password hash is the shared
+ * account's own, read back exactly as checkVerifyPage reads it, so this needs
+ * no argon2 in JavaScript either.
+ */
+async function checkEnrolmentFlow(browser) {
+  const configPath = CONFIG_PATH;
+  const hash = readPasswordHash(configPath);
+  if (!hash) {
+    fail('2fa setup', `could not read the password hash out of ${configPath}; ` +
+      'set EASYWALL_CONFIG to the web.toml run 1 signed in against');
+    return;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'easywall-ui-enrol-'));
+  const port = 12231;
+  writeFileSync(join(dir, 'web.toml'), [
+    `bind_addr = "127.0.0.1:${port}"`,
+    `socket_path = "${join(dir, 'nowhere.sock')}"`,
+    `ssl_dir = "${join(dir, 'ssl')}"`,
+    `data_dir = "${dir}"`,
+    `language = "en"`,
+    `demo_mode = true`,
+    `session_key = "ui-check-enrol-session-key-32byte"`,
+    `username = "${USER}"`,
+    `password = "${hash}"`,
+    `totp_secret = ""`,
+    `recovery_codes = []`,
+    `update_check = false`,
+  ].join('\n'));
+
+  const proc = spawn('bin/easywall-web', ['-config', join(dir, 'web.toml')], { stdio: 'inherit' });
+  try {
+    const base = `https://127.0.0.1:${port}`;
+    await waitForPort(`${base}/login`);
+
+    const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await ctx.newPage();
+
+    // A demo instance: entered with the button, never a password.
+    await page.goto(`${base}/login`, { waitUntil: 'load' });
+    await enterDemo(page);
+    if (page.url().includes('/login')) {
+      fail('2fa setup', `could not enter the throwaway demo instance, still at ${page.url()}`);
+      return;
+    }
+
+    await page.goto(`${base}/password`, { waitUntil: 'networkidle' });
+    await page.fill("form[action='/password/2fa/begin'] input[name=current_password]", PASS);
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/password/2fa/begin'] button[type=submit]"),
+    ]);
+
+    const qr = await page.getAttribute('.qr-plate img', 'src');
+    if (!qr || !qr.startsWith('data:image/png;base64,')) {
+      fail('2fa setup', `the QR code is ${qr ? qr.slice(0, 40) : 'absent'}; the CSP allows data: URIs and nothing else`);
+      return;
+    }
+
+    const key = (await page.textContent('.totp-secret')).trim();
+    await page.fill("form[action='/password/2fa/confirm'] input[name=code]", totp(key));
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/password/2fa/confirm'] button[type=submit]"),
+    ]);
+
+    const codes = await page.locator('.recovery-code').count();
+    if (codes !== 8) {
+      fail('2fa setup', `${codes} recovery codes on the page after confirm, want 8`);
+    }
+    const body = await page.textContent('body');
+    if (!/demo/i.test(body)) {
+      fail('2fa setup', 'the demo confirmed an enrolment without saying nothing was saved');
+    } else {
+      console.log('  ok   enrolment runs end to end and the demo says it saved nothing');
+    }
+
+    await ctx.close();
+  } finally {
+    proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The gate: 2.18 makes a second factor mandatory, and this is the screen an
+ * operator meets the first time they sign in after the upgrade.
+ *
+ * It needs its own instance because demo_mode is the gate's one exemption, so
+ * the demo the rest of this script drives can never show it. Everything else is
+ * checkEnrolmentFlow's arrangement — a real password hash, no secret, no core.
+ *
+ * Three things are checked and the middle one is the point. Landing on
+ * /password after a one-step login is the redirect; being unable to leave it is
+ * the gate. A redirect an operator can walk around by typing a path is not a
+ * mandate, and the difference is invisible in a screenshot.
+ */
+async function checkTheGate(browser) {
+  const hash = readPasswordHash(CONFIG_PATH);
+  if (!hash) {
+    fail('gate', 'could not read the password hash; set EASYWALL_CONFIG');
+    return;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'easywall-ui-gate-'));
+  const port = 12233;
+  writeFileSync(join(dir, 'web.toml'), [
+    `bind_addr = "127.0.0.1:${port}"`,
+    `socket_path = "${join(dir, 'nowhere.sock')}"`,
+    `ssl_dir = "${join(dir, 'ssl')}"`,
+    `data_dir = "${dir}"`,
+    `language = "en"`,
+    `demo_mode = false`,
+    `session_key = "ui-check-gate-session-key-32bytes"`,
+    `username = "${USER}"`,
+    `password = "${hash}"`,
+    `totp_secret = ""`,
+    `recovery_codes = []`,
+    `update_check = false`,
+  ].join('\n'));
+
+  const proc = spawn('bin/easywall-web', ['-config', join(dir, 'web.toml')], { stdio: 'inherit' });
+  try {
+    const base = `https://127.0.0.1:${port}`;
+    await waitForPort(`${base}/login`);
+
+    const ctx = await browser.newContext({ ignoreHTTPSErrors: true });
+    const page = await ctx.newPage();
+
+    // One step, because there is no second factor to ask for yet. That is the
+    // upgrade path: the account is valid, the password is right, and the
+    // release still may not let it reach the firewall.
+    await page.goto(`${base}/login`, { waitUntil: 'load' });
+    await page.fill('input[name=username]', USER);
+    await page.fill('input[name=password]', PASS);
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/login'] button[type=submit]"),
+    ]);
+
+    if (!page.url().endsWith('/password')) {
+      fail('gate', `signing in with no second factor landed on ${page.url()}, want /password`);
+      return;
+    }
+    // The string, not the class: .alert-warn is worn by every flash on this
+    // page, so a class check would pass on a page that never explains itself.
+    if (!(await page.locator("text=Set up a second factor to continue").count())) {
+      fail('gate', 'the enrolment page carries no callout saying why the operator is here');
+    }
+
+    // The gate, not the redirect. Every one of these is a path an operator
+    // could type, and the allowlist is an exact match rather than a prefix.
+    for (const path of ['/dashboard', '/ports', '/settings', '/apply']) {
+      await page.goto(`${base}${path}`, { waitUntil: 'load' });
+      if (!page.url().endsWith('/password')) {
+        fail('gate', `${path} was reachable with no second factor enrolled; it answered from ${page.url()}`);
+      }
+    }
+
+    await page.goto(`${base}/password`, { waitUntil: 'networkidle' });
+    await page.fill("form[action='/password/2fa/begin'] input[name=current_password]", PASS);
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/password/2fa/begin'] button[type=submit]"),
+    ]);
+    const key = (await page.textContent('.totp-secret')).trim();
+    await page.fill("form[action='/password/2fa/confirm'] input[name=code]", totp(key));
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/password/2fa/confirm'] button[type=submit]"),
+    ]);
+
+    // Deliberately still on /password: this response is the only one that
+    // carries the eight recovery codes, and redirecting off it would take them
+    // with it. What has to change is that the operator may now leave.
+    const codes = await page.locator('.recovery-code').count();
+    if (codes !== 8) {
+      fail('gate', `${codes} recovery codes after enrolling through the gate, want 8`);
+    }
+    await page.goto(`${base}/dashboard`, { waitUntil: 'load' });
+    if (!page.url().endsWith('/dashboard')) {
+      fail('gate', `enrolling did not open the gate; /dashboard answered from ${page.url()}`);
+    } else {
+      console.log('  ok   the gate holds every page until a factor is enrolled, then opens');
+    }
+
+    // 2.28: the first dashboard after an update asks whether to count this
+    // installation. This instance is the only non-demo one that reaches the
+    // dashboard, and the demo never asks.
+    const ask = page.locator('#telemetry-ask');
+    if (!(await ask.count())) {
+      fail('telemetry question', 'the first dashboard of a never-asked installation shows no question');
+    } else {
+      await Promise.all([
+        page.waitForResponse((r) => r.url().endsWith('/telemetry/prompt')),
+        page.click("#telemetry-ask button[value=no]"),
+      ]);
+      await page.waitForSelector('#telemetry-ask', { state: 'detached' });
+      await page.reload({ waitUntil: 'load' });
+      if (await page.locator('#telemetry-ask').count()) {
+        fail('telemetry question', 'the question came back after No on the same version');
+      } else {
+        console.log('  ok   the dashboard asks once, and No puts it away for this version');
+      }
+    }
+
+    await ctx.close();
+  } finally {
+    proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The verify page cannot be reached against the demo — no secret is ever stored
+ * there — and it is the page a half-locked-out human meets first. So: a second
+ * instance with prepared state.
+ *
+ * socket_path points nowhere on purpose. The login path does not need the core,
+ * and the dashboard then shows its CoreErr banner, which is itself worth seeing.
+ * This scaffolding is also the only way to take two-factor-verify-{light,dark}
+ * at all.
+ */
+async function checkVerifyPage(browser) {
+  const dir = mkdtempSync(join(tmpdir(), 'easywall-ui-'));
+  const secret = 'JBSWY3DPEHPK3PXP';
+  // The hash comes out of the config run 1's wizard already wrote for PASS, so
+  // this needs no argon2 in JavaScript and no environment variable. An
+  // env-gated skip would be a check that never runs anywhere but on the machine
+  // of whoever set the variable — which is the same as not having the check.
+  const configPath = CONFIG_PATH;
+  const hash = readPasswordHash(configPath);
+  if (!hash) {
+    fail('second step', `could not read the password hash out of ${configPath}; ` +
+      'set EASYWALL_CONFIG to the web.toml run 1 signed in against');
+    return;
+  }
+  writeFileSync(join(dir, 'web.toml'), [
+    `bind_addr = "127.0.0.1:12228"`,
+    `socket_path = "${join(dir, 'nowhere.sock')}"`,
+    `ssl_dir = "${join(dir, 'ssl')}"`,
+    `data_dir = "${dir}"`,
+    `language = "en"`,
+    `session_key = "ui-check-session-key-32-bytes-long!!"`,
+    `username = "${USER}"`,
+    `password = "${hash}"`,
+    `totp_secret = "${secret}"`,
+    `recovery_codes = []`,
+    `update_check = false`,
+  ].join('\n'));
+
+  const proc = spawn('bin/easywall-web', ['-config', join(dir, 'web.toml')], { stdio: 'inherit' });
+  try {
+    await waitForPort('https://127.0.0.1:12228/login');
+
+    const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: 390, height: 1000 } });
+    const page = await ctx.newPage();
+
+    await page.goto('https://127.0.0.1:12228/login', { waitUntil: 'load' });
+    await page.fill('input[name=username]', USER);
+    await page.fill('input[name=password]', PASS);
+    await Promise.all([page.waitForLoadState('load'), page.click("form[action='/login'] button[type=submit]")]);
+
+    if (!page.url().includes('/login/verify')) {
+      fail('second step', `the password step landed on ${page.url()}, want /login/verify`);
+      return;
+    }
+
+    await page.fill('input[name=code]', totp(secret));
+    await Promise.all([page.waitForLoadState('load'), page.click("form[action='/login/verify'] button[type=submit]")]);
+    if (!page.url().includes('/dashboard')) {
+      fail('second step', `a correct code landed on ${page.url()}, want /dashboard`);
+    } else {
+      console.log('  ok   password → verify → dashboard');
+    }
+
+    // Three wrong codes and back to /login, with nothing saying which factor
+    // failed. Ending the session here means dropping the cookie, not asking for
+    // /logout: that route is refused with 405 on GET by design — see
+    // checkSignOutEndsTheSession — so a goto there leaves the browser signed in,
+    // and the /login GET below would redirect it straight past the form to
+    // /dashboard instead of presenting one to fill.
+    await ctx.clearCookies();
+    await page.goto('https://127.0.0.1:12228/login', { waitUntil: 'load' });
+    await page.fill('input[name=username]', USER);
+    await page.fill('input[name=password]', PASS);
+    await Promise.all([page.waitForLoadState('load'), page.click("form[action='/login'] button[type=submit]")]);
+    for (let i = 0; i < 3; i++) {
+      await page.fill('input[name=code]', '000000');
+      await Promise.all([page.waitForLoadState('load'), page.click("form[action='/login/verify'] button[type=submit]")]);
+    }
+    if (!page.url().endsWith('/login')) {
+      fail('second step', `three wrong codes left the browser at ${page.url()}, want /login`);
+    } else {
+      console.log('  ok   three wrong codes end the attempt');
+    }
+
+    await ctx.close();
+  } finally {
+    proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * A forwarding port must be stored as the number the field holds.
+ *
+ * "1E+04" is what a spreadsheet writes for 10000. The number input accepts it as
+ * valid, and parseInt("1E+04", 10) is 1 — so the rule that got saved was port 1,
+ * privileged and not the one anyone asked for, reported as success.
+ */
+async function checkForwardingPortIsNotReparsed(page) {
+  await page.goto(`${BASE}/forwarding`, { waitUntil: 'networkidle' });
+  const before = JSON.parse((await page.inputValue('#fwd-json')) || '[]');
+
+  await page.click('#add-fwd-btn');
+  const rows = await page.$$('#fwd-tbody tr[data-idx]');
+  const row = rows[rows.length - 1];
+  await (await row.$('.f-src')).click();
+  await page.keyboard.type('1E+04');
+  await (await row.$('.f-dst')).click();
+  await page.keyboard.type('9999');
+
+  const payload = JSON.parse((await page.inputValue('#fwd-json')) || '[]');
+  const added = payload.slice(before.length);
+  if (added.length !== 1) {
+    fail('forwarding payload', `expected 1 new row in the payload, got ${added.length}`);
+    return;
+  }
+  if (added[0].source_port !== 10000) {
+    fail('forwarding port re-parsed',
+      `typed "1E+04" (ten thousand); the payload carries source_port ${added[0].source_port}. ` +
+      'The editor is re-parsing the field text instead of reading valueAsNumber.');
+    return;
+  }
+
+  // And it survives the round trip, because the payload being right is only half
+  // of it — the server has to accept and store the same number.
+  await Promise.all([
+    page.waitForNavigation(),
+    page.click("#fwd-form button[type=submit]"),
+  ]);
+  await page.goto(`${BASE}/forwarding`, { waitUntil: 'networkidle' });
+  const stored = JSON.parse((await page.inputValue('#fwd-json')) || '[]');
+  // Stated as a positive and a negative, so the check does not depend on how many
+  // rules were already there: the rule asked for must exist, and the rule the bug
+  // produced must not.
+  const wanted = stored.some(r => r.source_port === 10000 && r.dest_port === 9999);
+  const truncated = stored.some(r => r.source_port === 1 && r.dest_port === 9999);
+  if (truncated) {
+    fail('forwarding round trip',
+      'a rule was stored forwarding privileged port 1 — the "1E+04" was truncated to its first digit');
+  } else if (!wanted) {
+    fail('forwarding round trip',
+      `no stored rule forwards 10000 -> 9999; stored: ${JSON.stringify(stored)}`);
+  } else {
+    console.log('  ok   a forwarding port of "1E+04" is stored as 10000');
+  }
+}
+
+/**
+ * All four cells of a forwarding row share one top edge.
+ *
+ * `display: flex` on a <td> stops the element being a table cell: the browser
+ * wraps it in an anonymous cell, its box leaves the row's height, and the row
+ * separator under that column sits ~10px below the others. Nothing in the Go
+ * suite or a stylesheet diff can see it — only a laid-out page can — and it is
+ * invisible below the 720px reflow breakpoint, where every td is a block.
+ */
+async function checkForwardingRowEdgesLineUp(page) {
+  await page.goto(`${BASE}/forwarding`, { waitUntil: 'networkidle' });
+  const measure = (sel) => page.evaluate((sel) => {
+    const row = document.querySelector(sel);
+    if (!row) return null;
+    return [...row.querySelectorAll('td')].map(td => td.getBoundingClientRect().top);
+  }, sel);
+
+  const seededTops = await measure('#fwd-tbody tr');
+  if (!seededTops) {
+    fail('forwarding row', 'no rows in #fwd-tbody — the demo seed changed');
+    return;
+  }
+  const seededSpread = Math.max(...seededTops) - Math.min(...seededTops);
+  if (seededSpread > 1) {
+    fail('forwarding row', `the four cells start ${seededSpread.toFixed(1)}px apart; ` +
+      'a display:flex <td> is not a table cell and leaves the row height');
+  } else {
+    console.log('  ok   forwarding row cells share one top edge');
+  }
+
+  // app.js builds the row a browser adds independently of forwarding.html —
+  // it drifted once (cell-flow survived a template rename to <div class="flow">)
+  // and nothing but a rendered, added row would have shown it.
+  await page.click('#add-fwd-btn');
+  const addedTops = await measure('#fwd-tbody tr:last-child');
+  if (!addedTops) {
+    fail('forwarding row', 'clicking #add-fwd-btn did not add a row to #fwd-tbody');
+    return;
+  }
+  const addedSpread = Math.max(...addedTops) - Math.min(...addedTops);
+  if (addedSpread > 1) {
+    fail('forwarding row', `the added row's cells start ${addedSpread.toFixed(1)}px apart; ` +
+      'app.js\'s fwdRowHTML has drifted from forwarding.html\'s markup');
+  } else {
+    console.log('  ok   added forwarding row cells share one top edge');
+  }
+
+  // The counter above the table was rendered once and never moved: "4 rules"
+  // over five rows until a reload. It is the ports page's updateRuleCount now.
+  const rows = await page.locator('#fwd-tbody tr[data-idx]').count();
+  const counted = parseInt(await page.textContent('#rules-count') ?? '', 10);
+  if (counted !== rows) {
+    fail('forwarding count', `the counter says ${counted} with ${rows} rows on the page`);
+  } else {
+    console.log(`  ok   the forwarding counter follows an added row (${rows})`);
+  }
+}
+
+/**
+ * The catalogue appends rows into fields that already work without it, and the
+ * sources field is one comma-separated input. Both were regressions waiting to
+ * happen in a different way: a picker that writes into a field the form does not
+ * read produces a page that looks right and saves nothing.
+ */
+async function checkPortsCatalogue(page) {
+  await page.goto(`${BASE}/ports?type=tcp`, { waitUntil: 'networkidle' });
+
+  // What is already there. A demo server that has been up across two
+  // invocations still holds run 1's rows, and asserting an absolute count then
+  // reported "picking Pi-hole added 4 TCP rows, expected 2" — which reads as a
+  // real regression and costs a bisect. CI never sees it: every run there
+  // starts a fresh easywall-web.
+  //
+  // Tolerated rather than reset. A check that deletes rules a maintainer was
+  // looking at is a bigger surprise than one that counts the difference.
+  const countPihole = () => page.$$eval('#rules-tbody tr[data-idx]',
+    trs => trs.filter(tr => tr.dataset.service === 'pihole').length);
+  const before = await countPihole();
+
+  await page.click('#catalogue-btn');
+  await page.click('.catalogue-item[data-service="pihole"]');
+
+  const rows = await page.$$eval('#rules-tbody tr[data-idx]', trs =>
+    trs.map(tr => ({
+      port: tr.querySelector('.f-port')?.value,
+      sources: tr.querySelector('.f-sources')?.value,
+      service: tr.dataset.service,
+    })));
+  const added = rows.filter(r => r.service === 'pihole');
+  if (added.length - before !== 2) {
+    fail('ports catalogue',
+      `picking Pi-hole added ${added.length - before} TCP rows, expected 2 (80, 53)` +
+      (before ? ` — ${before} were already there from an earlier run` : ''));
+    return;
+  }
+  // Measured, not assumed: the catalogue appends — web/static/app.js:255, :293
+  // and :442 all use tbody.appendChild — so this run's rows are the last two.
+  // Selected by their ports as well, because position alone would silently
+  // check an earlier run's row if that ever changes.
+  const fresh = added.slice(before);
+  const ports = fresh.map(r => r.port).sort();
+  if (ports.join(',') !== '53,80') {
+    fail('ports catalogue', `the two rows this run added are ports ${ports.join(', ')}, expected 53 and 80`);
+    return;
+  }
+  if (!fresh[0].sources.includes('fc00::/7')) {
+    fail('ports catalogue', `the private suggestion did not reach the field: "${fresh[0].sources}"`);
+  }
+
+  const payload = await page.$eval('#rules-json', el => el.value);
+  if (!payload.includes('"sources"') || !payload.includes('"service":"pihole"')) {
+    fail('ports catalogue', `the form payload dropped the new fields: ${payload.slice(0, 300)}`);
+  }
+}
+
+/**
+ * app.js's ruleRowHTML carries a comment requiring it to stay identical to the
+ * server-rendered row in ports.html — same column order, same classes, same
+ * data-label values, same chip. Nothing checked that beyond eyeballing it, so
+ * the two are free to drift the next time either one is touched alone.
+ *
+ * Pick a catalogue row (browser-built, via ruleRowHTML) and read its shape;
+ * save and reload (server-rendered, via ports.html) and read the same row's
+ * shape; they must be the same markup, not just the same values.
+ */
+async function checkPortsRowAgreesWithServer(page) {
+  await page.goto(`${BASE}/ports?type=tcp`, { waitUntil: 'networkidle' });
+  await page.click('#catalogue-btn');
+  await page.click('.catalogue-item[data-service="pihole"]');
+
+  // The *last* matching row, not the first: on a demo server kept up across
+  // invocations, an earlier run's Pi-hole rows are still there, rendered
+  // ahead of whatever this run just appended (app.js's tbody.appendChild —
+  // the same fact checkPortsCatalogue's delta count relies on). $eval takes
+  // the first DOM match, so it would pick that stale row both before and
+  // after the save below, compare it against itself, and pass — the same
+  // "check:ui is not re-runnable" defect the count fix closed, just failing
+  // toward green instead of red. Do not "simplify" this back to $eval.
+  const shape = () => page.$$eval('#rules-tbody tr[data-service="pihole"]', trs => {
+    const tr = trs[trs.length - 1];
+    return {
+      trClasses: tr.className,
+      cells: [...tr.querySelectorAll('td')].map(td => ({
+        classes: td.className,
+        label: td.getAttribute('data-label'),
+        chip: td.querySelector('.chip')?.textContent.trim() ?? null,
+      })),
+    };
+  });
+
+  let clientShape;
+  try {
+    clientShape = await shape();
+  } catch {
+    fail('ports row agreement', 'picking Pi-hole did not add a tr[data-service="pihole"] row to compare');
+    return;
+  }
+
+  await Promise.all([
+    page.waitForNavigation(),
+    page.click("#ports-form button[type=submit]"),
+  ]);
+  await page.goto(`${BASE}/ports?type=tcp`, { waitUntil: 'networkidle' });
+
+  let serverShape;
+  try {
+    serverShape = await shape();
+  } catch {
+    fail('ports row agreement', 'the saved catalogue row was not there after reload — could not compare');
+    return;
+  }
+
+  const before = JSON.stringify(clientShape);
+  const after = JSON.stringify(serverShape);
+  if (before !== after) {
+    fail('ports row agreement',
+      `the browser-built row (ruleRowHTML) and the server-rendered row (ports.html) disagree.\n` +
+      `  client: ${before}\n  server: ${after}`);
+  } else {
+    console.log('  ok   the catalogue-built row matches the server-rendered row after save and reload');
+  }
+}
+
+/**
+ * The apply screen actually draws the preview, and the verdict names an address.
+ *
+ * The demo seeds a configuration drift, so /apply always has something to show.
+ * A Go test can assert the handler built the data; only a browser can say the
+ * page rendered it, that the mono column lines up, and that nothing scrolls
+ * sideways at 390px with a long custom rule in the diff.
+ */
+async function checkApplyPreview(page) {
+  await page.goto(`${BASE}/apply`, { waitUntil: 'networkidle' });
+
+  if (await page.locator('.diff-row').count() === 0) {
+    fail('apply preview', 'no .diff-row on /apply — the demo seeds a drift, so the page should list it');
+    return;
+  }
+  const verdict = page.locator('.verdict-addr');
+  if (await verdict.count() === 0) {
+    fail('apply preview', 'no verdict line — the page does not say where the request came from');
+  } else if (!/->|→/.test(await verdict.first().innerText())) {
+    fail('apply preview', `the verdict line does not name an address and a port: ${await verdict.first().innerText()}`);
+  } else {
+    console.log('  ok   /apply shows the diff and names the connection it is about');
+  }
+}
+
+/**
+ * /blocked's live tail (2.21.1 F3, F12; 2.25.2). It must not move what the
+ * operator is pointing at or destroy what has keyboard focus, must say when
+ * and why it is paused, must ask only for what is new, and must stop asking
+ * while the Pause button is pressed. The demo refuses a packet every 7 s, so
+ * 12 s is at least one poll with new rows either way.
+ */
+async function checkBlockedTailHoldsStill(page) {
+  const rowsSeen = [];
+  const onResponse = async res => {
+    if (!res.url().includes('/blocked/rows')) return;
+    rowsSeen.push({ url: res.url(), status: res.status(), swap: res.headers()['hx-reswap'] || '',
+                    bytes: (await res.body().catch(() => Buffer.alloc(0))).length });
+  };
+  page.on('response', onResponse);
+  try {
+    await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+    if (await page.locator('#blocked-rows details').count() === 0) {
+      fail('blocked tail', 'no rows to observe — the demo produced no refused packets');
+      return;
+    }
+    const firstSeq = () => page.$eval('#blocked-rows details', d => d.id);
+    const stateText = () => page.$eval('#blocked-live-state', s => s.textContent.trim());
+    const liveText = await page.$eval('#blocked-live-state', s => s.dataset.live);
+    if (/["'\\]/.test(liveText)) fail('blocked tail', `the live state reads ${liveText} — an attribute named data-on* is escaped as script`);
+
+    await page.hover('#blocked-rows tr:first-child td:first-child');
+    const underPointer = await firstSeq();
+    await page.waitForTimeout(12000);
+    if (await firstSeq() !== underPointer) fail('blocked tail', 'rows moved while the pointer was on the table');
+    if (await stateText() === liveText) fail('blocked tail', 'the state line says live while the pointer pauses the tail');
+
+    rowsSeen.length = 0;
+    await page.mouse.move(5, 5);
+    await page.waitForTimeout(12000);
+    if (await firstSeq() === underPointer) fail('blocked tail', 'the tail did not resume after the pointer left the table');
+    if (await stateText() !== liveText) fail('blocked tail', `the state line reads "${await stateText()}" while live`);
+    // "Nothing new answers 204", asked directly: waiting for an idle poll
+    // depended on the 5 s poll's phase against the demo's 7 s packets. A
+    // packet landing between the read and the request answers 200; then ask
+    // again after the newest row that answer carried.
+    let seq = await page.$eval('#blocked-rows tr[data-seq]', tr => tr.dataset.seq);
+    let quiet;
+    for (let i = 0; i < 3; i++) {
+      const r = await page.request.get(`${BASE}/blocked/rows?after=${seq}`);
+      quiet = r.status();
+      if (quiet === 204) break;
+      seq = (/data-seq="(\d+)"/.exec(await r.text()) || [])[1] || await page.$eval('#blocked-rows tr[data-seq]', tr => tr.dataset.seq);
+    }
+    if (quiet !== 204) fail('blocked tail', `/blocked/rows?after=${seq} answered ${quiet}, not 204 — nothing new must answer 204`);
+    const asked = rowsSeen.filter(r => r.status === 200 || r.status === 204);
+    if (asked.length === 0 || !asked.every(r => /[?&]after=\d+/.test(r.url))) {
+      fail('blocked tail', `a poll did not carry after=<seq>: ${asked.map(r => r.url).join(', ')}`);
+    }
+    if (asked.some(r => r.status === 200 && r.swap !== 'afterbegin')) {
+      fail('blocked tail', 'a poll with new rows answered with the whole view');
+    }
+    const marked = await page.locator('#blocked-rows tr.pkt-new').count();
+    if (marked === 0) fail('blocked tail', 'the newest batch is not marked');
+    const limit = await page.$eval('#blocked-rows', t => Number(t.dataset.limit));
+    if (await page.locator('#blocked-rows tr[data-seq]').count() > limit) fail('blocked tail', `more than ${limit} rows on the page`);
+
+    await page.click('#blocked-live-toggle');
+    await page.mouse.move(5, 5);
+    // The label says what a click does; aria-pressed on a button whose label
+    // changes would announce "Resume, pressed" (ARIA APG, Button).
+    const toggleState = await page.$eval('#blocked-live-toggle', b =>
+      ({ text: b.textContent.trim(), resume: b.dataset.resume, pressed: b.hasAttribute('aria-pressed') }));
+    if (toggleState.text !== toggleState.resume) {
+      fail('blocked tail', `the button reads "${toggleState.text}" after Pause; want "${toggleState.resume}"`);
+    }
+    if (toggleState.pressed) fail('blocked tail', 'the Pause button carries aria-pressed while its label changes');
+    await page.waitForTimeout(500);       // a poll in flight at the click lands before the count starts
+    rowsSeen.length = 0;
+    const paused = await firstSeq();
+    await page.waitForTimeout(12000);
+    if (rowsSeen.length > 0) fail('blocked tail', `${rowsSeen.length} polls were sent while paused`);
+    if (await firstSeq() !== paused) fail('blocked tail', 'rows arrived while paused');
+    await page.click('#blocked-live-toggle');
+    await page.mouse.move(5, 5);
+    await page.waitForTimeout(7000);
+    if (await firstSeq() === paused) fail('blocked tail', 'Resume did not catch up');
+
+    if (await page.locator('#blocked-rows .pkt-actions .btn').count() === 0) {
+      fail('blocked tail', 'no row action to focus — the demo produced no refused packets');
+      return;
+    }
+    await page.focus('#blocked-rows .pkt-actions .btn');
+    const label = await page.evaluate(() => document.activeElement.textContent.trim());
+    const focusText = await page.$eval('#blocked-live-state', s => s.dataset.focus);
+    await page.waitForTimeout(12000);
+    if (await stateText() !== focusText) fail('blocked tail', `the state line reads "${await stateText()}" while a row button has focus`);
+    const still = await page.evaluate(() => {
+      const a = document.activeElement;
+      return a && a.isConnected && !!a.closest('#blocked-rows') ? a.textContent.trim() : null;
+    });
+    if (still !== label) {
+      fail('blocked tail', `keyboard focus on "${label}" was lost to ${still === null ? 'the page' : `"${still}"`}`);
+      return;
+    }
+    console.log('  ok   blocked tail asks only for what is new, holds still under pointer, focus and Pause, says so, resumes after');
+  } finally {
+    page.off('response', onResponse);
+  }
+}
+
+/**
+ * The state line's paused sentence is longer than "Live" and must not move the
+ * button or wrap the toolbar (2.25.2 final review): a table that moves under
+ * the pointer fires pointerleave, and the tail oscillates between live and
+ * paused. Before the fix, en at 390px grew the toolbar from 80 to 113px.
+ */
+async function checkBlockedTailStateHoldsTheLayout(browser, session) {
+  let n = 0;
+  for (const width of [1600, 900, 390]) {
+    for (const lang of ['en', 'de']) {
+      const ctx = await browser.newContext({ ignoreHTTPSErrors: true, storageState: session,
+        viewport: { width, height: 900 } });
+      await ctx.addCookies([{ name: 'easywall_lang', value: lang, url: BASE }]);
+      const page = await ctx.newPage();
+      await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+      const layout = () => page.evaluate(() => ({
+        toolbar: document.getElementById('blocked-live-state').closest('.toolbar').getBoundingClientRect().height,
+        table: document.getElementById('blocked-rows').getBoundingClientRect().top + window.scrollY,
+      }));
+      await page.mouse.move(1, 1);
+      const live = await layout();
+      await page.hover('#blocked-rows tr:first-child td:first-child');
+      const paused = await page.waitForFunction(() => {
+        const s = document.getElementById('blocked-live-state');
+        return s.textContent === s.dataset.pointer;
+      }, null, { timeout: 3000 }).then(() => true, () => false);
+      const ptr = await layout();
+      await ctx.close();
+      const where = `${lang} ${width}px`;
+      if (!paused) { fail('blocked tail layout', `${where}: the state line never said the pointer pauses it`); continue; }
+      if (ptr.toolbar !== live.toolbar || ptr.table !== live.table) {
+        fail('blocked tail layout', `${where}: the paused state line moved the layout — toolbar ` +
+          `${live.toolbar}→${ptr.toolbar}px, table top ${live.table}→${ptr.table}px`);
+        continue;
+      }
+      n++;
+    }
+  }
+  if (n === 6) console.log('  ok   blocked tail state line moves neither toolbar nor table, en/de at 1600/900/390');
+}
+
+/**
+ * A tail that loses its session navigates to /login rather than swapping the
+ * login page into the table. The middleware answered htmx with a 303, which
+ * the XHR followed, and /login rendered inside /blocked's Time column.
+ */
+async function checkASignedOutTailNavigates(browser, session) {
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, storageState: session });
+  const page = await ctx.newPage();
+  await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+  await page.mouse.move(1, 1);            // the tail pauses under the pointer
+  await ctx.clearCookies();               // the session is gone, as after a timeout
+  await page.waitForURL(/\/login$/, { timeout: 12000 }).catch(() => {});
+  const url = page.url();
+  const swapped = await page.locator('#blocked-rows form[action="/login"]').count();
+  await ctx.close();
+  if (swapped > 0) { fail('signed-out tail', 'the login form was swapped into #blocked-rows'); return; }
+  if (!url.endsWith('/login')) { fail('signed-out tail', `still at ${url} after the session ended`); return; }
+  console.log('  ok   a signed-out tail navigates to /login');
+}
+
+/**
+ * A default-drop row says why, and a module's chip leads to its card
+ * (2.23 G1, G4). The demo's shapes include a closed port, a port open only
+ * for other sources and an IPv4 ping refused by Answer pings, whose sentence
+ * links to the switch, so every default-drop row on the page has a reason to
+ * give; one without is the defect, as is a sentence still
+ * carrying its message id or an unfilled placeholder.
+ */
+async function checkBlockedSaysWhy(page) {
+  await page.goto(`${BASE}/blocked?rule=drop`, { waitUntil: 'networkidle' });
+  const r = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll('#blocked-rows tr')].filter(tr => tr.querySelector('.log-action'));
+    const whys = rows.map(tr => (tr.querySelector('.pkt-why') || {}).textContent || '');
+    return { n: rows.length, missing: whys.filter(w => !w.trim()).length,
+      raw: whys.filter(w => w.includes('blocked_why_') || w.includes('<no value>')) };
+  });
+  if (r.n === 0) { fail('blocked reasons', 'no default-drop rows — the demo produced none'); return; }
+  if (r.missing) { fail('blocked reasons', `${r.missing} of ${r.n} default-drop rows give no reason`); return; }
+  if (r.raw.length) { fail('blocked reasons', `unrendered: ${r.raw[0]}`); return; }
+
+  await page.goto(`${BASE}/blocked?rule=portscan`, { waitUntil: 'networkidle' });
+  const href = await page.getAttribute('#blocked-rows a.log-action', 'href').catch(() => null);
+  if (!href || !href.startsWith('/options#opt-')) { fail('blocked reasons', `a port-scan chip leads to ${href}`); return; }
+  await page.goto(`${BASE}${href}`, { waitUntil: 'networkidle' });
+  if (await page.locator(`#${href.split('#')[1]}`).count() !== 1) {
+    fail('blocked reasons', `${href} names no card on /options`);
+    return;
+  }
+  await page.goto(`${BASE}/blocked?rule=drop&proto=icmp`, { waitUntil: 'networkidle' });
+  const pingHref = await page.getAttribute('#blocked-rows .pkt-why a.link', 'href').catch(() => null);
+  if (pingHref !== '/options#opt-icmp_allow_echo_request') { fail('blocked reasons', `a ping_off row leads to ${pingHref}`); return; }
+  await page.goto(`${BASE}${pingHref}`, { waitUntil: 'networkidle' });
+  if (await page.locator('#opt-icmp_allow_echo_request').count() !== 1) {
+    fail('blocked reasons', `${pingHref} names no card on /options`);
+    return;
+  }
+  console.log(`  ok   ${r.n} default-drop rows each say why; a module chip reaches its card; a refused ping reaches its switch`);
+}
+
+/**
+ * The Feeds card on /blocklist (2.23 Task 7). A switch stages — the row then
+ * says it is on once applied, not that it is live — and a ✗ feed is refused
+ * without its own confirmation box, by the server, so this submits the form
+ * the way a browser without JavaScript would. Every source and terms link
+ * opens in a tab that cannot reach back (P17), and no password field carries
+ * a value. The demo is left as it was found: the feed switched on is
+ * switched off again.
+ */
+async function checkFeedsCard(page) {
+  await page.goto(`${BASE}/blocklist`, { waitUntil: 'networkidle' });
+  const rows = await page.locator('#feeds tr[id^="feed-"]').count();
+  if (rows < 10) { fail('feeds card', `${rows} feed rows on /blocklist, want the ten catalogue feeds`); return; }
+  const order = await page.$$eval('#feeds tr[id^="feed-"]', trs => trs.slice(0, 3).map(t => t.id));
+  if (order.join() !== 'feed-spamhaus-drop,feed-dshield,feed-blocklist-de-ssh') {
+    fail('feeds card', `first rows ${order.join()}, want Spamhaus DROP, DShield, blocklist.de (SSH)`); return;
+  }
+  const badLinks = await page.$$eval('#feeds a[target="_blank"]', as => as
+    .filter(a => !/\bnoopener\b/.test(a.rel) || !/\bnoreferrer\b/.test(a.rel) || !a.href.startsWith('https://'))
+    .map(a => a.outerHTML));
+  const links = await page.locator('#feeds a[target="_blank"]').count();
+  if (links < 20 || badLinks.length) { // a source and a terms link for each of the ten
+    fail('feeds card', `${links} source/terms links; without noopener noreferrer or https: ${badLinks[0] || 'none'}`);
+    return;
+  }
+  const echoed = await page.$$eval('#feeds input[type="password"]', ps => ps.filter(p => p.hasAttribute('value') || p.value !== '').length);
+  if (echoed) { fail('feeds card', `${echoed} password field(s) carry a value`); return; }
+
+  const tor = '#feed-tor-exits';
+  if (await page.isChecked(`${tor} input[name="feed"]`)) { fail('feeds card', 'Tor exits is already switched on in the demo'); return; }
+  await page.check(`${tor} input[name="feed"]`);
+  await Promise.all([page.waitForNavigation(), page.click('form[action="/blocklist/feeds"] button[type="submit"]')]);
+  if (await page.isChecked(`${tor} input[name="feed"]`)) {
+    fail('feeds card', 'a ✗ feed was staged without its confirmation box');
+    return;
+  }
+  if (!/Nothing was staged/.test(await page.locator('.alert').first().innerText())) {
+    fail('feeds card', 'the refusal of a ✗ feed without confirmation says nothing');
+    return;
+  }
+
+  await page.check(`${tor} input[name="feed"]`);
+  await page.check(`${tor} input[name="confirm"]`);
+  await Promise.all([page.waitForNavigation(), page.click('form[action="/blocklist/feeds"] button[type="submit"]')]);
+  const state = await page.locator(`${tor} .status-dot.pending`).first().innerText().catch(() => '');
+  const staged = await page.isChecked(`${tor} input[name="feed"]`);
+  await page.uncheck(`${tor} input[name="feed"]`);
+  await Promise.all([page.waitForNavigation(), page.click('form[action="/blocklist/feeds"] button[type="submit"]')]);
+  if (!staged || !/apply/i.test(state)) {
+    fail('feeds card', `a confirmed ✗ feed did not stage as "on once you apply": checked=${staged}, state "${state}"`);
+    return;
+  }
+  if (await page.isChecked(`${tor} input[name="feed"]`)) { fail('feeds card', 'Tor exits could not be switched off again'); return; }
+  console.log(`  ok   feeds card: ${rows} rows, ${links} links with rel, a ✗ feed refused unconfirmed, staged once confirmed`);
+}
+
+/**
+ * The Countries card on /blocklist (2.26). The demo's Antarctica has a row and
+ * a /blocked chip that leads to it. Adding a country stages it — its row says
+ * on once applied — and a save of the Feeds card keeps it: that form carries
+ * no country, and saving it once switched every country off. Remove takes
+ * the row away again, so the demo is left as it was found.
+ */
+async function checkCountriesCard(page) {
+  await page.goto(`${BASE}/blocked?rule=feed`, { waitUntil: 'networkidle' });
+  if (await page.locator('#blocked-rows a.log-action[href="/blocklist#country-aq"]').count() === 0) {
+    fail('countries card', 'no /blocked chip leads to the demo\'s Antarctica row');
+    return;
+  }
+  await page.goto(`${BASE}/blocklist`, { waitUntil: 'networkidle' });
+  if (await page.locator('#countries tr#country-aq').count() !== 1) { fail('countries card', 'the demo\'s Antarctica row is missing'); return; }
+  const flag = await page.$eval('#country-aq .feed-title img.flag', i => i.decode().catch(() => {}).then(() => i.naturalWidth)).catch(() => 0);
+  if (!flag) { fail('countries card', 'Antarctica\'s flag did not load'); return; }
+  const offered = await page.locator('#country-add option[value^="country-"]').count();
+  if (offered < 200) { fail('countries card', `${offered} countries offered, want every one not switched on`); return; }
+
+  await page.selectOption('#country-add', 'country-is');
+  await Promise.all([page.waitForNavigation(), page.click('#countries form.editor-foot button[type="submit"]')]);
+  const state = await page.locator('#country-is .status-dot.pending').first().innerText().catch(() => '');
+  if (!/apply/i.test(state)) { fail('countries card', `an added country reads "${state}", not "on once you apply"`); return; }
+  await Promise.all([page.waitForNavigation(), page.click('form[action="/blocklist/feeds"] button[type="submit"]')]);
+  if (await page.locator('#country-is').count() !== 1) { fail('countries card', 'saving the Feeds card switched the country off'); return; }
+  await Promise.all([page.waitForNavigation(), page.click('#country-is button[name="remove"]')]);
+  if (await page.locator('#country-is').count() !== 0) { fail('countries card', 'Remove left the row'); return; }
+  console.log(`  ok   countries card: Antarctica's row, flag and chip, ${offered} offered, an added country staged, kept by the Feeds save, removed`);
+}
+
+/**
+ * The country column (2.27). The demo's own table names its documentation
+ * sources — the packet Antarctica's feed refused reads AQ — and Block stages a
+ * country exactly as the Countries card's Add does: the flash is green, the
+ * row offers it no more, and the card lists it. Removed again on the card, so
+ * the demo is left as the next check found it.
+ */
+async function checkBlockedNamesCountries(page) {
+  await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+  const head = await page.$eval('#blocked-rows', t => t.closest('table').querySelector('thead th[title]')?.textContent.trim() || '');
+  if (!head) { fail('country column', 'no Country header — is country_lookup = true in the demo config?'); return; }
+  const cells = await page.$$eval('#blocked-rows button.cc-code[title]', as => [...new Set(as.map(a => `${a.textContent}=${a.title}`))]);
+  if (!cells.includes('AQ=Antarctica')) { fail('country column', `no row reads AQ: ${cells.join(', ')}`); return; }
+  // 2.27.1: every flag loaded — a 404 or a CSP refusal is an image with no
+  // natural width — and each is drawn 20x15.
+  const flags = await page.$$eval('#blocked-rows img.flag', imgs => Promise.all(imgs.map(i => i.decode().catch(() => {}).then(() => {
+    const r = i.getBoundingClientRect();
+    return { src: i.getAttribute('src'), w: i.naturalWidth, box: `${Math.round(r.width)}x${Math.round(r.height)}` };
+  }))));
+  const broken = flags.filter(f => f.w === 0 || f.box !== '20x15');
+  if (flags.length === 0 || broken.length) { fail('country column', `${flags.length} flags, broken or resized: ${[...new Set(broken.map(f => `${f.src} ${f.box}`))].join(', ')}`); return; }
+  // The code opens its name on a click (the Popover API), under the code, and
+  // Escape closes it.
+  const code = page.locator('#blocked-rows button.cc-code[title="Antarctica"]').first();
+  await code.click();
+  const pop = await page.evaluate(() => {
+    const p = document.querySelector('#blocked-rows .cc-pop:popover-open');
+    if (!p) return null;
+    const b = document.querySelector(`[popovertarget="${p.id}"]`).getBoundingClientRect(), r = p.getBoundingClientRect();
+    return { text: p.textContent, below: r.top >= b.bottom && r.top - b.bottom < 16 && Math.abs(r.left - b.left) < 40 };
+  });
+  if (!pop || !pop.text.startsWith('Antarctica ')) { fail('country column', `a click on AQ opened ${pop ? `"${pop.text}"` : 'no popover'}`); return; }
+  if (!pop.below) { fail('country column', 'the name opened away from its code'); return; }
+  await page.keyboard.press('Escape');
+  if (await page.locator('#blocked-rows .cc-pop:popover-open').count() !== 0) { fail('country column', 'Escape left the name open'); return; }
+  // At 390 the card layout names the country in full, with no tap; the code
+  // and its popover are not drawn.
+  await page.setViewportSize({ width: 390, height: 1000 });
+  const phone = await page.evaluate(() => {
+    const seen = el => el && el.getClientRects().length > 0;
+    const cell = [...document.querySelectorAll('#blocked-rows .cc')].find(c => c.querySelector('.cc-code[title="Antarctica"]'));
+    return { long: seen(cell?.querySelector('.cc-long')) ? cell.querySelector('.cc-long').textContent : '', code: seen(cell?.querySelector('.cc-code')) };
+  });
+  await page.setViewportSize({ width: 1600, height: 1000 });
+  if (!phone.long.startsWith('Antarctica (AQ) ') || phone.code) { fail('country column', `at 390px the cell shows "${phone.long}"${phone.code ? ' and the code button' : ''}`); return; }
+  const block = page.locator('#blocked-rows form:has(input[name="cc"][value="tk"]) button').first();
+  if (await block.count() === 0) { fail('country column', 'no row offers Block TK'); return; }
+  if (await page.locator('#blocked-rows form:has(input[name="cc"][value="aq"])').count() !== 0) {
+    fail('country column', 'Block AQ is offered although Antarctica is switched on'); return;
+  }
+  await Promise.all([page.waitForNavigation(), block.click()]);
+  if (await page.locator('.alert.alert-ok').count() === 0) { fail('country column', 'Block TK did not say it was staged'); return; }
+  if (await page.locator('#blocked-rows input[name="cc"][value="tk"]').count() !== 0) {
+    fail('country column', 'Block TK is still offered once Tokelau is staged'); return;
+  }
+  await page.goto(`${BASE}/blocklist`, { waitUntil: 'networkidle' });
+  if (await page.locator('#country-tk').count() !== 1) { fail('country column', 'the Countries card does not list Tokelau'); return; }
+  await Promise.all([page.waitForNavigation(), page.click('#country-tk button[name="remove"]')]);
+  console.log(`  ok   country column: ${cells.join(', ')}; ${flags.length} flags loaded at 20x15, AQ's name opens under it on a click, "Antarctica (AQ)" at 390px; Block TK staged it, the row offered it no more, the card removed it`);
+}
+
+/**
+ * The Country filter (2.29 D7, D11). The first row's country chosen in the
+ * filter bar leaves only that country's rows, counted over the whole log —
+ * never fewer than are shown — and the popover's "Only this country" leads to
+ * the same kind of view.
+ */
+async function checkBlockedFiltersByCountry(page) {
+  await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+  const cc = (await page.locator('#blocked-rows button.cc-code').first().textContent().catch(() => '')).trim().toLowerCase();
+  if (!cc) { fail('country filter', 'no row names a country'); return; }
+  await page.selectOption('select[name="country"]', cc);
+  await Promise.all([page.waitForNavigation(), page.click('form.pkt-filters button[type="submit"]')]);
+  if (!page.url().includes(`country=${cc}`)) { fail('country filter', `the form led to ${page.url()}`); return; }
+  const codes = await page.$$eval('#blocked-rows tr[data-seq]', trs => trs.map(tr => tr.querySelector('.cc-code')?.textContent.trim().toLowerCase() || '—'));
+  const others = codes.filter(c => c !== cc);
+  if (codes.length === 0 || others.length) { fail('country filter', `${codes.length} rows, ${others.length} of them not ${cc}: ${[...new Set(others)].join(', ')}`); return; }
+  const count = await page.locator('.toolbar-count').textContent();
+  const m = count.match(/(\d+)\D+(\d+)/);
+  if (!m || Number(m[1]) !== codes.length || Number(m[2]) < codes.length) { fail('country filter', `the count reads "${count}" over ${codes.length} rows`); return; }
+  await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+  await page.locator('#blocked-rows button.cc-code').first().click();
+  const link = page.locator('#blocked-rows .cc-pop:popover-open a');
+  if (await link.count() !== 1) { fail('country filter', 'the name\'s popover has no link'); return; }
+  await Promise.all([page.waitForNavigation(), link.click()]);
+  if (!/[?&]country=[a-z]{2}\b/.test(page.url())) { fail('country filter', `Only this country led to ${page.url()}`); return; }
+  console.log(`  ok   country filter: ${cc.toUpperCase()} chosen leaves ${codes.length} rows, all ${cc.toUpperCase()}, "${count.trim()}"; the popover's link leads to ${new URL(page.url()).search}`);
+}
+
+/**
+ * A /blocked card at 390px in German keeps an address whole and its Details
+ * clear of the buttons. The card's td is a flex row with overflow-wrap:
+ * anywhere, so each link of the route used to be its own flex item and broke
+ * mid-number ("192.0.2 / .140"), and "Sperrliste bearbeiten" ran into
+ * "Details" — while every width check here stayed green, because nothing
+ * overflowed its container.
+ */
+async function checkBlockedCardsKeepValuesWhole(browser, session) {
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, storageState: session });
+  await ctx.addCookies([{ name: 'easywall_lang', value: 'de', url: BASE }]);
+  const page = await ctx.newPage();
+  await page.setViewportSize({ width: 390, height: 1000 });
+  await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+  const bad = await page.evaluate(() => {
+    const out = [];
+    const rows = document.querySelectorAll('#blocked-rows tr');
+    // Every link in a flow cell, not .pkt-route's: the check must still see
+    // the links if the grouping is lost. Lines are counted on a Range over the
+    // text, because a blockified flex item reports one rect however it wraps.
+    // Only drawn text: an .sr-only span (the country in "Only this country")
+    // is positioned off the line and would count as a second one.
+    const lines = el => {
+      const tops = new Set();
+      const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+      for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+        if (n.parentElement.closest('.sr-only')) continue;
+        const r = document.createRange();
+        r.selectNodeContents(n);
+        for (const q of r.getClientRects()) tops.add(Math.round(q.top));
+      }
+      return tops.size;
+    };
+    for (const a of document.querySelectorAll('#blocked-rows td.pkt-flow a')) {
+      // An IPv4 address or a port fits a 390px line; only a long IPv6 may break.
+      if (!a.textContent.includes('::') && lines(a) > 1) out.push(`"${a.textContent}" breaks across lines`);
+    }
+    for (const tr of rows) {
+      const s = tr.querySelector('.pkt-detail summary');
+      if (!s) continue;
+      if (lines(s) > 1) out.push('"Details" wraps onto two lines');
+      const r = s.getBoundingClientRect();
+      for (const b of tr.querySelectorAll('.pkt-actions .btn')) {
+        const q = b.getBoundingClientRect();
+        if (r.left < q.right && q.left < r.right && r.top < q.bottom && q.top < r.bottom) out.push(`"Details" overlaps "${b.textContent.trim()}"`);
+      }
+    }
+    return { out: [...new Set(out)], n: rows.length };
+  });
+  await ctx.close();
+  if (bad.n === 0) { fail('blocked cards at 390px [de]', 'no rows to measure'); return; }
+  if (bad.out.length) { fail('blocked cards at 390px [de]', bad.out.slice(0, 5).join('; ')); return; }
+  console.log('  ok   blocked cards keep addresses whole and Details clear at 390px in German');
+}
+
+/**
+ * An open /options disclosure fits its card at 390px in German. The bogon
+ * filter's, because its German "Kann stören" line is the longest of the
+ * fourteen. .module is overflow: hidden, so a line running past the card is
+ * clipped in place — the page does not widen and no scroll container
+ * overflows, so neither check above can see it.
+ */
+async function checkOptionsDisclosureFits(browser, session) {
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, storageState: session });
+  await ctx.addCookies([{ name: 'easywall_lang', value: 'de', url: BASE }]);
+  const page = await ctx.newPage();
+  await page.setViewportSize({ width: 390, height: 1000 });
+  await page.goto(`${BASE}/options`, { waitUntil: 'networkidle' });
+  const card = page.locator('#opt-bogon_filter');
+  await card.locator('.module-help summary').click();
+  const bad = await card.evaluate(el => {
+    const out = [];
+    const details = el.querySelector('.module-help');
+    if (!details.open) out.push('the disclosure did not open');
+    const lines = n => {
+      const r = document.createRange();
+      r.selectNodeContents(n);
+      return new Set([...r.getClientRects()].map(q => Math.round(q.top))).size;
+    };
+    if (lines(details.querySelector('summary')) > 1) out.push('the summary wraps');
+    const box = el.getBoundingClientRect();
+    for (const n of details.querySelectorAll('summary, dt, dd, a')) {
+      const what = `<${n.tagName.toLowerCase()}> "${n.textContent.trim().slice(0, 32)}"`;
+      const r = n.getBoundingClientRect();
+      if (r.width === 0) out.push(`${what} is not laid out`);
+      if (r.left < box.left - 0.5 || r.right > box.right + 0.5) out.push(`${what} runs past the card`);
+      if (n.scrollWidth > n.clientWidth + 1) out.push(`${what} is clipped`);
+    }
+    return out;
+  });
+  const overflow = await page.evaluate(
+    () => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+  if (overflow > 0) bad.push(`the page scrolls ${overflow}px sideways`);
+  await checkContainersDoNotOverflow(page, 'de 390px, disclosure open', '/options');
+  await ctx.close();
+  if (bad.length) { fail('options disclosure at 390px [de]', bad.join('; ')); return; }
+  console.log('  ok   an open /options disclosure fits its card at 390px in German');
+}
+
+/**
+ * Adds one port rule via #add-rule-btn — the same control
+ * checkForwardingPortIsNotReparsed already drives for the forwarding table,
+ * since ports.html's row editor works the same way: click to append a row,
+ * then fill its fields.
+ *
+ * Skips the click if the port is already staged. This function saves what it
+ * adds, and the demo server this runs against keeps its state across runs
+ * (see democlient.go's own comment on that) — so a rerun must not pile a
+ * second, identical row onto whatever the previous run already left behind.
+ */
+async function addPortRule(page, port, description = '') {
+  const already = await page.$$eval('#rules-tbody tr[data-idx] .f-port',
+    (els, port) => els.some(el => el.value === port), port);
+  if (already) return;
+
+  await page.click('#add-rule-btn');
+  const rows = await page.$$('#rules-tbody tr[data-idx]');
+  const row = rows[rows.length - 1];
+  await (await row.$('.f-port')).fill(port);
+  if (description) await (await row.$('.f-desc')).fill(description);
+}
+
+/**
+ * Set the acceptance window's duration through the interface, stage something
+ * nameable, and press Apply — shared by checkAcceptanceWindow (the
+ * WINDOW_SECONDS floor, so the health-check run does not wait two minutes)
+ * and the apply-window screenshot (the shipped 120s default, so the
+ * remaining time in the shot reads plausibly). One place opens a window, not
+ * two.
+ *
+ * A no-op if a window from an earlier run is already open — a second apply is
+ * refused, not queued, and an already-open window is exactly what a caller
+ * wants here regardless of who opened it.
+ *
+ * 9443, not 8443: the demo seeds 8443 into both Current and Staged from the
+ * start (see democlient.go's seed()), so staging it again is not a change —
+ * DiffRules would show nothing. 9443 is not in the seed on either side.
+ */
+async function openAcceptanceWindow(page, durationSeconds) {
+  await page.goto(`${BASE}/apply`, { waitUntil: 'networkidle' });
+  if (await page.locator('#rollback-btn').count()) return;
+
+  // This form posts through htmx (hx-swap="none"), so the click never
+  // navigates anywhere — waitForNavigation here would just hang until its own
+  // timeout. Waiting for the response the click itself starts is the same fix
+  // signIn uses for /login, for the same reason: a load-state wait can resolve
+  // against a page that was already there before the request finished.
+  await page.goto(`${BASE}/system`, { waitUntil: 'networkidle' });
+  await page.fill('input[name=acceptance_duration]', String(durationSeconds));
+  const [saved] = await Promise.all([
+    page.waitForResponse(r => r.url().endsWith('/system') && r.request().method() === 'POST'),
+    page.click("form[action='/system'] button[type=submit]"),
+  ]);
+  if (!saved.ok()) {
+    throw new Error(`saving a ${durationSeconds}s window on /system answered ${saved.status()}`);
+  }
+
+  // Stage something nameable, then apply. Everything up to the click on
+  // #start-btn happens before the window opens, so none of it counts against
+  // how long the window actually runs.
+  await page.goto(`${BASE}/ports`, { waitUntil: 'networkidle' });
+  await addPortRule(page, '9443');
+  await Promise.all([
+    page.waitForNavigation(),
+    page.click("#ports-form button[type=submit]"),
+  ]);
+
+  await page.goto(`${BASE}/apply`, { waitUntil: 'networkidle' });
+  await Promise.all([page.waitForNavigation(), page.click('#start-btn')]);
+}
+
+/**
+ * Drive a whole acceptance window: apply, read the countdown falling, roll
+ * back, and assert the rules came back.
+ *
+ * The demo runs a real timer, so this is a real window. A fixture here would
+ * prove nothing about the one screen that carries the product's thesis.
+ */
+async function checkAcceptanceWindow(page) {
+  let ok = true;
+  const failHere = (detail) => { fail('acceptance window', detail); ok = false; };
+
+  try {
+    await openAcceptanceWindow(page, WINDOW_SECONDS);
+  } catch (e) {
+    fail('acceptance window', e.message);
+    return;
+  }
+
+  const countdown = page.locator('#apply-countdown');
+  if (!(await countdown.count())) {
+    fail('acceptance window', 'no countdown on /apply with a window open');
+    return;
+  }
+
+  const first = await countdown.innerText();
+  if (!/^\d{2}:\d{2}$/.test(first)) {
+    failHere(`the countdown reads ${JSON.stringify(first)}, want mm:ss`);
+  }
+
+  // It has to actually fall. A rendered "00:10" that never changes is the
+  // defect this release exists to remove, with better typography. This is
+  // the one wait in this file that measures the passage of time on purpose,
+  // rather than standing in for a condition — and the window is only
+  // WINDOW_SECONDS long, so everything from here on is written to spend as
+  // little of it as possible.
+  await page.waitForTimeout(2500);
+  const second = await countdown.innerText();
+  if (second === first) {
+    failHere(`the countdown did not move in 2.5s: ${first} -> ${second}`);
+  }
+
+  // The live diff names what is live — no reload needed, this is still the
+  // page #start-btn's own navigation rendered.
+  if (!(await page.locator('.diff-row', { hasText: '9443' }).count())) {
+    failHere('the open window does not name the port it made live');
+  }
+
+  // The chip follows the operator off this page. `load` rather than the usual
+  // `networkidle`: every second spent waiting here is one the rollback below
+  // has less of the window left to beat.
+  await page.goto(`${BASE}/ports`, { waitUntil: 'load' });
+  if (!(await page.locator('#apply-chip').count())) {
+    failHere('the countdown does not follow the operator to /ports');
+  }
+
+  // Roll back, and check the window actually closed.
+  await page.goto(`${BASE}/apply`, { waitUntil: 'load' });
+  await Promise.all([page.waitForNavigation(), page.click('#rollback-btn')]);
+
+  // A rollback restores what is live, not what is staged: handlePortsGET
+  // always reads Staged, and the rollback only touches Current/Backup. So the
+  // port just added is expected to still be on /ports — asserting it is gone
+  // would fail the check on the one thing this release deliberately kept.
+  // What must be true instead is that the apply page offers a start again,
+  // not a confirm.
+  if (await page.locator('#confirm-btn').count()) {
+    failHere('the window is still open after a rollback');
+  }
+  if (!(await page.locator('#start-btn').count())) {
+    failHere('the apply page offers no way forward after a rollback');
+  }
+
+  if (ok) {
+    console.log('  ok   a whole acceptance window: it runs, it is visible everywhere, it rolls back');
+  }
+}
+
+/**
+ * Signing out has to end the session by pressing the control the operator sees.
+ *
+ * The Go suite proves the *route* is right: GET /logout answers 405, a
+ * cross-origin POST answers 403, a same-origin POST answers 303. What it cannot
+ * see is which of those the sidebar actually sends. Sign out was an
+ * `<a href="/logout">` until the route moved to POST, and a template that goes
+ * back to an anchor — or a form that loses its method — leaves every Go test
+ * green while the button quietly answers 405 and the operator stays signed in.
+ *
+ * So this drives the control rather than the URL: click it, then ask for a page
+ * behind the login and see where it lands.
+ */
+/**
+ * The version badge fits the version strings a build of this repository can
+ * carry.
+ *
+ * `.brand-version` was capped at 9ch, which fits "2.13.0" and nothing longer.
+ * The .deb sets the version from the changelog and gets six characters; the
+ * Dockerfile and the Makefile pass `git describe`, so every container image
+ * showed "v2.13…" instead of its own version. "2.13.10" clips just the same,
+ * which would have reached every installation at the first patch release past
+ * .9 — the one shape of this bug nobody would have read as a packaging quirk.
+ *
+ * Measured in the browser rather than asserted against the stylesheet: what
+ * matters is whether the text fits the box, and no number in a CSS file says
+ * that. The `title` attribute carries the full string either way, but a tooltip
+ * is not a version number on the screen.
+ */
+async function checkVersionBadgeFitsTheVersion(page) {
+  await page.goto(`${BASE}/dashboard`, { waitUntil: 'load' });
+  const bad = await page.evaluate(() => {
+    const el = document.querySelector('.brand-version');
+    if (!el) return ['(the sidebar has no .brand-version badge at all)'];
+    const brand = el.parentElement;
+    const original = el.textContent;
+    const clipped = [];
+    // The changelog version, `git describe` with and without a tag suffix, and
+    // a two-digit patch — every shape the packaging here can hand the binary.
+    for (const v of ['2.13.0', 'v2.13.0', '2.13.10', 'v2.13.10', 'v2.13.0-rc1', 'v2.13.0-dirty']) {
+      el.textContent = v;
+      if (el.scrollWidth > el.clientWidth) clipped.push(v);
+      // A badge that fits by pushing the product name out of the row is not a
+      // fix; the cap has to leave the brand line intact as well.
+      else if (brand.scrollWidth > brand.clientWidth) clipped.push(`${v} (overflows the brand row)`);
+    }
+    el.textContent = original;
+    return clipped;
+  });
+  if (bad.length) {
+    throw new Error(`the version badge cannot show: ${bad.join(', ')}`);
+  }
+  console.log('  ok   the version badge fits every version string a build can carry');
+}
+
+async function checkSignOutEndsTheSession(page) {
+  await page.goto(`${BASE}/dashboard`, { waitUntil: 'networkidle' });
+
+  const anchors = await page.locator('.nav-footer a').count();
+  if (anchors > 0) {
+    fail('sign out', `.nav-footer holds ${anchors} link(s); the sign-out control must be a form submit, ` +
+      'because GET /logout is refused with 405 and an anchor would sign nobody out');
+  }
+
+  const button = page.locator('.nav-footer .logout-btn');
+  if (await button.count() === 0) {
+    fail('sign out', 'no .logout-btn in the sidebar footer — nothing to sign out with');
+    return;
+  }
+  await button.click();
+  await page.waitForLoadState('networkidle');
+
+  await page.goto(`${BASE}/dashboard`, { waitUntil: 'networkidle' });
+  if (!page.url().includes('/login')) {
+    fail('sign out', `after pressing sign out, /dashboard still answered as ${page.url()} — the session survived it`);
+  } else {
+    console.log('  ok   sign out ends the session');
+  }
+}
+
+/**
+ * The switcher has to work two ways at once: a real <select> that a running
+ * script submits on change, and a submit button that stays in the markup and
+ * visible for an operator with no JavaScript — the one screen where this
+ * control matters most is the one nothing has run on yet. Neither Go nor a
+ * stylesheet diff can see whether the button actually disappears once script
+ * has run, or actually works once it hasn't; only a browser can.
+ */
+/**
+ * Picks a language from the select and waits for the POST it is supposed to
+ * trigger to be *answered*. Returns whether that happened.
+ *
+ * The wait is armed before the option is picked, and it waits for the response
+ * rather than for the request or for a load state. Each of the two weaker waits
+ * has its own failure:
+ *
+ *   - `waitForLoadState` alone resolves against the document that is already
+ *     loaded, because the page has not started navigating yet when it is called.
+ *   - `waitForRequest` resolves when the browser has *sent* the POST, which is
+ *     still one round trip before Set-Cookie exists. The waitForLoadState after
+ *     it then returns against that same already-loaded document, and
+ *     ctx.cookies() is read before the server has answered.
+ *
+ * The second is what shipped, and it did exactly what a race does: green on a
+ * fast machine, and one red CI job reporting "the POST went through but the
+ * cookie is unset". waitForResponse is the wait that means the cookie exists.
+ */
+async function switchTo(page, code) {
+  const posted = page
+    .waitForResponse(r => r.url().endsWith('/language') && r.request().method() === 'POST',
+      { timeout: 5000 })
+    .then(() => true, () => false);
+  await page.locator('#lang-select').selectOption({ value: code });
+  const ok = await posted;
+  if (ok) await page.waitForLoadState('load');
+  return ok;
+}
+
+async function checkLanguageSwitch(ctx) {
+  const page = await ctx.newPage();
+  await page.goto(`${BASE}/dashboard`, { waitUntil: 'networkidle' });
+
+  const select = page.locator('#lang-select');
+  if (await select.count() === 0) {
+    fail('language switch', 'no #lang-select in the sidebar — the chip buttons were not replaced');
+  }
+  if (await page.locator('.lang-option').count() > 0) {
+    fail('language switch', '.lang-option chip markup is still rendered alongside the select');
+  }
+  const submit = page.locator('.lang-submit');
+  if (await submit.count() === 0) {
+    fail('language switch', 'no .lang-submit in the markup — required for the no-JS path');
+  } else if (await submit.isVisible()) {
+    fail('language switch', '.lang-submit is visible with JavaScript running; data-js should have hidden it');
+  }
+
+  if (await switchTo(page, 'de')) {
+    const lang = (await ctx.cookies()).find(c => c.name === 'easywall_lang');
+    if (lang?.value !== 'de') {
+      fail('language switch', `the POST went through but the cookie is ${lang?.value ?? 'unset'}`);
+    } else {
+      console.log('  ok   the select submits itself on change with JavaScript running');
+    }
+  } else {
+    fail('language switch', 'selecting "de" never posted /language — the change handler ' +
+      'did not fire, or the value was already "de" so there was no change to react to');
+  }
+  // Leave English behind for whatever runs after this.
+  await switchTo(page, 'en');
+  const session = await ctx.storageState();
+  await page.close();
+
+  // Without JavaScript the select cannot submit itself, so the button in the
+  // markup is the only way to change the language — and it must be visible.
+  const noJsCtx = await ctx.browser().newContext({
+    ignoreHTTPSErrors: true,
+    javaScriptEnabled: false,
+    storageState: session,
+  });
+  const noJsPage = await noJsCtx.newPage();
+  await noJsPage.goto(`${BASE}/dashboard`);
+  const noJsSubmit = noJsPage.locator('.lang-submit');
+  if (await noJsSubmit.count() === 0 || !(await noJsSubmit.isVisible())) {
+    fail('language switch (no JS)', '.lang-submit is not visible without JavaScript — ' +
+      'an operator who cannot read the interface would have no way to change it');
+  } else {
+    await noJsPage.locator('#lang-select').selectOption({ value: 'de' });
+    // click() auto-waits for the navigation a submit button starts, so unlike
+    // the change handler above this path never needed an explicit wait of its
+    // own — the difference is the control, not the care taken over it.
+    await noJsSubmit.click();
+    await noJsPage.waitForLoadState('load');
+    const lang = (await noJsCtx.cookies()).find(c => c.name === 'easywall_lang');
+    if (lang?.value !== 'de') {
+      fail('language switch (no JS)', 'the submit button did not change the language cookie');
+    } else {
+      console.log('  ok   the submit button works with JavaScript disabled');
+    }
+  }
+  await noJsCtx.close();
+}
+
+/**
+ * Every input in a rules table (.table-reflow — ports, forwarding, log) must
+ * show its own value. The page-wide overflow check above cannot see this: a
+ * column that squeezes its input to below the value's content width doesn't
+ * make the *page* scroll, table-layout: auto just clips the field in place.
+ * That is exactly how task 6's Sources column shipped — 190px showing a
+ * 307px default, fc00::/7 entirely invisible, and the page overflow check
+ * green throughout because nothing scrolled.
+ */
+async function checkNoInputClipsItsOwnValue(page, where, path) {
+  // The demo's own seed carries no Sources value long enough to prove
+  // anything either way. The catalogue's Pi-hole entry does — same fc00::/7
+  // default the demo config's two saved rows carry — so add it here,
+  // unsaved, purely to put that value on the page for this one check. The
+  // next page.goto in the caller's loop discards it; nothing is written to
+  // the account's rules, so checkPortsCatalogue's row count downstream is
+  // unaffected.
+  if (path.startsWith('/ports')) {
+    const btn = page.locator('#catalogue-btn');
+    if (await btn.count() && await btn.isVisible()) {
+      await btn.click();
+      const item = page.locator('.catalogue-item[data-service="pihole"]');
+      if (await item.count()) await item.click();
+    }
+  }
+
+  const clipped = await page.evaluate(() => {
+    const inputs = document.querySelectorAll('.table-reflow input');
+    return [...inputs]
+      .filter(el => el.scrollWidth > el.clientWidth)
+      .map(el => ({
+        label: el.getAttribute('aria-label') || el.name || el.className,
+        value: el.value,
+        clientWidth: el.clientWidth,
+        scrollWidth: el.scrollWidth,
+      }));
+  });
+  for (const c of clipped) {
+    fail(`input overflow [${where}]`, `${path} — "${c.label}" value "${c.value}" needs ` +
+      `${c.scrollWidth}px, only ${c.clientWidth}px visible`);
+  }
+  await checkNoSelectClipsItsOwnOption(page, where, path);
+}
+
+/**
+ * And every <select> in one must show the option it has chosen.
+ *
+ * The check above cannot: a <select> is a replaced element, its scrollWidth is
+ * its clientWidth whatever the option says, and it answers a box too narrow by
+ * truncating the label with no ellipsis, no wrap and no scrollbar. 2.19's Scope
+ * column reached review twice with a clipped German option — once showing
+ * "An einen Container" for "An einen Container weitergeleitet", once
+ * "Weitergeleite" for "Weitergeleitet" — with this suite green both times.
+ *
+ * Nor can it be predicted: the arithmetic that missed the second one measured
+ * the option's text in the select's own computed font, in a hidden <span>, and
+ * said 15px clear. A native select does not lay its label out in the box that
+ * arithmetic describes — the control reserves room of its own beside the text,
+ * and how much is the engine's business, not the stylesheet's.
+ *
+ * So this asks the engine. The select is cloned with one option left in it and
+ * `width: auto` — the width that engine needs to render that option in full;
+ * if the real control is narrower, the label on screen is not all of it. Same
+ * clone, same classes, same cascade; the only difference is that nothing is
+ * constraining the width.
+ *
+ * Every option, not the selected one. Which option a row happens to carry is
+ * the demo's data, and the widest one is a click away for any operator: a Scope
+ * column that cannot show "Weitergeleitet" is broken on a page where every rule
+ * currently says "Dieser Host". That is also what keeps this honest without the
+ * seed having to carry a forwarded rule — the first run's wizard replaces the
+ * demo's rules with its own two, and a check that only measured what was on the
+ * page would have gone quiet exactly there.
+ *
+ * A 1px tolerance, for the same reason the container check has one: sub-pixel
+ * layout rounds, and a check that fires on half a pixel gets switched off.
+ */
+async function checkNoSelectClipsItsOwnOption(page, where, path) {
+  const clipped = await page.evaluate(() => {
+    const out = [];
+    const seen = new Set();
+    for (const el of document.querySelectorAll('.table-reflow select')) {
+      const has = el.getBoundingClientRect().width;
+      let worst = null;
+      for (const option of [...el.options]) {
+        // The index is read before the clone is pruned: removing an option
+        // renumbers the ones after it, and comparing against a live index
+        // while mutating the collection empties the clone instead of
+        // narrowing it — which measures the minimum width of a select with
+        // no options at all, and passes everything.
+        const keep = option.index;
+        const clone = el.cloneNode(true);
+        [...clone.options].forEach((o, i) => { if (i !== keep) o.remove(); });
+        Object.assign(clone.style, {
+          position: 'absolute', left: '-10000px', top: '0',
+          width: 'auto', minWidth: '0', maxWidth: 'none',
+        });
+        document.body.appendChild(clone);
+        const needs = clone.getBoundingClientRect().width;
+        clone.remove();
+        if (!worst || needs > worst.needs) {
+          worst = { needs, option: option.textContent.trim() };
+        }
+      }
+      if (!worst || worst.needs - has <= 1) continue;
+      const label = el.getAttribute('aria-label') || el.className;
+      // One row's worth: every rule row carries the same control, and thirty
+      // identical failures is a wall of text nobody reads to the end of.
+      const key = `${label}|${worst.option}|${Math.round(has)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        label, option: worst.option,
+        needs: Math.round(worst.needs), has: Math.round(has),
+      });
+    }
+    return out;
+  });
+  for (const c of clipped) {
+    fail(`select overflow [${where}]`, `${path} — "${c.label}" option "${c.option}" needs ` +
+      `${c.needs}px, the control is ${c.has}px`);
+  }
+}
+
+/**
+ * Every focusable element shows where it is, at a contrast a person can see.
+ *
+ * WCAG 2.1 SC 1.4.11 Non-text Contrast (AA) wants 3:1 for a focus indicator
+ * against what is behind it. Measured rather than asserted against the
+ * stylesheet, and composited rather than read: the outline this suite was
+ * written beside is `rgba(143,211,251,0.13)`, which is 11.4:1 as a *colour* and
+ * 1.31:1 once composited over the card it sits on. No number in a CSS file says
+ * that. (2.4.13 Focus Appearance is AAA and is not the criterion; 2.4.11 is
+ * Focus Not Obscured and is a different question again.)
+ *
+ * The indicator is whichever of the two carries it — the outline, or the border
+ * change focus brings — so this takes the better of the two and requires that
+ * one to clear 3:1. A control answering focus with a border alone is fine; one
+ * answering with neither is not, and three of them do: .nav-links li a,
+ * .nav-footer .logout-btn and .tab have no :focus-visible rule at all, which is
+ * SC 2.4.7 Focus Visible at Level A rather than the 1.4.11 above.
+ */
+const focusLuminance = c => {
+  const s = c / 255;
+  return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+};
+
+/** Parses `rgb(…)` / `rgba(…)` as getComputedStyle returns it. */
+function parseRGBA(str) {
+  const m = str.match(/rgba?\(([^)]+)\)/);
+  if (!m) return null;
+  const p = m[1].split(/[,\s/]+/).filter(Boolean).map(Number);
+  if (p.length < 3 || p.some(Number.isNaN)) return null;
+  return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+}
+
+/** Straight-alpha composite of fg onto an opaque bg. */
+function compositeOver(fg, bg) {
+  return {
+    r: fg.r * fg.a + bg.r * (1 - fg.a),
+    g: fg.g * fg.a + bg.g * (1 - fg.a),
+    b: fg.b * fg.a + bg.b * (1 - fg.a),
+  };
+}
+
+function contrastRatio(a, b) {
+  const L = c => 0.2126 * focusLuminance(c.r) + 0.7152 * focusLuminance(c.g)
+    + 0.0722 * focusLuminance(c.b);
+  const [hi, lo] = [L(a), L(b)].sort((p, q) => q - p);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
+async function checkFocusIsVisible(ctx, theme) {
+  const page = await ctx.newPage();
+  const worst = new Map();   // control -> its lowest measured ratio
+  const uaRing = new Set();  // controls falling back to the browser's own ring
+
+  for (const path of PAGES) {
+    await page.goto(BASE + path, { waitUntil: 'networkidle' });
+    // Start from the document, so the first Tab lands on the first tab stop.
+    await page.evaluate(() => (document.activeElement instanceof HTMLElement)
+      && document.activeElement.blur());
+
+    // The resting border of every focusable element, measured once, before
+    // anything is focused. It cannot be read during the walk: the element is
+    // focused at that moment, so its computed border is already the focused one
+    // and comparing it with itself always says "unchanged". Reading it off a
+    // clone appended beside the element works and mutates the DOM in the middle
+    // of a tab order, which is its own bug. An attribute changes no layout and
+    // no tab stop.
+    await page.evaluate(() => {
+      const focusable = document.querySelectorAll(
+        'a[href], button, input:not([type=hidden]), select, textarea, [tabindex]:not([tabindex="-1"])');
+      focusable.forEach((el, i) => {
+        el.dataset.ewFocusProbe = String(i);
+        el.dataset.ewRestingBorder = getComputedStyle(el).borderTopColor;
+      });
+    });
+
+    const seenHere = new Set();
+    // A generous ceiling rather than a count: /ports has the most tab stops and
+    // the loop leaves as soon as focus wraps or stops moving.
+    for (let i = 0; i < 250; i++) {
+      await page.keyboard.press('Tab');
+
+      const m = await page.evaluate(async () => {
+        // Two frames, so the style recalculation the focus triggered has landed
+        // before anything is read. Even with transitions reduced to 0.01ms, a
+        // getComputedStyle in the same task as the key press returns the state
+        // from before the focus — which reported every border-carried focus at
+        // its outline value alone: 1.31:1 for a field that reaches 11.4:1 once
+        // the frame has been drawn.
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+
+        const el = document.activeElement;
+        if (!el || el === document.body || !(el instanceof HTMLElement)) return null;
+
+        // What an indicator is seen against — not the element's own
+        // transparent background, and not the first ancestor with *any*
+        // paint either. A translucent wash is not the colour a reader sees;
+        // it is what that colour looks like once it is composited onto
+        // whatever is actually behind it. Reading it as if it were opaque —
+        // the previous version of this function, which stopped climbing at
+        // the first ancestor whose alpha was merely nonzero — reported
+        // /dashboard's unknown-bridge notice in dark mode as 1.92:1 against
+        // `rgb(229, 165, 75)`, the warn wash's own un-composited colour. The
+        // real backdrop is that wash over the canvas beneath it,
+        // `rgb(32, 26, 21)`, and the same ring is ~15:1 there.
+        //
+        // So every translucent layer between the element and the first
+        // *opaque* one is collected, then folded back in nearest-last, each
+        // one composited over what the walk has established is behind it.
+        const parseColor = str => {
+          const mm = str && str.match(/rgba?\(([^)]+)\)/);
+          if (!mm) return null;
+          const p = mm[1].split(/[,\s/]+/).filter(Boolean).map(Number);
+          if (p.length < 3) return null;
+          return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+        };
+        const backdrop = node => {
+          const layers = [];
+          for (let n = node.parentElement; n; n = n.parentElement) {
+            const c = parseColor(getComputedStyle(n).backgroundColor);
+            if (!c || c.a === 0) continue;
+            layers.push(c);
+            if (c.a >= 1) break;                 // opaque: nothing behind it shows
+          }
+          let base = (layers.length && layers[layers.length - 1].a >= 1)
+            ? layers.pop()
+            : (parseColor(getComputedStyle(document.body).backgroundColor)
+              || { r: 255, g: 255, b: 255 });
+          for (let i = layers.length - 1; i >= 0; i--) {
+            const l = layers[i];
+            base = {
+              r: l.r * l.a + base.r * (1 - l.a),
+              g: l.g * l.a + base.g * (1 - l.a),
+              b: l.b * l.a + base.b * (1 - l.a),
+            };
+          }
+          return `rgb(${base.r}, ${base.g}, ${base.b})`;
+        };
+
+        const cs = getComputedStyle(el);
+        return {
+          key: (typeof el.className === 'string' && el.className.trim().split(/\s+/)[0])
+            || el.getAttribute('aria-label') || el.name || el.id || el.tagName,
+          tag: el.tagName,
+          outlineStyle: cs.outlineStyle,
+          outlineWidth: parseFloat(cs.outlineWidth) || 0,
+          outlineColor: cs.outlineColor,
+          borderBefore: el.dataset.ewRestingBorder,
+          borderAfter: cs.borderTopColor,
+          backdrop: backdrop(el),
+          // Where we are, so the loop can tell "focus wrapped" from "focus moved".
+          // The stamped index, so "focus wrapped" is decided by identity rather
+          // than by a text snippet two controls may share.
+          mark: el.dataset.ewFocusProbe ?? (el.tagName + '|' + (el.textContent || '').slice(0, 24)),
+        };
+      });
+
+      if (!m) break;                       // focus left the document (browser chrome)
+      if (seenHere.has(m.mark)) break;     // wrapped round
+      seenHere.add(m.mark);
+
+      // outline-style: auto is the browser's own focus ring. Chrome paints a
+      // high-contrast double ring for it and reports a colour that is not what
+      // it paints — measuring outlineColor here reported 1.02:1 for a ring that
+      // is perfectly visible. It is a real indicator, so it passes; it is also
+      // not the one DESIGN.md specifies, so it is reported separately.
+      if (m.outlineStyle === 'auto') {
+        uaRing.add(`${path} .${m.key}`);
+        continue;
+      }
+
+      const bg = parseRGBA(m.backdrop);
+      if (!bg) continue;
+
+      const ratios = [];
+      if (m.outlineWidth > 0 && m.outlineStyle !== 'none') {
+        const o = parseRGBA(m.outlineColor);
+        if (o) ratios.push(contrastRatio(compositeOver(o, bg), bg));
+      }
+      if (m.borderAfter !== m.borderBefore) {
+        const b = parseRGBA(m.borderAfter);
+        if (b) ratios.push(contrastRatio(compositeOver(b, bg), bg));
+      }
+      const best = ratios.length ? Math.max(...ratios) : 0;
+
+      const key = `${path} .${m.key}`;
+      if (!worst.has(key) || worst.get(key) > best) worst.set(key, best);
+    }
+
+    await page.evaluate(() => {
+      for (const el of document.querySelectorAll('[data-ew-focus-probe]')) {
+        delete el.dataset.ewFocusProbe;
+        delete el.dataset.ewRestingBorder;
+      }
+    });
+  }
+
+  const bad = [...worst].filter(([, r]) => r < 3).sort((a, b) => a[1] - b[1]);
+  for (const [where, ratio] of bad) {
+    fail(`focus contrast [${theme}]`, `${where} — the focus indicator composites to ` +
+      `${ratio.toFixed(2)}:1 against its backdrop; WCAG 1.4.11 wants 3:1` +
+      (ratio === 0 ? ' (and this control answers focus with nothing at all)' : ''));
+  }
+  if (!bad.length) {
+    console.log(`  ok   focus clears 3:1 on ${PAGES.length} pages in ${theme} ` +
+      `(${worst.size} controls measured)`);
+  }
+  // Not a failure: a UA ring is visible and accessible. It is reported because
+  // DESIGN.md specifies a border change plus an outline, and a control that
+  // silently falls back to the browser's ring is not following the system.
+  if (uaRing.size) {
+    console.log(`  note ${uaRing.size} control(s) fall back to the browser's own focus ring ` +
+      `in ${theme}: ${[...uaRing].slice(0, 4).join(', ')}${uaRing.size > 4 ? ', …' : ''}`);
+  }
+  await page.close();
+}
+
+/**
+ * A row action's text at rest must clear WCAG AA for text, 4.5:1 (2.21.1 F2).
+ * Opacity is composited, so the colour a reader sees is the text over the
+ * button over the row.
+ */
+async function checkBlockedActionContrast(page, theme) {
+  await page.goto(`${BASE}/blocked`, { waitUntil: 'networkidle' });
+  await page.mouse.move(5, 5);
+  await page.waitForTimeout(250);
+  if (await page.locator('#blocked-rows .pkt-actions .btn').count() === 0) {
+    fail(`blocked action contrast [${theme}]`, 'no row action to measure — the demo produced no refused packets');
+    return;
+  }
+  const c = await page.$eval('#blocked-rows .pkt-actions .btn', b => {
+    let op = 1;
+    for (let el = b; el; el = el.parentElement) op *= parseFloat(getComputedStyle(el).opacity);
+    // Same compositing checkFocusIsVisible's backdrop() does, and for the same
+    // reason: the first ancestor with *any* paint is not necessarily opaque,
+    // and stopping there reads a translucent fill as if it were the colour on
+    // screen rather than what it looks like over whatever is behind it.
+    const parseColor = str => {
+      const mm = str && str.match(/rgba?\(([^)]+)\)/);
+      if (!mm) return null;
+      const p = mm[1].split(/[,\s/]+/).filter(Boolean).map(Number);
+      if (p.length < 3) return null;
+      return { r: p[0], g: p[1], b: p[2], a: p.length > 3 ? p[3] : 1 };
+    };
+    const layers = [];
+    for (let el = b; el; el = el.parentElement) {
+      const col = parseColor(getComputedStyle(el).backgroundColor);
+      if (!col || col.a === 0) continue;
+      layers.push(col);
+      if (col.a >= 1) break;
+    }
+    let base = (layers.length && layers[layers.length - 1].a >= 1)
+      ? layers.pop()
+      : (parseColor(getComputedStyle(document.body).backgroundColor) || { r: 255, g: 255, b: 255 });
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const l = layers[i];
+      base = {
+        r: l.r * l.a + base.r * (1 - l.a),
+        g: l.g * l.a + base.g * (1 - l.a),
+        b: l.b * l.a + base.b * (1 - l.a),
+      };
+    }
+    return { fg: getComputedStyle(b).color, bg: `rgb(${base.r}, ${base.g}, ${base.b})`, op };
+  });
+  const fg = parseRGBA(c.fg), bg = parseRGBA(c.bg);
+  const seen = compositeOver({ ...fg, a: fg.a * c.op }, bg);
+  const ratio = contrastRatio(seen, bg);
+  if (ratio < 4.5) {
+    fail(`blocked action contrast [${theme}]`, `${ratio.toFixed(2)}:1 at rest, needs 4.5:1`);
+    return;
+  }
+  console.log(`  ok   blocked row actions ${ratio.toFixed(2)}:1 at rest in ${theme}`);
+}
+
+/**
+ * Nothing scrolls sideways inside its own container either.
+ *
+ * The page-level overflow check below cannot see this, and not by oversight: a
+ * container with `overflow-x: auto` absorbs its own overflow, so the document
+ * never widens. Every such container in the stylesheet was therefore unmeasured
+ * — .table-wrap, .scroll-wrapper, a <pre> — and .table-wrap has overflowed by
+ * 10px in card mode at every width its container query switches at, with this
+ * whole suite green throughout.
+ *
+ * What is measured is a container narrower than its own laid-out children, not
+ * a container whose content is genuinely wider. A table with more columns than
+ * fit is doing its job and scrolls on purpose; a row 10px wider than the box
+ * that holds it is nobody's intention.
+ *
+ * A tolerance of 1px, not 0: sub-pixel layout rounds, and a check that fires on
+ * half a pixel is a check somebody switches off.
+ */
+async function checkContainersDoNotOverflow(page, where, path) {
+  const overflowing = await page.evaluate(() => {
+    const out = [];
+    for (const el of document.querySelectorAll('*')) {
+      const style = getComputedStyle(el);
+      if (style.overflowX !== 'auto' && style.overflowX !== 'scroll') continue;
+      const widest = [...el.children].reduce((w, c) => Math.max(w, c.scrollWidth), 0);
+      const over = widest - el.clientWidth;
+      if (over > 1) {
+        out.push({
+          selector: (typeof el.className === 'string' && el.className.trim().split(/\s+/)[0])
+            || el.tagName,
+          clientWidth: el.clientWidth,
+          contentWidth: widest,
+          over,
+        });
+      }
+    }
+    return out;
+  });
+  for (const o of overflowing) {
+    fail(`container overflow [${where}]`, `${path} — .${o.selector} is ${o.clientWidth}px ` +
+      `and holds ${o.contentWidth}px, ${o.over}px over`);
+  }
+}
+
+/**
+ * The same overflow questions, asked in German.
+ *
+ * Every width above is swept in English, and German is the language this
+ * interface is longest in: "Netzwerkeinstellungen gespeichert" against "Network
+ * settings saved", "Weitergeleitet" against "Forwarded", "Geltungsbereich"
+ * against "Scope". A column that fits in English and not in German is a defect
+ * in half the shipped locales, and until 2.19 nothing here had ever rendered
+ * one. The first run of this pass found two: the Scope select truncating its
+ * own German option, which this release caused, and /log's action chip — a
+ * nowrap pill — making that table 382px wide inside a 360px wrap at 390px,
+ * which it had been doing since long before this branch.
+ *
+ * One theme, because none of these three measurements is a colour, and every
+ * width, because that is where the last one hid. The health checks themselves
+ * (console errors, failed requests) are not repeated: those do not change with
+ * the Accept-Language a cookie sets.
+ */
+async function checkGermanFits(browser, session) {
+  const ctx = await browser.newContext({ ignoreHTTPSErrors: true, storageState: session });
+  await ctx.addCookies([{ name: 'easywall_lang', value: 'de', url: BASE }]);
+  for (const width of WIDTHS) {
+    const page = await ctx.newPage();
+    await page.setViewportSize({ width, height: 1000 });
+    for (const path of PAGES) {
+      await page.goto(BASE + path, { waitUntil: 'networkidle' });
+      await checkNoInputClipsItsOwnValue(page, `de ${width}px`, path);
+      await checkContainersDoNotOverflow(page, `de ${width}px`, path);
+    }
+    await page.close();
+    console.log(`  ok   ${PAGES.length} pages fit German at ${width}px`);
+  }
+  await ctx.close();
+}
+
+/** Every page renders without complaint, and without scrolling sideways. */
+async function checkPageHealth(ctx, theme, width) {
+  const page = await ctx.newPage();
+  const seen = [];
+  page.on('console', m => { if (m.type() === 'error') seen.push(`console: ${m.text()}`); });
+  page.on('pageerror', e => seen.push(`pageerror: ${e.message}`));
+  page.on('requestfailed', r => seen.push(`requestfailed: ${r.url()}`));
+
+  const where = `${theme} ${width}px`;
+  for (const path of PAGES) {
+    seen.length = 0;
+    await page.goto(BASE + path, { waitUntil: 'networkidle' });
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    if (overflow > 0) {
+      fail(`horizontal overflow [${where}]`, `${path} scrolls ${overflow}px sideways`);
+    }
+    await checkNoInputClipsItsOwnValue(page, where, path);
+    await checkContainersDoNotOverflow(page, where, path);
+    for (const problem of seen) {
+      fail(`page problem [${where}]`, `${path} — ${problem}`);
+    }
+  }
+  console.log(`  ok   ${PAGES.length} pages clean at ${where}`);
+  await page.close();
+}
+
+const launch = process.env.CHROME_PATH
+  ? { executablePath: process.env.CHROME_PATH }
+  : {};
+
+// The three widths CLAUDE.md names: a desktop, a narrow window, a phone. Only
+// 1600 was ever driven here, so "both themes, three widths" was a rule the
+// repository stated and checked a third of — and a mobile layout that scrolls
+// sideways is invisible at 1600.
+//
+// 1440 and 1200 added after the Sources column defect shipped invisible to
+// this suite: both sit in .page-grid's two-column band (aside present), where
+// a shared table can be squeezed well below what 1600 or 900 exercise. 1440
+// is an ordinary maximised laptop window and 1200 sat at the worst point of
+// the band that clipped — 10 of 30 fields — while every width already listed
+// here stayed clean throughout.
+const WIDTHS = [1600, 1440, 1200, 900, 390];
+
+/** The full health/regression suite — everything that isn't screenshotting. */
+async function runChecks(browser, session) {
+  const langCtx = await browser.newContext({ ignoreHTTPSErrors: true, storageState: session });
+  await checkLanguageSwitch(langCtx);
+  await langCtx.close();
+
+  // Focus, at one width in both themes: focus colour does not vary with
+  // viewport, so this costs ~26 page passes rather than 130.
+  for (const theme of ['dark', 'light']) {
+    const focusCtx = await browser.newContext({
+      ignoreHTTPSErrors: true,
+      viewport: { width: 1600, height: 1000 },
+      storageState: session,
+      // Focus is measured in the same tick as the key press, and .input carries
+      // `transition: border-color 120ms`. Read mid-transition, its border is
+      // still essentially the resting colour, so every control whose focus is
+      // carried by a border change looked as though it had none — 1.31:1 for a
+      // field that actually reaches 11.4:1 once the transition lands.
+      //
+      // Reduced motion rather than an injected stylesheet or a sleep per tab
+      // stop: app.css already answers the media query by setting every
+      // transition-duration to 0.01ms, so this measures the end state through a
+      // rule the application ships, and exercises that rule at the same time.
+      reducedMotion: 'reduce',
+    });
+    await focusCtx.addInitScript(t => localStorage.setItem('theme', `easywall-${t}`), theme);
+    await checkFocusIsVisible(focusCtx, theme);
+    const cp = await focusCtx.newPage();
+    await checkBlockedActionContrast(cp, theme);
+    await cp.close();
+    await focusCtx.close();
+  }
+
+  for (const theme of ['dark', 'light']) {
+    for (const width of WIDTHS) {
+      const ctx = await browser.newContext({
+        ignoreHTTPSErrors: true,
+        viewport: { width, height: 1000 },
+        storageState: session,
+      });
+      // After storageState, so the theme this pass is checking wins over
+      // whatever the signed-in context happened to leave behind.
+      await ctx.addInitScript(t => localStorage.setItem('theme', `easywall-${t}`), theme);
+      await checkPageHealth(ctx, theme, width);
+      await ctx.close();
+    }
+  }
+
+  await checkGermanFits(browser, session);
+
+  const ctx = await browser.newContext({
+    ignoreHTTPSErrors: true,
+    viewport: { width: 1600, height: 1000 },
+    storageState: session,
+  });
+  const p = await ctx.newPage();
+  await checkForwardingRowEdgesLineUp(p);
+  await checkForwardingPortIsNotReparsed(p);
+  await checkPortsCatalogue(p);
+  await checkPortsRowAgreesWithServer(p);
+  await checkApplyPreview(p);
+  await checkBlockedTailHoldsStill(p);
+  await checkBlockedTailStateHoldsTheLayout(browser, session);
+  await checkBlockedSaysWhy(p);
+  await checkFeedsCard(p);
+  await checkCountriesCard(p);
+  await checkBlockedNamesCountries(p);
+  await checkBlockedFiltersByCountry(p);
+  await checkASignedOutTailNavigates(browser, session);
+  await checkBlockedCardsKeepValuesWhole(browser, session);
+  await checkOptionsDisclosureFits(browser, session);
+  await checkAcceptanceWindow(p);
+  await checkEnrolmentFlow(browser);
+  await checkTheGate(browser);
+  await checkVersionBadgeFitsTheVersion(p);
+  await checkVerifyPage(browser);
+  // Last, and deliberately: signing out revokes the session id every context
+  // above is sharing, so anything after it would be driving a signed-out browser.
+  await checkSignOutEndsTheSession(p);
+  await ctx.close();
+}
+
+/**
+ * --screenshots [page ...]: capture docs/assets/img/screens/<page>-<theme>.png
+ * for each page, in both themes, instead of running the suite above. Pages are
+ * path segments ("ports", or "/ports") off a short default list when none are
+ * given. Reuses setUpAccount/signIn below — there is no second sign-in path
+ * to maintain.
+ */
+const screenshotFlagIdx = process.argv.indexOf('--screenshots');
+const screenshotMode = screenshotFlagIdx !== -1;
+const screenshotArgs = screenshotMode
+  ? process.argv.slice(screenshotFlagIdx + 1).map(a => a.startsWith('/') ? a : `/${a}`)
+  : [];
+// The pages docs/assets/img/screens/ actually ships figures for — grep
+// `base="/assets/img/screens/` across docs/_docs to regenerate this list.
+// Deliberately narrower than PAGES: /allowlist and /system have no figure of
+// their own (filters.md reuses the blocklist/options shots), and shooting
+// them here would add files nothing links to.
+const DEFAULT_SCREENSHOT_PAGES = [
+  '/dashboard', '/blocked', '/ports', '/blocklist', '/forwarding', '/custom',
+  '/options', '/settings', '/password', '/log', '/notify', '/apply',
+  '/apply-window',
+];
+// The remaining names in that directory are not URL paths at all — the
+// first-run wizard (with its optional 2FA step), the login page a signed-out
+// visitor meets, and the two-factor setup/verify screens. Each needs its own
+// flow, several need an account that does not exist yet, and login/verify
+// need to be reached signed OUT — so they are captured by the functions
+// below rather than by visiting a path with an authenticated session.
+
+/**
+ * Fills in the one thing the seeded demo TCP tab does not otherwise show: a
+ * rule with sources filled in, and a catalogue-added rule with its service
+ * chip. Saved server-side, so it survives into every theme's own context.
+ */
+async function seedPortsScreenshot(page) {
+  await page.goto(`${BASE}/ports?type=tcp`, { waitUntil: 'networkidle' });
+  await page.locator('#rules-tbody tr[data-idx] .f-sources').first().fill('203.0.113.10, 203.0.113.11');
+  if (await page.locator('#rules-tbody tr[data-service="pihole"]').count() === 0) {
+    await page.click('#catalogue-btn');
+    await page.click('.catalogue-item[data-service="pihole"]');
+  }
+  await Promise.all([
+    page.waitForNavigation(),
+    page.click("#ports-form button[type=submit]"),
+  ]);
+}
+
+// The shape every published screenshot is taken in.
+//
+// 1700, not the 1600 this used before the carried-forward sweep restored
+// /ports' two-column aside: `.page-grid-ports` collapses at its own 1650px
+// breakpoint, 80px above `.page-grid`'s plain 1570px, so 1600 sat between the
+// two and every figure of /ports still showed the single-column fallback.
+// 1600 itself replaced the 1440 this used from 2.11 to 2.13, for the same
+// reason one breakpoint lower: `.page-grid` drops its 320px context column
+// below 1570px, so at 1440 every screenshot in docs/ showed the collapsed
+// layout — the aside cards stacked under the table instead of beside it, on
+// ports, blocklist, forwarding, custom and options alike. 1440 is still
+// exercised, by WIDTHS above, where squeezing the layout is the whole point.
+// A screenshot is documentation, and documents the layout the design is
+// actually about.
+const SHOT_VIEWPORT = { width: 1700, height: 900 };
+
+/**
+ * Screenshot one page into docs/assets/img/screens/<name>-<theme>.png.
+ *
+ * The viewport is grown to the document's height first rather than passing
+ * `fullPage`. `.sidebar` is `position: fixed` with `min-height: 100vh`, and a
+ * fullPage capture leaves a fixed element pinned to the viewport it was laid out
+ * in: on every page taller than 900px the sidebar stopped mid-image, with the
+ * language switch, the theme toggle and Logout floating in the middle of it and
+ * nothing below. Twenty-two of the thirty-four shipped files carried it — every
+ * page with a sidebar that ran past 900px. Growing
+ * the window instead renders the page the way a reader with a window that tall
+ * would see it — which is also the right answer for the sticky save bar.
+ *
+ * `maxHeight` bounds that growth. /blocked is the exception: its row count is
+ * live traffic, not layout, and the demo's synthetic stream alone can carry
+ * it past 200 rows — growing to fit would photograph the whole table instead
+ * of documenting the page. Capped at the plain viewport height, the figure
+ * shows what a reader actually meets: header, filters, the first dozen or so
+ * rows, exactly as `SHOT_VIEWPORT.height` already does for every page short
+ * enough not to need growing at all.
+ */
+async function shoot(page, name, theme, maxHeight = Infinity) {
+  const out = `docs/assets/img/screens/${name}-${theme}.png`;
+  const height = Math.min(await page.evaluate(() => document.documentElement.scrollHeight), maxHeight);
+  if (height > SHOT_VIEWPORT.height) {
+    await page.setViewportSize({ width: SHOT_VIEWPORT.width, height });
+    // The reflow is synchronous, but a sticky element's resolved position and
+    // any transition on it are not.
+    await page.waitForTimeout(200);
+  }
+  await page.screenshot({ path: out });
+  await page.setViewportSize(SHOT_VIEWPORT);
+  console.log(`  wrote ${out}`);
+}
+
+/** A themed, 1700x900@1.5x context — every screenshot in the set uses this shape. */
+async function screenshotContext(browser, theme, extra = {}) {
+  const ctx = await browser.newContext({
+    ignoreHTTPSErrors: true, viewport: { ...SHOT_VIEWPORT },
+    deviceScaleFactor: 1.5, ...extra,
+  });
+  await ctx.addInitScript(t => localStorage.setItem('theme', `easywall-${t}`), theme);
+  return ctx;
+}
+
+async function takeScreenshots(browser, session, pages) {
+  console.log(`Screenshotting ${pages.join(', ')} in both themes`);
+  // apply-window is not a URL: it is /apply with a window open, captured after
+  // everything else so that opening it does not leak into the plain /apply
+  // shot, which has to keep showing the idle/staged screen. See below.
+  const mainPages = pages.filter(p => p !== '/apply-window');
+  const wantWindow = pages.includes('/apply-window');
+
+  const prep = await browser.newContext({
+    ignoreHTTPSErrors: true, viewport: { ...SHOT_VIEWPORT },
+    deviceScaleFactor: 1.5, storageState: session,
+  });
+  if (mainPages.includes('/ports')) await seedPortsScreenshot(await prep.newPage());
+  await prep.close();
+
+  for (const theme of ['light', 'dark']) {
+    const ctx = await screenshotContext(browser, theme, { storageState: session });
+    const page = await ctx.newPage();
+    for (const path of mainPages) {
+      await page.goto(BASE + path, { waitUntil: 'networkidle' });
+      const name = path.replace(/^\//, '').replace(/\?.*$/, '');
+      await shoot(page, name, theme, name === 'blocked' ? SHOT_VIEWPORT.height : undefined);
+    }
+    await ctx.close();
+  }
+
+  // Opened once, after both themes' ordinary pages are already shot — the
+  // window is real backend state (see openAcceptanceWindow), shared across
+  // every context that follows, and a window opened before the plain /apply
+  // pass would leave that shot showing the countdown instead of the screen it
+  // is actually documenting.
+  if (wantWindow) {
+    const openCtx = await browser.newContext({ ignoreHTTPSErrors: true, storageState: session });
+    // The shipped 120s default, not WINDOW_SECONDS: a screenshot is meant to be
+    // looked at, and a remaining time in the single digits reads as a bug.
+    await openAcceptanceWindow(await openCtx.newPage(), 120);
+    await openCtx.close();
+
+    for (const theme of ['light', 'dark']) {
+      const ctx = await screenshotContext(browser, theme, { storageState: session });
+      const page = await ctx.newPage();
+      await page.goto(`${BASE}/apply`, { waitUntil: 'networkidle' });
+      await shoot(page, 'apply-window', theme);
+      await ctx.close();
+    }
+  }
+}
+
+/**
+ * Enabling 2FA from /password. Demo mode runs the whole flow and then
+ * discards the write (see handler_2fa.go's IsDemo branch) — correct there,
+ * but the page it renders says "not saved" and greys itself out, unlike
+ * every real enrolment. So this gets its own throwaway, non-demo instance,
+ * the same shape as takeVerifyScreenshot.
+ *
+ * Seeded directly with a password and no secret, rather than run through the
+ * wizard: the wizard has no way to produce that state any more — Finish only
+ * reaches a confirmed TOTP step, never a plain account — so this instead
+ * represents the account of an operator who set up before this release. The
+ * password hash is the shared account's own, read back the way
+ * takeVerifyScreenshot reads it, so this needs no argon2 in JavaScript either.
+ */
+async function takeEnrolmentScreenshots(browser, theme) {
+  const configPath = CONFIG_PATH;
+  const hash = readPasswordHash(configPath);
+  if (!hash) {
+    throw new Error(`could not read the password hash out of ${configPath}; ` +
+      'set EASYWALL_CONFIG to the web.toml run 1 signed in against');
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'easywall-ui-2fa-'));
+  const port = 12232;
+  writeFileSync(join(dir, 'web.toml'), [
+    `bind_addr = "127.0.0.1:${port}"`,
+    `socket_path = "${join(dir, 'nowhere.sock')}"`,
+    `ssl_dir = "${join(dir, 'ssl')}"`,
+    `data_dir = "${dir}"`,
+    `language = "en"`,
+    `session_key = "ui-check-2fa-session-key-32bytes"`,
+    `username = "${USER}"`,
+    `password = "${hash}"`,
+    `totp_secret = ""`,
+    `recovery_codes = []`,
+    `update_check = false`,
+  ].join('\n'));
+
+  const proc = spawn('bin/easywall-web', ['-config', join(dir, 'web.toml')], { stdio: 'inherit' });
+  try {
+    const base = `https://127.0.0.1:${port}`;
+    await waitForPort(`${base}/login`);
+
+    const ctx = await screenshotContext(browser, theme);
+    const page = await ctx.newPage();
+
+    // login-{light,dark}.png documents an installation's login, and the demo
+    // has none to show — it is entered with a button — so the shot is taken
+    // here, on this non-demo instance, before signing in.
+    await page.goto(`${base}/login`, { waitUntil: 'load' });
+    await shoot(page, 'login', theme);
+    await page.fill('input[name=username]', USER);
+    await page.fill('input[name=password]', PASS);
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/login'] button[type=submit]"),
+    ]);
+
+    await page.goto(`${base}/password`, { waitUntil: 'networkidle' });
+    await page.fill("form[action='/password/2fa/begin'] input[name=current_password]", PASS);
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/password/2fa/begin'] button[type=submit]"),
+    ]);
+    if (!(await page.$('.totp-secret'))) {
+      throw new Error('2FA setup did not show the QR/secret step');
+    }
+    await shoot(page, 'two-factor-setup', theme);
+
+    const key = (await page.textContent('.totp-secret')).trim();
+    await page.fill("form[action='/password/2fa/confirm'] input[name=code]", totp(key));
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/password/2fa/confirm'] button[type=submit]"),
+    ]);
+    if (!(await page.$('.recovery-code'))) {
+      throw new Error('2FA confirm did not show recovery codes');
+    }
+    await shoot(page, 'two-factor-codes', theme);
+
+    await ctx.close();
+  } finally {
+    proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The first-run wizard with its 2FA step, and the account it creates is never
+ * used again. Nothing else in this file can reach these three screens: the
+ * long-lived instance the rest of the set is shot against already has an
+ * account by the time this runs, and /firstrun redirects to /login the
+ * moment one exists. So each theme gets its own throwaway instance, spun up
+ * and torn down entirely inside this function.
+ */
+async function takeWizardScreenshots(browser, theme) {
+  const dir = mkdtempSync(join(tmpdir(), 'easywall-ui-wizard-'));
+  const port = 12229;
+  writeFileSync(join(dir, 'web.toml'), [
+    `bind_addr = "127.0.0.1:${port}"`,
+    `socket_path = "${join(dir, 'nowhere.sock')}"`,
+    `ssl_dir = "${join(dir, 'ssl')}"`,
+    `data_dir = "${dir}"`,
+    `language = "en"`,
+    `demo_mode = true`,
+    `session_key = "ui-check-wizard-session-key-32byte"`,
+    `update_check = false`,
+  ].join('\n'));
+
+  // stdout piped rather than inherited: the setup token is in it, and the
+  // wizard refuses step 1 without it. Still echoed, so the log reads as before.
+  const proc = spawn('bin/easywall-web', ['-config', join(dir, 'web.toml')],
+    { stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  proc.stdout.on('data', d => { out += d; process.stdout.write(d); });
+  try {
+    const base = `https://127.0.0.1:${port}`;
+    await waitForPort(`${base}/firstrun`);
+    const token = await waitForSetupToken(() => out, "the wizard instance's output");
+
+    const ctx = await screenshotContext(browser, theme);
+    const page = await ctx.newPage();
+
+    await page.goto(`${base}/firstrun`, { waitUntil: 'load' });
+    await shoot(page, 'firstrun', theme);
+
+    await page.fill('input[name=setup_token]', token);
+    await page.fill('input[name=username]', USER);
+    await page.fill('input[name=password]', PASS);
+    await page.fill('input[name=password_confirm]', PASS);
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/firstrun'] button[type=submit]"),
+    ]);
+    if (!(await page.$('.totp-secret'))) {
+      throw new Error('firstrun did not reach the TOTP setup step; it is unconditional now');
+    }
+    await shoot(page, 'firstrun-2fa', theme);
+
+    const key = (await page.textContent('.totp-secret')).trim();
+    await page.fill("form[action='/firstrun/confirm'] input[name=code]", totp(key));
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/firstrun/confirm'] button[type=submit]"),
+    ]);
+    if (!(await page.$('.recovery-code'))) {
+      throw new Error('firstrun/confirm did not show recovery codes');
+    }
+    await shoot(page, 'firstrun-codes', theme);
+
+    await ctx.close();
+  } finally {
+    proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The second step of a 2FA login. Reachable only against an account that
+ * already has a secret — the demo never stores one (see checkVerifyPage,
+ * which this mirrors) — so a fresh instance is seeded with the *shot*
+ * account's own password hash, read out of the running instance's config
+ * exactly as checkVerifyPage does — see webConfigPath — plus a secret this
+ * function controls.
+ *
+ * Returns false, naming the page, if it cannot get the hash — rather than
+ * leaving two-factor-verify-*.png stale and silently wrong about why.
+ */
+async function takeVerifyScreenshot(browser, theme) {
+  const configPath = CONFIG_PATH;
+  const hash = readPasswordHash(configPath);
+  if (!hash) {
+    console.log(`  skip two-factor-verify-${theme}.png: could not read the password hash ` +
+      `out of ${configPath} — set EASYWALL_CONFIG to the file the shot account signed in against`);
+    return false;
+  }
+
+  const dir = mkdtempSync(join(tmpdir(), 'easywall-ui-verify-'));
+  const port = 12230;
+  const secret = 'JBSWY3DPEHPK3PXP';
+  writeFileSync(join(dir, 'web.toml'), [
+    `bind_addr = "127.0.0.1:${port}"`,
+    `socket_path = "${join(dir, 'nowhere.sock')}"`,
+    `ssl_dir = "${join(dir, 'ssl')}"`,
+    `data_dir = "${dir}"`,
+    `language = "en"`,
+    `session_key = "ui-check-verify-session-key-32byte"`,
+    `username = "${USER}"`,
+    `password = "${hash}"`,
+    `totp_secret = "${secret}"`,
+    `recovery_codes = []`,
+    `update_check = false`,
+  ].join('\n'));
+
+  const proc = spawn('bin/easywall-web', ['-config', join(dir, 'web.toml')], { stdio: 'inherit' });
+  try {
+    const base = `https://127.0.0.1:${port}`;
+    await waitForPort(`${base}/login`);
+
+    const ctx = await screenshotContext(browser, theme);
+    const page = await ctx.newPage();
+    await page.goto(`${base}/login`, { waitUntil: 'load' });
+    await page.fill('input[name=username]', USER);
+    await page.fill('input[name=password]', PASS);
+    await Promise.all([
+      page.waitForLoadState('load'),
+      page.click("form[action='/login'] button[type=submit]"),
+    ]);
+    if (!page.url().includes('/login/verify')) {
+      throw new Error(`the password step landed on ${page.url()}, want /login/verify`);
+    }
+    await shoot(page, 'two-factor-verify', theme);
+    await ctx.close();
+    return true;
+  } finally {
+    proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The counting question (2.28) — the card alone, not the dashboard around it.
+ * The demo never asks, so this signs in to a throwaway non-demo instance with
+ * a second factor, the way takeVerifyScreenshot does; the core is absent, and
+ * the card is cropped so its error banner stays out of the figure.
+ */
+async function takeTelemetryAskScreenshot(browser, theme) {
+  const hash = readPasswordHash(CONFIG_PATH);
+  if (!hash) {
+    console.log(`  skip telemetry-ask-${theme}.png: could not read the password hash out of ${CONFIG_PATH}`);
+    return false;
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'easywall-ui-ask-'));
+  const port = 12234;
+  const secret = 'JBSWY3DPEHPK3PXP';
+  writeFileSync(join(dir, 'web.toml'), [
+    `bind_addr = "127.0.0.1:${port}"`,
+    `socket_path = "${join(dir, 'nowhere.sock')}"`,
+    `ssl_dir = "${join(dir, 'ssl')}"`,
+    `data_dir = "${dir}"`,
+    `language = "en"`,
+    `demo_mode = false`,
+    `session_key = "ui-check-ask-session-key-32bytes!!"`,
+    `username = "${USER}"`,
+    `password = "${hash}"`,
+    `totp_secret = "${secret}"`,
+    `recovery_codes = []`,
+    `update_check = false`,
+  ].join('\n'));
+
+  const proc = spawn('bin/easywall-web', ['-config', join(dir, 'web.toml')], { stdio: 'inherit' });
+  try {
+    const base = `https://127.0.0.1:${port}`;
+    await waitForPort(`${base}/login`);
+    const ctx = await screenshotContext(browser, theme);
+    const page = await ctx.newPage();
+    await page.goto(`${base}/login`, { waitUntil: 'load' });
+    await page.fill('input[name=username]', USER);
+    await page.fill('input[name=password]', PASS);
+    await Promise.all([page.waitForLoadState('load'), page.click("form[action='/login'] button[type=submit]")]);
+    await page.fill('input[name=code]', totp(secret));
+    await Promise.all([page.waitForLoadState('load'), page.click("form[action='/login/verify'] button[type=submit]")]);
+    const out = `docs/assets/img/screens/telemetry-ask-${theme}.png`;
+    await page.locator('#telemetry-ask').screenshot({ path: out });
+    console.log(`  wrote ${out}`);
+    await ctx.close();
+    return true;
+  } finally {
+    proc.kill();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * The whole documented set: DEFAULT_SCREENSHOT_PAGES plus every screen that
+ * is not a plain authenticated GET. Account and dataset: whatever `admin`
+ * and the demo seed's DEMO_MODE instance at BASE hold — see this script's
+ * USER/PASS and internal/web/democlient.go's seed().
+ */
+async function takeFullScreenshotSet(browser, session) {
+  await takeScreenshots(browser, session, DEFAULT_SCREENSHOT_PAGES);
+  const notCaptured = [];
+  for (const theme of ['light', 'dark']) {
+    await takeEnrolmentScreenshots(browser, theme);
+    await takeWizardScreenshots(browser, theme);
+    if (!(await takeVerifyScreenshot(browser, theme))) {
+      notCaptured.push(`two-factor-verify-${theme}.png`);
+    }
+    if (!(await takeTelemetryAskScreenshot(browser, theme))) {
+      notCaptured.push(`telemetry-ask-${theme}.png`);
+    }
+  }
+  if (notCaptured.length) {
+    console.log(`\nNot re-taken (see the "skip" lines above for why): ${notCaptured.join(', ')}`);
+  }
+}
+
+const browser = await chromium.launch(launch);
+try {
+  console.log(`Driving ${BASE}`);
+  const setup = await browser.newContext({ ignoreHTTPSErrors: true });
+  const page = await setup.newPage();
+  await setUpAccount(page);
+  await signIn(page);
+  // One sign-in for the whole run — see signIn for what doing it per context
+  // cost. Every context below starts already authenticated.
+  const session = await setup.storageState();
+  await setup.close();
+
+  if (screenshotMode) {
+    // "firstrun" is not a path a signed-in session can visit: it names the
+    // three wizard screens, which takeWizardScreenshots shoots on its own
+    // throwaway instance.
+    const wizard = screenshotArgs.includes('/firstrun');
+    const paths = screenshotArgs.filter(a => a !== '/firstrun' && a !== '/telemetry-ask');
+    if (!screenshotArgs.length) {
+      await takeFullScreenshotSet(browser, session);
+    } else {
+      if (paths.length) await takeScreenshots(browser, session, paths);
+      if (wizard) {
+        for (const theme of ['light', 'dark']) await takeWizardScreenshots(browser, theme);
+      }
+      if (screenshotArgs.includes('/telemetry-ask')) {
+        for (const theme of ['light', 'dark']) await takeTelemetryAskScreenshot(browser, theme);
+      }
+    }
+  } else {
+    await runChecks(browser, session);
+  }
+} finally {
+  await browser.close();
+}
+
+if (screenshotMode) {
+  console.log('\nScreenshots written');
+} else if (failures.length) {
+  console.error(`\n${failures.length} UI check(s) failed`);
+  process.exit(1);
+} else {
+  console.log('\nUI checks passed');
+}

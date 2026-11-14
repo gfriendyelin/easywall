@@ -1,0 +1,224 @@
+# The socket protocol
+
+`easywall-web` reaches `easywall-core` over a Unix socket at
+`/run/easywall/core.sock`, `root:easywall 0660`. One JSON object per request, one
+per reply, connection closed after. Declared as Go structs on both sides in
+`internal/shared/protocol.go`; adding an operation means adding a constant to both
+ends.
+
+Twenty-five command types:
+
+| | |
+|---|---|
+| `GET_RULES` · `SAVE_RULES` | read all three sets · write **Staged** |
+| `APPLY_RULES` · `ACCEPT` | promote Staged and start the timer · confirm |
+| `CANCEL_ACCEPTANCE` | end the open window now — the rollback the timeout would have run, without the wait |
+| `GET_OPTIONS` · `SAVE_OPTIONS` | the protection modules |
+| `GET_SETTINGS` · `SAVE_SETTINGS` | IPv6, Docker, routing |
+| `GET_SYSTEM` · `SAVE_SYSTEM` | the acceptance window |
+| `GET_STATUS` | dashboard state, asked of the kernel. `acceptance` keeps `accepted` or `rolled_back` (with `acceptance_reason`: `timeout`, `cancelled by operator`, `panic mode`, `core stopped`) until the next apply — a 15-second poller has to be able to find it. `acceptance_enabled` says whether a window is configured at all — `acceptance: idle` alone cannot separate *none open now* from *none will ever open*. `unknown_bridges` names a Docker network that exists now and is not in the rules in force — created after the last apply (spec 2.24 D5); omitted when there is none |
+| `GET_LOG` | the last 200 audit entries |
+| `GET_PACKET_LOG` | the refused-packet ring, filtered by `PacketLogFilter`, newest first; `before` (seq, exclusive upper bound, 0 = none) is how the web process pages the ring for the country filter (2.29) — the country filter itself is not a protocol field; plus whether the core holds its NFLOG group and why not |
+| `EXPORT_RULES` · `IMPORT_RULES` | the rule set as JSON |
+| `VALIDATE_CUSTOM` | `nft --check` for the live editor |
+| `GET_APPLIED_CONFIG` | the options and network settings that went into the kernel with the rules that are in it |
+| `GET_USAGE` | what each port rule has carried, keyed by rule id, and when the figures were read |
+| `GET_HEALTH` | whether the firewall is doing what it says — three facts evaluated in order, plus the last self-test's identity, no rule detail or counter values |
+| `PANIC` · `RESUME` | tear the table down and record it as deliberate · end that and restore. **Root peers only** (`SO_PEERCRED`, read in `handleConn`): anyone else, `easywall-web` included, is answered `ErrConsoleOnlyText` and nothing runs. Until 2.25.1 any client of the socket could send both. `RESUME` answers `ResumeResult` — whether panic mode was engaged, and whether the restore wrote anything |
+| `LOG_EVENT` | one of thirteen login events, from a fixed enum, for the audit log |
+| `UPDATE_FEED` | one enabled feed's new version, from the web process's fetcher; re-validated, stored, and swapped into the live set without an apply |
+| `GET_FEEDS` | counts, timestamps and counters per feed — never entries; with `addr`, which copies contain it |
+
+## Size
+
+`shared.MaxMessageBytes`, **8 MiB**, each way (1 MiB before 2.23). Both ends read
+one byte past it:
+
+| | Over the limit |
+|---|---|
+| request, at the core (`handleConn`) | answered `request too large` (`ErrRequestTooLargeText`), nothing dispatched. It used to be cut at the limit and answered `invalid JSON command` |
+| request, at the sender (`SendCommand`) | not sent: `ErrRequestTooLarge`. The core stops reading at the limit, so the rest of the write would end in a broken pipe instead of the answer |
+| reply, at `SendCommand` | `read response: longer than 8388608 bytes`, not truncated JSON |
+
+Why 8: 100 000 entries in one `UPDATE_FEED`. The longest IPv6 address, 100 000
+times, is 4 200 059 bytes bare and 4 600 059 as `/128` — both over 4 MiB, the
+first limit planned (plan P12). `TestMaxMessageBytesCarriesAFullFeed` pins both,
+`TestSendCommand_RequestLimitIsExact`,
+`TestSendCommand_ResponseLimitIsExact`, `TestDaemonHandleConn_RequestLimitIsExact`.
+
+## Connections
+
+| | Core (`handleConn`, the accept loop) |
+|---|---|
+| deadline | `requestTimeout` (5 s) to read the request — every client writes it on connect; `connTimeout` (the longest `CommandTimeout`, 35 s) to write the reply. Dispatch is under neither, so an import's `nft --check` is never cut off. `TestDaemonConnTimeout_CoversEveryClientDeadline` |
+| at once | `maxConns`, 16 served; `maxQueued`, 48 more wait for a slot; past that a connection is closed unserved. `TestDaemon_ServesAtMostMaxConnsAtOnce` |
+| root peer | the console (SO_PEERCRED uid 0) skips both caps, so the web side cannot hold `panic` in the backlog. `TestDaemon_TheConsoleIsServedWhileTheCapIsFull` |
+| at Stop | a connection waiting on its peer is closed; one in dispatch finishes and is answered. `TestDaemonStop_DoesNotWaitForAnIdleClient` |
+
+Before: no deadline and no cap — one idle client held `systemctl restart` until
+SIGKILL, and 32 clients sending 8 MiB − 1 without closing took the heap from
+4 MiB to 286 MiB.
+
+## `UPDATE_FEED`
+
+Deadline class: long (`NftTimeout` + 5 s) — it takes the nft mutex to replace a
+live set. Payload `UpdateFeedPayload{id, entries, not_modified}`, reply
+`UpdateFeedResult{before, after, dropped, changed, loaded}`. The core trusts
+nothing in it, and checks in this order:
+
+| # | Check | On failure |
+|---|---|---|
+| 1 | panic is not engaged (checked again once the apply slot is held, so PANIC landing between the two finds nothing to interrupt), and the slot is free | refused, `panic mode is engaged` / exactly `ErrApplyInProgressText` (P7) — the web resends that one later |
+| 2 | `id` is a catalogue id or `own-1`…`own-3`, enabled in Staged or Current | refused |
+| 3 | ≤ 100 000 entries, each parsed again with `netip`, `::ffff:` unmapped | refused; a bad entry is named by position, never quoted |
+| 4 | wholly inside non-global space — RFC 1918, 100.64/10, 127/8, 169.254/16, 0/8, 224/3; IPv6 outside 2000::/3 or inside 2001:db8::/32 (documentation) — checked **before** the breadth refusal, so a feed's own bogon documentation (FireHOL level1's `224.0.0.0/3`, `10.0.0.0/8`…) is dropped rather than refusing the whole update (review finding, D4-4 revision) | dropped and counted (`dropped`); nothing left at all is refused |
+| 5 | no prefix broader than /8 (v4) or /16 (v6) — only what row 4 left standing reaches this; `0.0.0.0/0` and `::/0` overlap non-global space without being wholly inside it, so they still refuse here | the whole update refused |
+| 6 | for a feed enabled in **Current** only: at least 70 % of the stored count. Staged-only or switched off, any size — off, apply, on is how a list that really shrank is accepted (the web's switch-on fetches a feed refused as a shrink although a copy is stored) | refused, exactly `ErrFeedShrankText` — unless it has been refused three fetches in a row over at least 24 h (memory-only watch, reset by any stored copy or 304): then taken, and `feed_shrink_accepted` is audited once the copy is stored (2.29 D5) |
+| 7 | enabled in **Current**, changed or not: loaded first — under `m.mu` and the apply slot, both sets flushed and refilled in ≤ 64 KiB chunks, one batch. No counter booking: a set flush leaves the rules' counters alone (`TestIntegration_ARefreshKeepsTheCounter`) | refused and audited with the kernel's reason; nothing stored, nothing half-loaded |
+| 8 | written to `<data_dir>/feeds.json` atomically — skipped when only `checked_at` moved (a 304, the same list again): the cache takes it | error; the kernel already holds the new copy |
+| 9 | audit `feed_updated` only when the copy changed; `feed_shrink_accepted` when step 6 took a long-lived shrink; `feed_refused` for the data guards (3–6), a kernel refusal and an unknown id (without the id) | — |
+
+Every refusal leaves the previous version in the kernel and on disk. An apply
+cycle holds the slot for its whole acceptance window; an update arriving then is
+refused with `ErrApplyInProgressText` (plan P7). `not_modified: true` is a 304:
+`checked_at` moves, nothing else (P8).
+
+## `GET_FEEDS`
+
+Deadline class: short. Payload `GetFeedsPayload{addr}`, may be empty. Reply
+`GetFeedsResult{feeds: [FeedStatus…]}`, one per id that is stored or enabled in
+Current ∪ Staged: `stored`, `entries`, `dropped`, `changed_at`, `checked_at`,
+`in_kernel`, `packets` and `counters_read` (the `_feed-<id>` counters, read live;
+`counters_read: false` when they could not be, P16), `allowlist_overlap`, and
+`contains_addr` for the `addr` asked about. No entries, no audit entry.
+
+`stored` is true for every copy `feeds.json` holds — including one kept only
+because Backup names the feed (P13) — and the web process sends conditional
+requests only for those.
+
+## The one field that is not typed
+
+`SaveRulesPayload.Rules` is an `interface{}`. The core re-encodes it to JSON and
+decodes it into the concrete type named by `rule_type`.
+
+An unknown `rule_type` is rejected, and since 2.5.0 the decoded rules are
+validated before they are stored — but the field itself is untyped at the protocol
+level, and `docs/architecture.md` used to claim the whole protocol was typed. It is
+the one place where "a JSON command the typed protocol accepts" means slightly less
+than it sounds.
+
+## The rules payload
+
+`PortRule`, the element type of `Rules.TCP` and `Rules.UDP`:
+
+```go
+type PortRule struct {
+	ID          string   `json:"id,omitempty"`
+	Port        string   `json:"port"`
+	Description string   `json:"description"`
+	SSH         bool     `json:"ssh"`
+	Sources     []string `json:"sources,omitempty"`
+	Service     string   `json:"service,omitempty"`
+}
+```
+
+`id`, `sources` and `service` are `omitempty`, so a rules file written before
+the release that added each one is byte-identical after a round-trip. `id` is
+filled in once, at the first start of 2.15, on every path that writes the file
+and on none that reads it.
+
+## The packet log entry
+
+`GET_PACKET_LOG` returns `shared.PacketLogEntry`, and the same JSON is one line
+of `packets.log`. Fields are added, never renamed:
+
+| Field | Since | Absent means |
+|---|---|---|
+| `icmp` — `{"type": N, "code": N}` | 2.22 | not an ICMP/ICMPv6 packet, a later fragment, or a line a 2.21 core wrote. A replayed old line keeps it absent; `TestReplayReadsLinesWithoutTheICMPField` |
+
+## The snapshot behind `GET_APPLIED_CONFIG`
+
+The core stores `applied-config.json` in its data directory, mode 0600, atomically,
+wherever `nft.Apply` succeeds — an ordinary apply, a rollback, and the boot or
+`resume` restore. Nowhere else: a refused or failed apply put nothing in the kernel.
+
+It is also what a rollback goes back to. An apply reads it before writing the
+kernel; the rollback rebuilds the table with that snapshot, not with the live
+config, and records it again — so a rolled-back option change stays configured
+and shows as pending. The `unconfirmed` marker carries the same snapshot as JSON
+for a core that dies inside the window; an empty marker (older core, or no
+snapshot) falls back to the live config.
+
+`recorded: false` means the file is not there, which is what an installation
+upgrading to 2.10 looks like. That state is *unknown*, not *identical*:
+`Status.HasPending` keeps its 2.9 meaning until a snapshot exists, so no
+installation is greeted with a pending change it did not make.
+
+## What the protocol does not carry
+
+**Identity.** There is no user field on any command, so every audit entry is
+written with the literal `"web"` — `daemon.go` passes it at each call site. The
+documentation must not imply otherwise: the audit log's `user` column answers
+"which process", not "which person". Multiple accounts and a `user` field are the
+2.7 line on the roadmap, in that order, because the field has to exist before
+login events mean anything.
+
+**A session.** Each request is independent. The core does not know which browser
+caused it, which is also why rate limiting lives entirely in the web process.
+
+## Concurrency and the apply timer
+
+An apply that is already running rejects a second one with
+`ErrApplyInProgressText`. The timer lives in the core, not the browser: closing the
+tab, losing the connection or restarting the *web* process does not confirm
+anything, and letting the window expire is what restores the previous set.
+
+Stopping the **core** while a window is open counts as not confirming — it rolls
+back before the daemon exits. A restart inside those two minutes is an ordinary
+event, and it used to leave the unconfirmed set in place with nothing left to
+undo it.
+
+## Demo mode
+
+`internal/web/democlient.go` implements the same client interface against an
+in-memory state: every `Get*` returns it, every `Save*` updates it and appends an
+audit entry, `APPLY_RULES` runs the real acceptance state machine.
+
+`VALIDATE_CUSTOM` **reports the checker as unavailable** rather than answering. It
+used to reply "no errors" whatever was typed — a false green on the one page where
+being wrong locks you out.
+
+`GET_HEALTH` answers `unprovable` and never `passed`. The demo has no network
+namespace to run the four claims in, and `/healthz` is unauthenticated — so a
+proof this process never ran would be published to anyone who asks.
+
+Demo mode disables nothing else: authentication, CSRF, the CSP and the rate
+limiter all behave normally, which is what makes it a usable target for the
+Playwright suite in `test.yml`.
+
+## What the demo mock answers
+
+| Command | In demo |
+|---|---|
+| every `Get*` | returns the in-memory state |
+| every `Save*` | updates it and appends an audit entry |
+| `ApplyRules` | promotes Staged to Current, starts the acceptance timer |
+| `Accept` | cancels the timer |
+| timeout | rolls Current back to Backup |
+| `ExportRules` / `ImportRules` | round-trips the state as JSON |
+| `ValidateCustom` | **reports the checker as unavailable** |
+| `GetHealth` | `ok`/`healthy`, or `fail`/`panic` while the demo's panic mode is on. The self-test reads `unprovable` with no kernel named |
+| `GetPacketLog` | a generated stream on documentation addresses, a few new packets a minute — see `demoPacketLog` |
+| `GetFeeds` | `spamhaus-drop` (1801 entries, 3412 packets) and `dshield` (20 entries, 18873 packets), both enabled with a copy; a feed staged in the demo is reported with no copy |
+| `UpdateFeed` | **refused** — demo mode constructs no fetcher, so nothing sends it |
+
+## Adding a command
+
+1. The constant in `internal/shared/protocol.go`, plus its payload struct.
+2. The handler in `internal/core/daemon.go` — and an audit entry if it changes
+   anything.
+3. The client method, and the demo client beside it. A demo client that silently
+   does nothing is how the validation false-green happened.
+4. If it changes the firewall: an integration test in `internal/core/`, because
+   the unit tests mock the kernel and cannot tell a correct rule from a plausible
+   one.

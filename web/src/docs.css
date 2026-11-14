@@ -1,0 +1,2132 @@
+/* ── easywall documentation site stylesheet ────────────────────────────
+   Palette and typography come from DESIGN.md in the repo root — the same
+   source the application uses. The values are duplicated here rather than
+   imported because Tailwind v4 cannot share a theme across two entry points;
+   when DESIGN.md changes, both stylesheets must be updated.
+
+   daisyUI was removed along with the application's dependency on it: the docs
+   chrome is hand-rolled and never used a daisyUI component.
+
+   Compiled with: npx @tailwindcss/cli -i web/src/docs.css -o docs/assets/css/style.css --minify */
+
+/* Restrict the source set to docs files so app-template patterns are not pulled
+   in. `source(none)` is what does the restricting: Tailwind v4 scans the whole
+   working directory by default and @source only *adds* to that, so the line
+   below on its own said "docs as well", not "docs only". The published
+   stylesheet carried the application's utilities as a result — 32,586 bytes
+   before the fix, 28,213 after. */
+@import "tailwindcss" source(none);
+
+@source "../../docs/**/*.{html,md}";
+/* Not the changelog: it is generated from CHANGELOG.md, its prose may not be
+   edited to suit a scanner, and Tailwind reads class-like tokens out of
+   ordinary English. Measured — "a ring with no border change" in a changelog
+   entry compiled `.ring` and 1,650 bytes into the published stylesheet. */
+@source not "../../docs/_docs/changelog.md";
+
+/* Self-hosted, same subsets the application ships. Paths are relative to the
+   compiled stylesheet at docs/assets/css/, so they survive the GitHub Pages
+   baseurl prefix. */
+@font-face {
+  font-family: "Inter";
+  src: url("../fonts/inter-var.woff2") format("woff2-variations");
+  font-weight: 400 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("../fonts/jetbrains-mono-var.woff2") format("woff2-variations");
+  font-weight: 300 600;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Tokens — Graphite + Ice, dark by default ─────────────────────────────
+   The chrome below refers to these short names; only the values changed when
+   the design system did. */
+:root {
+  --font-sans:    'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  --font-mono:    'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --sidebar-w:    260px;
+
+  /* Layout arithmetic. Content runs full width between the sidebar and the
+     on-page contents; --measure-max is only a backstop for very wide displays.
+     --toc-w is 0 until the viewport is wide enough for a third column, which
+     is what keeps the reserved padding honest at every other size. */
+  --measure-max:  1400px;
+  --content-pad:  clamp(1.25rem, 5vw, 4rem);
+  --toc-w:        0px;
+  /* The gutter between the prose and the on-page contents. It has to be its own
+     value: --toc-w was doing double duty as the column's width and as the space
+     reserved for it, so the article's right edge landed exactly on the contents'
+     border-left — a hairline touching the text, and a figure running flush into
+     it. Fluid, so the reading measure gives up least where there is least room. */
+  --toc-gap:      0px;
+
+  --bg:           #0a0b0f;
+  --surface:      #111318;
+  --surface-2:    #181b22;
+  --surface-3:    #252932;
+  --border:       #252932;
+  --border-muted: #181b22;
+  /* Mirrors control-edge in DESIGN.md. --border is a separator and may be quiet;
+     a button's outline may not — at --border it measured 1.28:1 against the
+     surface behind it, where WCAG 2.1 SC 1.4.11 wants 3:1. */
+  --control-edge: #5e636e;
+  --text:         #f1f3f6;
+  --text-muted:   #a2aab8;
+  --text-subtle:  #7d8593;
+  /* Colour means firewall state, and a documentation page has no state for it
+     to mean — nothing here is ok, warning or critical, so an ice-blue accent
+     was a fourth colour with nothing to say. Focus, selection and the one
+     primary action are carried by fill, edge and weight instead; a link takes
+     an underline and 500 weight rather than a hue. --select-fill is
+     --surface-2 and --select-edge is --text, which is the strongest pairing
+     the palette has (16.4:1 on the page ground). */
+  --focus-ring:   #f1f3f6;
+  --link-ink:     #f1f3f6;
+  --select-fill:  #181b22;
+  --select-edge:  #f1f3f6;
+
+  --state-ok:     #3ecf8e;
+  --state-warn:   #e5a54b;
+  --state-crit:   #f2555a;
+
+  /* Syntax highlighting is its own semantic domain — a docs page carries no
+     firewall state, so the state hues are free to be reused for code tokens. */
+  --code-keyword: #8fd3fb;
+  --code-string:  #3ecf8e;
+  --code-number:  #e5a54b;
+  --code-builtin: #a2aab8;
+  --code-error:   #f2555a;
+
+  /* Callout washes. Three semantic states, each a wash and an edge, and each
+     was a pair of rgba() literals in the rule itself until 2.19. The blue is
+     not an exception to "colour means state" — info *is* a state — but a
+     literal is invisible to every guard that greps for token names, which is
+     what TestNoRetiredHueSurvives exists to catch one palette later. */
+  --callout-info-wash:    rgba(56,189,248,0.08);
+  --callout-info-edge:    rgba(56,189,248,0.25);
+  --callout-warning-wash: rgba(245,158,11,0.08);
+  --callout-warning-edge: rgba(245,158,11,0.30);
+  --callout-success-wash: rgba(16,185,129,0.08);
+  --callout-success-edge: rgba(16,185,129,0.25);
+}
+
+[data-theme="easywall-light"] {
+  --bg:           #fcfcfd;
+  --surface:      #ffffff;
+  --surface-2:    #f4f6f9;
+  --surface-3:    #e4e8ee;
+  --border:       #e4e8ee;
+  --border-muted: #f4f6f9;
+  --control-edge: #868a93;
+  --text:         #0f1116;
+  --text-muted:   #5a6270;
+  --text-subtle:  #666e7b;  /* raised from #6f7784: 4.17:1 on --surface-2 failed AA */
+  --focus-ring:   #0f1116;
+  --link-ink:     #0f1116;
+  --select-fill:  #f4f6f9;
+  --select-edge:  #0f1116;
+
+  --state-ok:     #12855c;
+  --state-warn:   #96620d;
+  --state-crit:   #cf2d38;
+
+  --code-keyword: #0d6b95;
+  --code-string:  #0f714e;
+  --code-number:  #88590c;
+  --code-builtin: #5a6270;
+  --code-error:   #ba2832;
+
+  --callout-info-wash:    rgba(2,132,199,0.06);
+  --callout-info-edge:    rgba(2,132,199,0.30);
+  --callout-warning-wash: rgba(217,119,6,0.06);
+  --callout-warning-edge: rgba(217,119,6,0.30);
+  --callout-success-wash: rgba(5,150,105,0.06);
+  --callout-success-edge: rgba(5,150,105,0.30);
+}
+
+/* ── Body / Fonts ──────────────────────────────────────────────────────
+   The page ground is set here explicitly. It used to come from daisyUI's base
+   layer via --color-base-100; when daisyUI was removed the background went with
+   it and nothing replaced it, so the site rendered dark components on a white
+   page — dark mode looked broken while light mode looked fine by coincidence. */
+html, body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 15.5px;
+  line-height: 1.7;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Tells the browser which way round the page is, so scrollbars, form controls,
+   spell-check underlines and the default focus ring follow the theme too. This
+   also came from daisyUI. */
+:root { color-scheme: dark; }
+[data-theme="easywall-light"] { color-scheme: light; }
+
+::selection {
+  background: var(--select-fill);
+  color: var(--text);
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--border); }
+
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Layout chrome (sidebar / topbar / content) ──────────────────────── */
+@layer components {
+
+  /* The sidebar is position:fixed (removed from flow), so the layout
+     wrapper is a plain block — using display:flex here makes .content
+     compute width against the full parent and overflow horizontally. */
+  .layout {
+    min-height: 100vh;
+  }
+
+  /* === Mobile topbar (hidden on desktop) === */
+  .topbar {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 52px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    align-items: center;
+    padding: 0 1rem;
+    gap: 0.75rem;
+    z-index: 200;
+    backdrop-filter: blur(8px);
+  }
+
+  .topbar-logo {
+    font-size: 0.95rem;
+    font-weight: 600;
+    letter-spacing: -0.3px;
+    color: var(--text);
+    text-decoration: none;
+    flex: 1;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .topbar-logo:hover { color: var(--text); }
+
+  .topbar-github {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .topbar-github:hover { color: var(--text); }
+
+  .sidebar-toggle {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0.375rem;
+    color: var(--text);
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .sidebar-toggle:hover { background: var(--surface-2); }
+
+  .sidebar-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 150;
+    backdrop-filter: blur(2px);
+  }
+  .sidebar-backdrop.visible { display: block; }
+
+  /* === Sidebar === */
+  .sidebar {
+    width: var(--sidebar-w);
+    min-height: 100vh;
+    background: var(--surface);
+    border-right: 1px solid var(--border);
+    position: fixed;
+    top: 0; left: 0; bottom: 0;
+    z-index: 100;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .sidebar-header {
+    padding: 1.25rem 1rem 1rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .sidebar-logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: -0.4px;
+    color: var(--text);
+    text-decoration: none;
+  }
+
+  .sidebar-logo:hover { color: var(--text); }
+
+  .sidebar-github {
+    color: var(--text-muted);
+    padding: 6px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.15s, color 0.15s;
+  }
+  .sidebar-github:hover {
+    color: var(--text);
+    background: var(--select-fill);
+  }
+
+  /* ── The documentation search ──────────────────────────────────────────────
+     Hidden by default and revealed by the flag the head script sets. A trigger
+     that opens a dialog it cannot fill is a control that lies about what it can
+     do; the sidebar navigation is the complete path without JavaScript. */
+  #docs-search { display: none; }
+  /* 12px above, and none below: .sidebar-nav's own 0.75rem does that side, so
+     the field sits evenly between the header's rule and the first page. It used
+     to have 0 above and 24 below — hard against the hairline, which reads as the
+     control being stuck to the brand row rather than being its own zone. */
+  [data-js] #docs-search { display: block; padding: 0.75rem 14px 0; }
+
+  /* Reads as a field, behaves as a button — the established pattern for docs
+     search, and the only way the shortcut can be shown on the control itself. */
+  .docs-search-trigger {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 8px 7px 10px;
+    font: inherit;
+    font-size: 13px;
+    color: var(--text-subtle);
+    background: var(--surface-2);
+    border: 1px solid var(--control-edge);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: color 120ms cubic-bezier(0.2, 0, 0.2, 1),
+                background-color 120ms cubic-bezier(0.2, 0, 0.2, 1),
+                border-color 120ms cubic-bezier(0.2, 0, 0.2, 1);
+  }
+
+  .docs-search-trigger:hover {
+    color: var(--text);
+    background: var(--surface-3);
+    border-color: var(--focus-ring);
+  }
+
+  .docs-search-trigger:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: 1px;
+    border-color: var(--focus-ring);
+  }
+
+  .docs-search-trigger svg { flex: none; }
+  .docs-search-trigger-label { flex: 1; text-align: left; }
+
+  .docs-search-key {
+    flex: none;
+    padding: 3px 5px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    line-height: 1;
+    color: var(--text-subtle);
+    background: var(--surface-3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+
+  /* The overlay. `display: none` on the element itself rather than relying on
+     the dialog's default, so [open] is the single switch that also turns on the
+     flex column the scrolling results depend on. */
+  .docs-search-dialog {
+    display: none;
+    flex-direction: column;
+    width: min(680px, calc(100vw - 2rem));
+    max-height: min(70vh, 640px);
+    padding: 0;
+    margin: auto;
+    overflow: hidden;
+    color: var(--text);
+    /* One surface step above the page, not level with it. At --surface over a
+       page dimmed by the backdrop the panel had almost no edge — it read as
+       translucent, which is the one thing a modal must not look like. A red
+       test fill proved the paint was solid and the contrast was the problem. */
+    background: var(--surface-2);
+    border: 1px solid var(--surface-3);
+    border-radius: 12px;
+    box-shadow: 0 8px 24px -8px rgba(0, 0, 0, 0.55);
+  }
+
+  .docs-search-dialog[open] { display: flex; }
+  .docs-search-dialog::backdrop { background: rgba(10, 11, 15, 0.62); }
+
+  [data-theme="easywall-light"] .docs-search-dialog {
+    box-shadow: 0 8px 24px -8px rgba(15, 17, 22, 0.14);
+  }
+
+  /* Lighter than the dark theme's veil on purpose. At 0.38 a white page read as
+     a dark one, which looks like the theme broke rather than like a dialog
+     opened; the panel's own border and overlay shadow carry the separation. */
+  [data-theme="easywall-light"] .docs-search-dialog::backdrop {
+    background: rgba(15, 17, 22, 0.28);
+  }
+
+  /* The page behind an open dialog is inert but still scrollable, which reads
+     as the overlay drifting when a trackpad is touched. */
+  html:has(.docs-search-dialog[open]) { overflow: hidden; }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .docs-search-dialog[open] {
+      animation: docs-search-in 200ms cubic-bezier(0.2, 0, 0.2, 1);
+    }
+    @keyframes docs-search-in {
+      from { opacity: 0; transform: translateY(-6px); }
+    }
+  }
+
+  .sidebar-nav {
+    flex: 1;
+    padding: 0.75rem 0.5rem;
+    overflow-y: auto;
+  }
+
+  /* A sidebar group is a <details>, so the label is its <summary>: the click
+     target, the keyboard target and the disclosure state are the element's own.
+     Both default markers have to go — list-style for Firefox, the WebKit
+     pseudo-element for Safari — or the browser's triangle sits beside ours. */
+  .nav-group-label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    color: var(--text-subtle);
+    padding: 1.5rem 0.75rem 0.5rem;
+    margin-top: 0.75rem;
+    border-top: 1px solid var(--border-muted);
+    cursor: pointer;
+    list-style: none;
+    user-select: none;
+  }
+
+  /* The first group follows the ungrouped Home/Overview links, not another
+     group — a rule there divides nothing and reads as a stray line. */
+  .nav-group:first-of-type > .nav-group-label {
+    border-top: none;
+  }
+
+  .nav-group-label::-webkit-details-marker { display: none; }
+
+  .nav-group-label:hover { color: var(--text-muted); }
+
+  .nav-group-label:focus-visible {
+    outline: 2px solid var(--focus-ring);
+    outline-offset: -2px;
+    border-radius: 6px;
+  }
+
+  /* The chevron. Two borders on an empty box rather than an icon file: it takes
+     currentColor, so it follows the label through hover and both themes without
+     a second asset or a fill that has to be kept in sync with the palette. */
+  .nav-group-label::after {
+    content: "";
+    width: 0.375rem;
+    height: 0.375rem;
+    margin-right: 0.125rem;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: translateY(-1px) rotate(45deg);
+  }
+
+  .nav-group[open] > .nav-group-label::after {
+    transform: translateY(1px) rotate(-135deg);
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .nav-group-label::after { transition: transform 0.15s ease; }
+  }
+
+  .nav-section, .nav-section-single {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .nav-link {
+    display: block;
+    padding: 0.45rem 0.75rem;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    border-radius: 6px;
+    transition: background 0.12s, color 0.12s;
+  }
+
+  .nav-link:hover {
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
+  /* A fill on its own is not enough to mark what is active: --select-fill is
+     --surface-2, which is one step off the page and the same fill .nav-link
+     already takes on hover. The edge is the half that says "you are here". */
+  /* The edge marks it, the fill only confirms it: --select-fill is 1.08:1 against
+     the surface behind it, which is not a marker on its own.
+
+     padding-left gives back the 2px the border takes, or the active item's label
+     sits 2px right of every inactive one and the whole column reads as a jog. */
+  .nav-link.active {
+    background: var(--select-fill);
+    color: var(--text);
+    border-left: 2px solid var(--select-edge);
+    padding-left: calc(0.75rem - 2px);
+    font-weight: 500;
+  }
+
+  .nav-sub {
+    padding-left: 1.5rem;
+  }
+
+  .sidebar-footer {
+    padding: 0.75rem 0.875rem 1rem;
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+
+  .theme-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 0.4rem 0.75rem;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: var(--font-sans);
+    font-size: 0.75rem;
+    transition: all 0.15s;
+  }
+
+  .theme-toggle:hover {
+    background: var(--surface-2);
+    color: var(--text);
+    border-color: var(--text-subtle);
+  }
+
+  .icon-sun, .icon-moon {
+    flex-shrink: 0;
+  }
+  [data-theme="easywall-dark"] .icon-sun { display: block; }
+  [data-theme="easywall-dark"] .icon-moon { display: none; }
+  [data-theme="easywall-light"] .icon-sun { display: none; }
+  [data-theme="easywall-light"] .icon-moon { display: block; }
+  .theme-label { font-weight: 500; }
+
+  /* The edge was a hard-coded rgba(34,211,238,…) — the Aurora cyan, retired
+     two palettes ago — with a light-mode override that existed only to
+     restate it in the other palette. A version number is not a state; it is
+     quiet metadata, and takes --border in both themes with no override at
+     all. */
+  .sidebar-version {
+    font-size: 0.7rem;
+    font-family: var(--font-mono);
+    color: var(--text-muted);
+    background: var(--surface-2);
+    padding: 2px 6px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    letter-spacing: 0.5px;
+  }
+
+  /* === Content === */
+  .content {
+    margin-left: var(--sidebar-w);
+    min-height: 100vh;
+    padding: 1.75rem var(--content-pad) 3rem;
+    /* Reserved for the on-page contents. Zero until the viewport earns it. */
+    padding-right: calc(var(--content-pad) + var(--toc-w) + var(--toc-gap));
+    animation: fade-in 0.25s ease;
+  }
+
+  /* No on-page contents, so nothing to reserve: a page that declares
+     `toc: false`, or one the script found too short to need a contents list,
+     gets the gutter back. Without this the landing page stopped at 1572px in a
+     1920px window and kept 347px empty beside it. Declared after .content and
+     at the same specificity, so source order settles it. */
+  .content-full { padding-right: var(--content-pad); }
+
+  /* Full width, left-aligned — one left edge for headings, prose, tables and
+     figures alike. It used to be an 880px measure centred in the available
+     area, while tables and diagrams stepped outside it and centred on the same
+     axis: their left edge therefore sat further left than every heading, and
+     the page read as if the content had come loose from its titles.
+
+     The cap only engages on very wide displays, where the alternative is a
+     150-character line. Below it there is nothing to centre. */
+  .content-body {
+    max-width: var(--measure-max);
+    margin: 0;
+  }
+
+  .page-footer {
+    max-width: var(--measure-max);
+    margin: 4rem 0 0;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border-muted);
+    font-size: 0.78rem;
+    color: var(--text-subtle);
+    text-align: center;
+  }
+
+  .page-footer a {
+    color: var(--text-muted);
+    text-decoration: none;
+  }
+  .page-footer a:hover { color: var(--text); }
+
+  /* === Hero (homepage) — large, atmospheric, on-brand =================== */
+  .docs-hero {
+    position: relative;
+    /* Top margin cancels .content's own top padding exactly (-1.75rem here
+       matches .content's padding-top below), so the glow/dotted texture
+       starts at the very top of the content column instead of leaving a
+       flat, textureless gap above the hero. That gap — empty either way,
+       just a different height — was still reading as a bar over the
+       content even after it was shrunk once. Padding-top now controls the
+       pill's offset alone, and every pixel of it is inside the textured
+       hero, not blank background. */
+    margin: -1.75rem -1rem 4rem;
+    padding: 1.5rem 1rem 3.5rem;
+    overflow: hidden;
+    isolation: isolate;
+  }
+
+  /* Subtle radial-gradient glow + dotted-grid pattern behind the hero
+     content — distinctive without being noisy. Sits behind via z-index.
+     No opaque surface cap over the top edge: that rendered as a solid dark
+     band across the hero wherever the mask is not applied, so the glow is
+     made of one tinted fill only and can never paint a full-width bar. */
+  .docs-hero-glow {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(900px 350px at 18% 0%, var(--select-fill), transparent 70%);
+    mask-image: radial-gradient(circle at center, black, black 70%, transparent 100%);
+  }
+
+  /* Dotted grid (CSS-only, no SVG). Layered on top of the glow. */
+  .docs-hero::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background-image:
+      radial-gradient(circle at 1px 1px, var(--border-muted) 1px, transparent 0);
+    background-size: 22px 22px;
+    mask-image: linear-gradient(180deg, black 0%, transparent 85%);
+    opacity: 0.45;
+  }
+
+  .docs-hero-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.85rem 0.3rem 0.7rem;
+    margin-bottom: 1.75rem;
+    background: var(--select-fill);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    font-weight: 500;
+    letter-spacing: 0.2px;
+  }
+
+  .docs-hero-pill-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-subtle);
+    box-shadow: 0 0 0 3px var(--select-fill);
+  }
+
+  .docs-hero-title {
+    font-size: clamp(2.5rem, 6vw, 4.25rem);
+    font-weight: 600;
+    letter-spacing: -2px;
+    line-height: 1.0;
+    margin: 0 0 1.75rem;
+    color: var(--text);
+  }
+
+  /* Was .docs-hero-accent, and was a linear-gradient clipped to the text with
+     a @supports fallback behind it — for a gradient whose two stops were the
+     same colour. A gradient made of one colour twice is a colour. */
+  .docs-hero-mark {
+    color: var(--text);
+  }
+
+  .docs-hero-desc {
+    font-size: clamp(1rem, 1.6vw, 1.2rem);
+    color: var(--text-muted);
+    line-height: 1.65;
+    max-width: 640px;
+    margin: 0 0 2rem;
+  }
+
+  .docs-hero-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 2.5rem;
+  }
+
+  /* The buttons themselves are styled below (.btn, .btn-primary,
+     .btn-soft, .btn-ghost). We only neutralise the prose-link styling
+     that would otherwise underline them on hover. */
+  .docs-hero-buttons .btn,
+  .docs-hero-buttons .btn:hover {
+    text-decoration: none;
+    border-bottom: none;
+  }
+
+  .docs-hero-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 0.78rem;
+    color: var(--text-subtle);
+    font-family: var(--font-mono);
+  }
+
+  .docs-hero-meta strong {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  .docs-hero-meta-sep {
+    opacity: 0.4;
+  }
+
+  /* === Why section ====================================================== */
+  .docs-why {
+    margin: 4rem 0;
+  }
+
+  .docs-why-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 1.25rem;
+    margin: 2rem 0 2rem;
+  }
+
+  .docs-why-card {
+    position: relative;
+    background: var(--surface);
+    border: 1px solid var(--border-muted);
+    border-radius: 12px;
+    padding: 1.75rem 1.5rem;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+
+  .docs-why-card:hover {
+    border-color: var(--border);
+    transform: translateY(-2px);
+  }
+
+  .docs-why-card-icon {
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    margin-bottom: 1rem;
+  }
+
+  .docs-why-card-icon svg {
+    width: 22px;
+    height: 22px;
+  }
+
+  .docs-why-icon-problem {
+    background: rgba(244,63,94,0.10);
+    color: var(--code-error);
+  }
+  [data-theme="easywall-light"] .docs-why-icon-problem {
+    color: var(--code-error);
+    background: rgba(225,29,72,0.08);
+  }
+
+  .docs-why-icon-history {
+    background: rgba(245,158,11,0.10);
+    color: var(--code-number);
+  }
+  [data-theme="easywall-light"] .docs-why-icon-history {
+    color: var(--code-number);
+    background: rgba(217,119,6,0.08);
+  }
+
+  .docs-why-icon-solution {
+    background: var(--select-fill);
+    color: var(--text-muted);
+  }
+
+  .docs-why-card h3 {
+    font-size: 1rem;
+    font-weight: 600;
+    margin: 0 0 0.5rem;
+    color: var(--text);
+    border: none !important;
+    padding: 0 !important;
+    letter-spacing: -0.2px;
+  }
+
+  .docs-why-card p {
+    font-size: 0.875rem;
+    color: var(--text-muted);
+    line-height: 1.65;
+    margin: 0;
+  }
+
+  .docs-why-card p code {
+    font-size: 0.78em;
+  }
+
+  .docs-why-tagline {
+    font-size: 1rem;
+    color: var(--text-muted);
+    line-height: 1.7;
+    text-align: center;
+    max-width: 720px;
+    margin: 1.5rem auto 0;
+    padding: 1.25rem 1.5rem;
+    border-top: 1px solid var(--border-muted);
+  }
+
+  .docs-why-tagline strong {
+    color: var(--text);
+  }
+
+  /* === Section spacing & headings (homepage long-form sections) ========= */
+  .docs-features-section,
+  .docs-design,
+  .docs-stack,
+  .docs-cta {
+    margin: 4.5rem 0;
+  }
+
+  .docs-features-section > h2,
+  .docs-design > h2,
+  .docs-stack > h2,
+  .docs-cta > h2,
+  .docs-why > h2 {
+    font-size: clamp(1.5rem, 2.4vw, 1.9rem);
+    font-weight: 600;
+    letter-spacing: -0.6px;
+    border-bottom: none;
+    padding-bottom: 0;
+    margin: 0 0 1rem;
+    color: var(--text);
+  }
+
+  .docs-section-lead {
+    font-size: 1.05rem;
+    color: var(--text-muted);
+    line-height: 1.75;
+    max-width: 680px;
+    margin: 0 0 2rem;
+  }
+
+  .docs-section-lead em {
+    color: var(--text);
+    font-style: italic;
+  }
+
+  /* === "Built for production" — numbered design rows ===================== */
+  .docs-design-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+    margin-top: 2rem;
+  }
+
+  .docs-design-row {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 1.5rem;
+    padding: 1.5rem 1.5rem 1.5rem 1.25rem;
+    background: var(--surface);
+    border: 1px solid var(--border-muted);
+    border-radius: 12px;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+
+  .docs-design-row:hover {
+    border-color: var(--border);
+    transform: translateY(-1px);
+  }
+
+  .docs-design-row-num {
+    font-family: var(--font-mono);
+    font-size: 1.25rem;
+    font-weight: 500;
+    color: var(--text-muted);
+    background: var(--select-fill);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    width: 48px;
+    height: 48px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    letter-spacing: -1px;
+  }
+
+
+  .docs-design-row-body h3 {
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin: 0 0 0.4rem;
+    color: var(--text);
+    border: none !important;
+    padding: 0 !important;
+    letter-spacing: -0.2px;
+  }
+
+  .docs-design-row-body p {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    line-height: 1.7;
+    margin: 0;
+  }
+
+  /* === Tech stack grid =================================================== */
+  .docs-stack-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 1rem;
+    margin-top: 2rem;
+  }
+
+  .docs-stack-item {
+    background: var(--surface);
+    border: 1px solid var(--border-muted);
+    border-radius: 10px;
+    padding: 1.1rem 1.2rem;
+    transition: border-color 0.2s;
+  }
+
+  .docs-stack-item:hover {
+    border-color: var(--border);
+  }
+
+  .docs-stack-label {
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--text-subtle);
+    margin-bottom: 0.45rem;
+  }
+
+  .docs-stack-value {
+    font-size: 1rem;
+    font-weight: 600;
+    color: var(--text);
+    font-family: var(--font-mono);
+    letter-spacing: -0.2px;
+    margin-bottom: 0.45rem;
+    line-height: 1.3;
+  }
+
+  .docs-stack-note {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    line-height: 1.55;
+  }
+
+  /* === CTA section (bottom of homepage) ================================= */
+  .docs-cta {
+    position: relative;
+    padding: 3rem 2.25rem;
+    background: var(--surface);
+    border: 1px solid var(--border-muted);
+    border-radius: 16px;
+    overflow: hidden;
+    isolation: isolate;
+    text-align: center;
+  }
+
+  .docs-cta-glow {
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    background:
+      radial-gradient(500px 240px at 50% 0%, var(--select-fill), transparent 70%);
+  }
+
+  /* These four rules are scoped through .content-body on purpose. The generic
+     prose rules for h2 and p live outside this layer and appear later in the
+     sheet, so at equal specificity they won: the heading kept the section
+     divider that belongs between chapters, not inside a card, and the
+     paragraph lost the `auto` side margins that centre it — leaving the copy
+     on one axis and the heading and buttons on another, 104px apart. */
+  .content-body .docs-cta > h2 {
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+
+  .content-body .docs-cta > p {
+    margin-inline: auto;
+  }
+
+  .docs-cta > h2 {
+    margin: 0 0 0.85rem;
+    font-size: clamp(1.6rem, 3vw, 2.1rem);
+    letter-spacing: -0.7px;
+  }
+
+  .docs-cta > p {
+    color: var(--text-muted);
+    font-size: 1rem;
+    line-height: 1.7;
+    max-width: 600px;
+    margin: 0 auto 2rem;
+  }
+
+  .docs-cta-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    justify-content: center;
+  }
+
+  .docs-cta-buttons .btn,
+  .docs-cta-buttons .btn:hover {
+    text-decoration: none;
+    border-bottom: none;
+  }
+
+  /* A line under the demo buttons, quieter than the paragraph above them. */
+  .content-body .docs-cta-note {
+    margin: 1.25rem auto 0;
+    font-size: 0.85rem;
+    color: var(--text-subtle);
+  }
+
+  /* === Feature cards grid === */
+  .features-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 1rem;
+    margin: 1.5rem 0 2.5rem;
+  }
+
+  .feature-card {
+    background: var(--surface);
+    border: 1px solid var(--border-muted);
+    border-radius: 10px;
+    padding: 1.25rem;
+    transition: border-color 0.2s, transform 0.2s;
+  }
+
+  .feature-card:hover {
+    border-color: var(--border);
+    transform: translateY(-2px);
+  }
+
+  .feature-card .fc-icon {
+    font-size: 1.5rem;
+    display: block;
+    margin-bottom: 0.5rem;
+  }
+
+  .feature-card h3 {
+    font-size: 0.95rem;
+    font-weight: 600;
+    margin: 0 0 0.4rem;
+    color: var(--text);
+    border: none !important;
+    padding: 0 !important;
+  }
+
+  .feature-card p {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin: 0;
+    line-height: 1.55;
+  }
+
+  /* === Callouts === */
+  .callout {
+    display: flex;
+    gap: 0.75rem;
+    align-items: flex-start;
+    padding: 1rem 1.1rem;
+    margin: 1.5rem 0;
+    border-radius: 10px;
+    border: 1px solid;
+    border-left-width: 4px;
+    line-height: 1.6;
+  }
+
+  .callout-icon {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    margin-top: 2px;
+  }
+
+  .callout-content { flex: 1; }
+  .callout-content strong { display: block; margin-bottom: 0.25rem; font-size: 0.85rem; }
+  .callout-content p { margin: 0; font-size: 0.875rem; color: var(--text-muted); }
+  .callout-content p + p { margin-top: 0.4rem; }
+  .callout-content code { font-size: 0.8rem; }
+
+  .callout-info {
+    background: var(--callout-info-wash);
+    border-color: var(--callout-info-edge);
+    color: var(--code-builtin);
+  }
+
+  .callout-warning {
+    background: var(--callout-warning-wash);
+    border-color: var(--callout-warning-edge);
+    color: var(--code-number);
+  }
+
+  .callout-success {
+    background: var(--callout-success-wash);
+    border-color: var(--callout-success-edge);
+    color: var(--code-string);
+  }
+
+  /* === Scroll wrapper for tables / pre on mobile === */
+  .scroll-wrapper {
+    overflow-x: auto;
+    margin: 1.25rem 0;
+    border-radius: 8px;
+  }
+
+  .scroll-wrapper table,
+  .scroll-wrapper pre {
+    margin: 0;
+  }
+
+  /* A table at width:100% inside the scroll wrapper never scrolls — it just
+     squeezes, and on a phone a four-column reference table squeezes down to
+     one word per line. Give it a floor and let the wrapper do its job. */
+  .scroll-wrapper table { min-width: 520px; }
+
+  /* === Product screenshots ===
+     A picture of the thing beats a paragraph about the thing, so the landing page
+     leads with one. Framed rather than bled to the edge, because a screenshot of a
+     dark UI on a dark page needs an edge to read as an object. */
+  .docs-shot {
+    display: block;
+    margin: 2rem 0;
+  }
+
+  /* No display here on purpose: the themed-image rules below own that, and at
+     (0,1,1) this selector would outrank their (0,1,0) hide and show both the
+     light and the dark screenshot at once. */
+  .docs-shot img {
+    width: 100%;
+    height: auto;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 18px 40px -24px rgba(0, 0, 0, 0.6);
+  }
+
+  .docs-shot img:not(.themed-img) { display: block; }
+
+  .docs-shot figcaption {
+    margin-top: 0.6rem;
+    font-size: 0.85rem;
+    color: var(--text-subtle);
+    text-align: center;
+  }
+
+  /* === Theme-dependent images ===
+     Diagrams and screenshots ship as one file per theme. Both variants are in
+     the markup (see _includes/themed-figure.html) and the choice is made here,
+     from [data-theme] — the same signal that themes the rest of the page.
+
+     It used to be made by <picture> from prefers-color-scheme, which reports the
+     operating system and therefore disagreed with the sidebar toggle. Script
+     cannot correct that: a matching <source> outranks the img's own src.
+
+     These two rules are the ONLY place display is set on a themed image. Any
+     other rule that sets it will outrank them on specificity and show both
+     variants stacked — which is exactly what happened when the sizing rule
+     below carried a display of its own. */
+  .themed-img { display: none; }
+
+  [data-theme="easywall-light"] .themed-img-light,
+  [data-theme="easywall-dark"]  .themed-img-dark { display: block; }
+
+  /* Diagrams: framed, because a line drawing needs an edge to sit on.
+
+     The frame belongs to the paragraph, not the image. That way its left edge
+     lines up with every heading and table on the page, while the drawing
+     inside stays centred — a 525px flow chart pinned to the left of a 1000px
+     column looks dropped rather than placed.
+
+     The image keeps its own dimensions rather than stretching to fill. Forcing
+     every diagram to the column scaled the widest one to 0.59 and its labels
+     to about 8px, and blew the narrow rule-order flow up nearly 2x. */
+  .content-body > p:has(> .themed-img) {
+    margin: 1.75rem 0;
+    padding: 1.25rem 1rem;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    text-align: center;
+  }
+
+  .content-body > .themed-img,
+  .content-body > p > .themed-img {
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    margin-inline: auto;
+  }
+
+  /* Screenshots inside a figure keep the figure's own frame instead. */
+  .docs-shot .themed-img {
+    margin: 0;
+    padding: 0;
+    background: none;
+  }
+
+  /* A caption directly under a diagram belongs to it, so it sits close and quiet. */
+  .content-body picture + p em:only-child {
+    display: block;
+    margin-top: -1.25rem;
+    font-size: 0.85rem;
+    font-style: normal;
+    color: var(--text-subtle);
+  }
+
+  /* The landing strip: three cards below the hero.
+   *
+   * Written as plain CSS rather than @apply because these three are the only
+   * classes docs/index.md brings of its own, and a rule Tailwind never sees in
+   * a template is a rule Tailwind cannot drop. */
+  .docs-landstrip {
+    margin-block: 4rem;
+  }
+
+  .docs-cardgrid {
+    display: grid;
+    gap: 1.5rem;
+    grid-template-columns: 1fr;
+  }
+
+  @media (min-width: 48rem) {
+    .docs-cardgrid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
+
+  .docs-card {
+    border: 1px solid var(--border);
+    border-radius: 0.5rem;
+    padding: 1.5rem;
+    background: var(--surface);
+  }
+
+  .docs-card > :first-child {
+    margin-top: 0;
+  }
+
+  .docs-card > :last-child {
+    margin-bottom: 0;
+  }
+
+}
+
+/* ── Pagefind's own markup, unlayered on purpose ────────────────────────────
+   These rules sit outside @layer components, and moving them back in silently
+   undoes all of them. Pagefind's stylesheet is fetched at runtime and is
+   unlayered, and an unlayered declaration beats every declaration in a named
+   cascade layer no matter how specific it is — an #id rule inside
+   @layer components lost to Pagefind's own class selectors, which is why the
+   first attempt rendered a yellow <mark> and a white input on a dark panel.
+   The custom-property block above keeps working from inside the layer because
+   an inherited value is not a competing declaration. */
+/* ── Pagefind's own markup ─────────────────────────────────────────────────
+   Overridden by class name, deliberately. The custom properties below cannot
+   reach height, scroll or the typography of an excerpt, and the reference
+   integration of this same engine — Astro Starlight — overrides the same
+   names for the same reason. What makes it safe here rather than merely
+   convenient: the composite action fails the build if any of these names
+   stops existing in the shipped stylesheet, so a rename surfaces as a red
+   pull request instead of an unstyled search nobody notices. */
+#docs-search-panel {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  --pagefind-ui-scale: 1;
+  --pagefind-ui-primary: var(--focus-ring);
+  --pagefind-ui-text: var(--text);
+  --pagefind-ui-background: var(--surface);
+  --pagefind-ui-border: var(--border);
+  --pagefind-ui-tag: var(--surface-2);
+  --pagefind-ui-border-width: 1px;
+  --pagefind-ui-border-radius: 6px;
+  --pagefind-ui-font: var(--font-sans);
+  /* Inherited, so one declaration reaches every excerpt: without it a long
+     unbroken token — an environment variable, a config key — is clipped
+     rather than broken, and the matched term itself can end up cut mid-word. */
+  overflow-wrap: anywhere;
+}
+
+#docs-search-panel .pagefind-ui,
+#docs-search-panel .pagefind-ui__form {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+}
+
+#docs-search-panel .pagefind-ui__form { position: relative; }
+
+/* padding-right is deliberately absent: PagefindUI writes it as an inline style,
+   measured from its own clear button, and an inline style outranks any rule we
+   could write. Setting it here produced a 49px gap against a 47px button that
+   the query then ran underneath. The left inset clears the magnifier that
+   .pagefind-ui__form:before paints at 20px — the icon is theirs and already
+   takes --pagefind-ui-text, so there is no reason to ship a second one. */
+#docs-search-panel .pagefind-ui__search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding-top: 15px;
+  padding-bottom: 15px;
+  padding-left: 48px;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  color: var(--text);
+  background: transparent;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+}
+
+#docs-search-panel .pagefind-ui__search-input::placeholder { color: var(--text-subtle); }
+#docs-search-panel .pagefind-ui__search-input:focus { outline: 0; }
+
+/* Reserved space above, so the query never runs underneath this button. It
+   used to sit on the last 44px of a 223px field: what you had typed was
+   unreadable, and the field scrolled to hide the rest. */
+/* Its width and its right offset stay Pagefind's — not set here at all — because
+   the inline padding-right above is measured at runtime from the button's own
+   rendered box: a narrower button here shrinks that reservation to match, a
+   wider one grows it. top, height, font-size, padding and colour are ours. At
+   Pagefind's own padding (0 15px 0 2px) the "Clear" text sat against the left
+   edge with a bare gap on the right, and at its own height (58px) the button
+   read as a panel stuck to the field rather than a control inside it. The
+   symmetric 3px/9px padding matches the docs-copy button (line 1684) so every
+   small control on the page shares one shape; height: 26px is that button's
+   own rendered height, and top: 19px centers it within the field's 64px. */
+#docs-search-panel .pagefind-ui__search-clear {
+  top: 19px;
+  height: 26px;
+  padding: 3px 9px;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-subtle);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+#docs-search-panel .pagefind-ui__search-clear:hover {
+  color: var(--text);
+  background: var(--surface-3);
+}
+
+#docs-search-panel .pagefind-ui__drawer {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+#docs-search-panel .pagefind-ui__message {
+  margin: 0;
+  padding: 11px 18px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+#docs-search-panel .pagefind-ui__results {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+#docs-search-panel .pagefind-ui__result {
+  padding: 14px 18px;
+  border-top: 1px solid var(--border-muted);
+}
+
+#docs-search-panel .pagefind-ui__result:first-child { border-top: 0; }
+
+/* The page is the label, the section inside it is the row — the same shape as
+   the reference tables these hits come from. */
+#docs-search-panel .pagefind-ui__result-inner > .pagefind-ui__result-title {
+  margin: 0;
+}
+
+#docs-search-panel .pagefind-ui__result-inner > .pagefind-ui__result-title .pagefind-ui__result-link {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 400;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+  text-decoration: none;
+}
+
+#docs-search-panel .pagefind-ui__result-nested {
+  margin-top: 9px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
+}
+
+#docs-search-panel .pagefind-ui__result-nested + .pagefind-ui__result-nested { margin-top: 12px; }
+
+#docs-search-panel .pagefind-ui__result-nested .pagefind-ui__result-title {
+  margin: 0;
+}
+
+/* Pagefind marks a sub-result with a "\2937 " pseudo-element positioned outside
+   the text. With the hairline rule doing that job it was one device too many,
+   and it landed on the wrong side of the border. */
+#docs-search-panel .pagefind-ui__result-nested .pagefind-ui__result-link:before {
+  content: none;
+}
+
+#docs-search-panel .pagefind-ui__result-nested .pagefind-ui__result-link {
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+  text-decoration: none;
+}
+
+#docs-search-panel .pagefind-ui__result-nested .pagefind-ui__result-link:hover {
+  color: var(--text);
+  text-decoration: underline;
+}
+
+#docs-search-panel .pagefind-ui__result-excerpt {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-muted);
+}
+
+#docs-search-panel a:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 3px;
+  border-radius: 4px;
+}
+
+/* A match is not a warning. Pagefind ships no rule for <mark>, so the browser
+   default applied: #ffff00 on black, the loudest thing on the page, and in a
+   firewall's interface yellow is what --state-warn means. The site already
+   answers "this text is picked out" with ::selection, and a match is the same
+   gesture, so it takes the same pair. */
+#docs-search-panel mark {
+  padding: 0 2px;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--select-fill);
+  border-radius: 4px;
+}
+
+/* The term marked on arrival, when a reader followed a result. Same pair as the
+   marks inside the search panel, because it is the same gesture — and the
+   highlight script's own stylesheet is switched off in the layout precisely so
+   this can use the theme's tokens instead of its one yellow rule. */
+article.content-body mark.pagefind-highlight {
+  padding: 0 2px;
+  font-weight: 500;
+  color: var(--text);
+  background: var(--select-fill);
+  border-radius: 4px;
+}
+
+/* The one state Pagefind cannot render itself: its own script failed to load. */
+.docs-search-failed {
+  padding: 18px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+
+/* ── Prose / Markdown rendering (outside @layer for higher specificity) ── */
+
+/* The mono display voice, on h1 alone. h2/h3/h4 stay in the sans face on
+   purpose: a long-form page set in mono headings throughout stops reading as
+   prose and starts reading as a table. */
+.content-body h1 {
+  font-family: var(--font-mono);
+  font-size: 2rem;
+  font-weight: 300;
+  letter-spacing: -0.01em;
+  margin: 0 0 1.5rem;
+  color: var(--text);
+  line-height: 1.2;
+}
+
+.content-body h2 {
+  font-size: 1.4rem;
+  font-weight: 600;
+  letter-spacing: -0.4px;
+  margin: 2.25rem 0 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border-muted);
+  color: var(--text);
+}
+
+.content-body h3 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 1.75rem 0 0.5rem;
+  color: var(--text);
+}
+
+.content-body h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin: 1.25rem 0 0.4rem;
+  color: var(--text);
+}
+
+.content-body p {
+  margin: 0 0 1rem;
+  color: var(--text);
+}
+
+/* No hue: the documentation has no firewall state for colour to mean, so the
+   underline carries the affordance and the weight carries the emphasis. This is
+   the one place in 2.16 a reader who never signs in sees the change.
+
+   Still excluding the button classes — a colour set here clobbers the button's
+   own text colour, which is set by the button rules below. */
+.content-body a:not(.btn):not(.docs-hero-brand):not(.feature-card) {
+  color: var(--link-ink);
+  font-weight: 500;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
+  transition: text-decoration-thickness 0.15s;
+}
+
+.content-body a:not(.btn):not(.docs-hero-brand):not(.feature-card):hover {
+  text-decoration-thickness: 2px;
+}
+
+.content-body strong {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Tailwind's preflight sets list-style:none on ul and ol. Nothing put it
+   back, so every bullet and every number in the documentation was missing —
+   including the numbered priority list in configuration.md, where the order
+   is the content. */
+.content-body ul,
+.content-body ol {
+  margin: 0 0 1rem;
+  padding-left: 1.5rem;
+}
+
+/* The longhand, not the shorthand: `list-style: disc outside` minifies to
+   `list-style: outside`, because disc is list-style-type's initial value. That
+   still works — the shorthand resets the omitted longhand — but it reads like
+   the marker was dropped, and it cannot be grepped for. */
+.content-body ul { list-style-type: disc; }
+.content-body ol { list-style-type: decimal; }
+.content-body ul ul { list-style-type: circle; }
+.content-body ol ol { list-style-type: lower-alpha; }
+
+.content-body li {
+  margin-bottom: 0.4rem;
+}
+
+.content-body li::marker {
+  color: var(--text-subtle);
+}
+
+.content-body li > p {
+  margin-bottom: 0.4rem;
+}
+
+.content-body hr {
+  border: none;
+  border-top: 1px solid var(--border-muted);
+  margin: 2rem 0;
+}
+
+/* Callouts. Previously the whole block was italic, which is fine for one
+   line and punishing on security.md, where three of these run to several
+   lines each — italic body text at that length is slower to read, and these
+   are the paragraphs a reader most needs to get right. The left edge and
+   the bold lead-in carry the emphasis instead. */
+.content-body blockquote {
+  margin: 1.15rem 0;
+  padding: 0.7rem 1.1rem;
+  border-left: 3px solid var(--select-edge);
+  background: var(--select-fill);
+  border-radius: 0 6px 6px 0;
+  color: var(--text);
+}
+
+.content-body blockquote > :last-child { margin-bottom: 0; }
+
+/* ── Disclosures in the body ──────────────────────────────────────────
+   The changelog is thirty of these. Only the sidebar's groups were styled, so
+   in the content body a <summary> arrived with the browser's default marker
+   and no hit area worth the name. */
+.content-body details {
+  margin: 0 0 0.55rem;
+  border: 1px solid var(--border-muted);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.content-body summary {
+  padding: 0.65rem 0.9rem;
+  font-size: 0.95rem;
+  color: var(--text);
+  cursor: pointer;
+  list-style: none;
+}
+
+.content-body summary::-webkit-details-marker { display: none; }
+
+/* The disclosure triangle, drawn rather than inherited, so it turns with the
+   state and matches the sidebar's. */
+.content-body summary::before {
+  content: "▸";
+  display: inline-block;
+  width: 1em;
+  color: var(--text-subtle);
+  transition: transform 120ms ease;
+}
+
+.content-body details[open] > summary::before { transform: rotate(90deg); }
+.content-body summary:hover { background: var(--surface-2); }
+.content-body details[open] > summary { border-bottom: 1px solid var(--border-muted); }
+.content-body details > :not(summary) { padding: 0 0.9rem; }
+.content-body details > :not(summary):first-of-type { padding-top: 0.8rem; }
+.content-body details > :last-child { padding-bottom: 0.8rem; }
+
+/* A <ul>/<ol> is a direct child too, so the rule above set its padding-left to
+   0.9rem — overriding the browser's own list indent, which is the room a
+   marker needs to sit to the left of the text. With list-style-position:
+   outside (kept deliberately, see .content-body ul above), the disc or number
+   then painted into that 0.9rem and landed on the panel's own border. This
+   adds the panel's inset back to the 1.5rem already proven elsewhere to be
+   enough room for this site's markers (.content-body ul, ol above), so the
+   marker clears the border instead of sitting on it. A list nested inside a
+   list item is not a direct child of <details> and is untouched — it already
+   gets that same 1.5rem from the rule above, relative to its own <li>. */
+.content-body details > ul,
+.content-body details > ol {
+  padding-left: calc(0.9rem + 1.5rem);
+}
+
+/* ── Inline code ───────────────────────────────────────────────────────
+   Deliberately not a colour of its own: it never was, and after 2.16 there is
+   no accent left to reach for. On a page like configuration.md — where nearly
+   every table cell holds a key or a value — colouring the code made the whole
+   page read as links. The tinted chip carries the distinction, and a link is
+   now told apart by its underline rather than by a hue. */
+.content-body code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 1px 6px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  /* break-word and not anywhere: a word breaks only when it cannot fit on a
+     line by itself. proxy_set_header is 16 characters and never breaks; a
+     56-character Go test name renders 462px at this size and cannot. The
+     carried entry measured that as a 92px overflow at a 390px viewport, on
+     the page that then carried the identifier; the identifier has since moved
+     to the generated changelog page, which is why the rule is written against
+     inline <code> generally rather than against a page. The entry rejected
+     overflow-wrap on the grounds that it would break every long identifier at
+     an arbitrary point — which is anywhere's behaviour and break-all's, not
+     this one's. */
+  overflow-wrap: break-word;
+}
+
+/* ── Code blocks ───────────────────────────────────────────────────────
+   kramdown + rouge nest three elements per block:
+
+     div.highlighter-rouge > div.highlight > pre.highlight > code
+
+   The frame belongs to exactly one of them. It used to sit on both
+   div.highlight and pre.highlight, which drew a box inside a box — two
+   frames, offset by the pre's own margin. It went unnoticed because the
+   edge was --border-muted, which is ~1.05:1 against the fill in both
+   themes, so each frame was individually almost invisible.
+
+   Fenced blocks with no language get no rouge wrapper at all and arrive as
+   a bare <pre>, so that case is claimed here too. */
+.content-body div.highlighter-rouge,
+.content-body pre:not(.highlight) {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  margin: 1.15rem 0;
+}
+
+/* Everything inside the frame is bare — no second background, no second
+   edge, no margin that would push the content off the frame's centre. */
+.content-body div.highlighter-rouge div.highlight,
+.content-body div.highlighter-rouge pre.highlight {
+  background: none;
+  border: 0;
+  border-radius: 0;
+  margin: 0;
+}
+
+.content-body pre {
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  line-height: 1.6;
+  padding: 0.95rem 1.15rem;
+  overflow-x: auto;
+  color: var(--text);
+  /* Long lines — CSP headers, JSON audit records — scroll rather than wrap,
+     so the scrollbar has to be visible enough to announce that. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.content-body pre::-webkit-scrollbar { height: 9px; }
+.content-body pre::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: 999px;
+}
+.content-body pre::-webkit-scrollbar-track { background: transparent; }
+
+/* The chip styling above must not follow <code> into a <pre>. This reset
+   used to lose to a [data-theme="easywall-light"] .content-body code rule
+   that set the identical background at higher specificity; since <code> is
+   an inline box, the chip fill painted per line box and left ragged grey
+   rectangles behind parts of every light-mode code block. That rule is
+   gone — do not reintroduce a theme-scoped override of a plain property. */
+.content-body pre code {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0;
+  font-size: inherit;
+  /* A code block scrolls; it does not wrap. A broken command line is a command
+     somebody pastes wrong. */
+  overflow-wrap: normal;
+}
+
+/* Rouge syntax highlighting — minimal token theme */
+.highlight .c, .highlight .c1, .highlight .cm { color: var(--text-subtle); font-style: italic; }
+.highlight .k, .highlight .kd, .highlight .kn, .highlight .kp, .highlight .kr,
+.highlight .kc { color: var(--code-keyword); font-weight: 500; }
+.highlight .s, .highlight .s1, .highlight .s2, .highlight .sb,
+.highlight .se, .highlight .si, .highlight .sh { color: var(--code-string); }
+.highlight .n, .highlight .nx, .highlight .nv { color: var(--text); }
+.highlight .nf, .highlight .nc { color: var(--code-keyword); }
+.highlight .nb, .highlight .bp, .highlight .no { color: var(--code-builtin); }
+.highlight .o, .highlight .ow, .highlight .p { color: var(--text-muted); }
+.highlight .mi, .highlight .mf, .highlight .il { color: var(--code-number); }
+.highlight .err { color: var(--code-error); }
+
+/* The name on the left of a configuration line: a TOML or YAML key (.nl, 64
+   occurrences), an nginx directive or YAML tag (.nt, 75), an attribute (.na).
+   All three were unstyled, so in the configuration reference a key rendered in
+   body-text colour beside a coloured value — the page disagreeing with its own
+   subject. One role, one token, and the same token a function name already
+   uses, because "the thing being named" is what they have in common. */
+.highlight .nl, .highlight .nt, .highlight .na { color: var(--code-keyword); }
+
+/* ── Copy buttons ─────────────────────────────────────────────────────
+   Positioned against .highlighter-rouge, which is the element carrying the
+   frame. Against the <pre> the button would scroll out of the block with a
+   long command. */
+.content-body div.highlighter-rouge { position: relative; }
+
+.content-body .docs-copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 3px 9px;
+  font-family: var(--font-sans);
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-subtle);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease;
+}
+
+/* Focus has to reveal it, or it is a tab stop that cannot be seen — worse than
+   no tab stop at all. */
+.content-body div.highlighter-rouge:hover .docs-copy,
+.content-body .docs-copy:focus-visible { opacity: 1; }
+
+.content-body .docs-copy:hover { color: var(--text); background: var(--surface-3); }
+.content-body .docs-copy[data-copied] { color: var(--text); }
+
+/* The <pre> scrolls horizontally but .highlighter-rouge, which the button is
+   anchored to, does not — so at scroll position 0 a long first line runs
+   directly under the button with no transition, an abrupt collision rather
+   than a fade. padding-right on the <pre> cannot fix this: with horizontal
+   scrolling that padding lands at the end of the scrollable content, not at
+   the visible right edge, so the first line would still run under the button
+   at scroll position 0. A gradient in the block's own background colour, on
+   together with the button, fades the text out before it gets there instead. */
+.content-body div.highlighter-rouge::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 72px;
+  height: 2.6rem;
+  background: linear-gradient(to left, var(--surface-2), transparent);
+  opacity: 0;
+  transition: opacity 120ms ease;
+  pointer-events: none;
+}
+
+.content-body div.highlighter-rouge:hover::before,
+.content-body div.highlighter-rouge:focus-within::before { opacity: 1; }
+
+/* A touch screen never hovers, so on one the button — and its fade — are
+   simply there. */
+@media (hover: none) {
+  .content-body .docs-copy { opacity: 1; }
+  .content-body div.highlighter-rouge::before { opacity: 1; }
+}
+
+
+/* Tables */
+.content-body table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  margin: 1rem 0;
+}
+
+.content-body th,
+.content-body td {
+  padding: 0.55rem 0.85rem;
+  text-align: left;
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.content-body th {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  background: var(--surface);
+}
+
+.content-body tbody tr:hover {
+  background: var(--surface-2);
+}
+
+/* ── Responsive ────────────────────────────────────────────────────── */
+@media (max-width: 900px) {
+  .topbar { display: flex; }
+
+  .sidebar {
+    transform: translateX(-100%);
+    transition: transform 0.25s ease;
+  }
+
+  /* Pre-existing: the backdrop's z-index (150, above) outranked the sidebar's
+     own (100), so an open drawer could only be closed, never touched — no nav
+     link, no search field, nothing in it received a tap. Found while
+     verifying search on a phone; raising the open sidebar above the backdrop
+     it is supposed to sit in front of is the fix, not anything about search. */
+  .sidebar.open { transform: translateX(0); z-index: 160; }
+
+  .content {
+    margin-left: 0;
+    padding-top: 4.5rem;
+  }
+}
+
+@media (min-width: 901px) {
+  .sidebar-toggle, .sidebar-backdrop { display: none !important; }
+}
+
+/* ── On-page contents ─────────────────────────────────────────────────────
+   Lives in the right gutter, which the boxed measure was otherwise leaving
+   empty. It earns its place on the long reference pages — configuration.md
+   runs to about 5,600px — and is simply absent everywhere it would not.
+
+   Switched on only when there is room for a third column without taking any
+   from the reading measure: 260 sidebar + 880 measure + 232 contents + gaps. */
+@media (min-width: 1440px) {
+  :root { --toc-w: 232px; --toc-gap: clamp(1.5rem, 2.5vw, 3rem); }
+
+  .docs-toc {
+    position: fixed;
+    top: 3rem;
+    right: var(--content-pad);
+    width: var(--toc-w);
+    max-height: calc(100vh - 6rem);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-left: 1rem;
+    border-left: 1px solid var(--border);
+    font-size: 0.82rem;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+}
+
+/* Below that width the markup stays in the DOM but shows nothing: the script
+   has already built it, and a media query is cheaper than tearing it down. */
+@media (max-width: 1439px) {
+  .docs-toc { display: none; }
+}
+
+.docs-toc-title {
+  margin: 0 0 0.6rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+  color: var(--text-subtle);
+}
+
+.docs-toc-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.docs-toc-item { margin: 0; }
+.docs-toc-item.is-h3 { padding-left: 0.85rem; }
+
+.docs-toc-item a {
+  display: block;
+  padding: 0.28rem 0;
+  color: var(--text-muted);
+  text-decoration: none;
+  line-height: 1.45;
+  border-bottom: none;
+}
+
+.docs-toc-item a:hover { color: var(--text); }
+
+/* The current section. Colour alone would not survive a reader who cannot
+   distinguish it, so the weight changes too. */
+.docs-toc-item a[aria-current] {
+  color: var(--text);
+  font-weight: 500;
+}
+
+/* The changelog's own version list: default.html's on-page contents correctly
+   drops every heading inside a <details>, and all thirty version headings are
+   inside one — so this page gets its own jump list, inline rather than in the
+   sidebar column. Same muted-link vocabulary as .docs-toc-item, wrapped as a
+   row instead of stacked as a list. */
+.changelog-versions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 0.9rem;
+  margin: 0 0 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.82rem;
+}
+
+.changelog-versions a {
+  color: var(--text-muted);
+  text-decoration: none;
+  border-bottom: none;
+}
+
+.changelog-versions a:hover { color: var(--text); }
+
+/* Anchors land under the fixed mobile topbar without this. `details` is here
+   for the changelog's per-version sections, which carry an id but no heading. */
+.content-body :is(h2, h3, details)[id] { scroll-margin-top: 5rem; }
+
+/* A diagram scrolls rather than shrinks on a narrow screen. Fitting the widest
+   flow chart into a phone meant scaling it to about a fifth, which left its
+   labels at three pixels — present, and useless. Same bargain the tables and
+   code blocks already make there.
+
+   Both declarations hang off :has() on purpose: without it the image would
+   keep max-width:100% and merely be small, instead of overflowing the page. */
+@media (max-width: 1199px) {
+  .content-body > p:has(> .themed-img) {
+    overflow-x: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  .content-body > p:has(> .themed-img) > .themed-img {
+    width: auto;
+    max-width: none;
+  }
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────
+   The landing page's calls to action use these classes. They previously came
+   from the daisyUI plugin; when that was removed with the application's
+   dependency on it, the buttons lost every style. Defined here from the same
+   tokens the application uses. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 40px;
+  padding: 0 18px;
+  border: 1px solid var(--control-edge);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  font-weight: 550;
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.btn:hover {
+  background: var(--surface-2);
+  /* --surface-3 is byte-identical to --border in both themes, so this hover
+     never changed the outline at all. */
+  border-color: var(--text-subtle);
+  text-decoration: none;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+  border-color: var(--focus-ring);
+}
+
+.btn svg { width: 17px; height: 17px; flex-shrink: 0; }
+
+.btn-primary,
+.btn-primary:hover {
+  background: var(--select-edge);
+  border-color: transparent;
+  color: var(--bg);
+}
+
+/* Was filter: brightness(1.08). On an ink fill that is #f1f3f6 in dark and
+   #0f1116 in light, brightening changes nothing a reader can see in either
+   theme — the light one is already near black and the dark one near white.
+   A step to the muted ink is a change in both. */
+.btn-primary:hover { background: var(--text-muted); }
+
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+}
+
+.btn-ghost:hover {
+  background: var(--surface-2);
+  border-color: transparent;
+  color: var(--text);
+}
+
+.btn-soft { background: var(--surface-2); }
+.btn-soft:hover { background: var(--surface-3); }
+
+.btn-lg { height: 46px; padding: 0 22px; font-size: 16px; }
+
+/* ── Landing-page call to action: prose overrides ──────────────────────────
+   These belong with the rest of the .docs-cta rules, and cannot live there.
+   Those sit in @layer components; the generic `.content-body h2` and
+   `.content-body p` rules are unlayered, and an unlayered rule beats a layered
+   one whatever the specificity. Raising the selector inside the layer does
+   nothing — the only fix is to leave the layer.
+
+   What it cost while they were losing: the heading kept the horizontal rule
+   that separates chapters, drawn inside a card where there is nothing to
+   separate; and the paragraph lost the `auto` side margins that centre its
+   600px measure, so the copy sat 104px to the left of the heading and the
+   buttons. Three elements, two centre lines. */
+.content-body .docs-cta > h2 {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.content-body .docs-cta > p {
+  margin-inline: auto;
+}
+
+.content-body .docs-cta-note {
+  margin: 1.25rem auto 0;
+}

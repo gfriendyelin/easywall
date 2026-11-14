@@ -1,0 +1,208 @@
+# easywall web configuration
+# See documentation at https://easywall-project.org/configuration
+
+bind_addr   = "0.0.0.0:12227"
+socket_path = "/run/easywall/core.sock"
+ssl_dir     = "/etc/easywall/ssl"
+data_dir    = "/var/lib/easywall"
+language    = "en"
+
+# ─── Demo mode ──────────────────────────────────────────────────────────────
+# Set to true to run easywall-web against an in-memory mock instead of the
+# Unix socket. No easywall-core daemon required, no root, no nftables. State
+# resets on process restart. Used for the public demo deployment.
+# See https://easywall-project.org/installation/demo/ for details.
+demo_mode = false
+
+# ─── Behind a reverse proxy ─────────────────────────────────────────────────
+# The addresses and networks whose X-Forwarded-For header may be believed.
+# Empty — the default — means no header's value is ever read and the TCP peer
+# is authoritative, which is how easywall behaved before 2.13.
+#
+# List the proxies themselves, never a network they merely sit in. Being on
+# this list is total trust: anything that can reach this port from a listed
+# address chooses the address easywall records in the audit log, gives the
+# lockout verdict for, and counts login attempts against.
+#
+#   trusted_proxies = ["127.0.0.1", "10.1.0.5"]
+#
+# EASYWALL_WEB_TRUSTED_PROXIES sets the same list, comma-separated.
+trusted_proxies = []
+
+# ─── Who may read /healthz ──────────────────────────────────────────────────
+# /healthz is the one page here that answers without a session, because the
+# orchestrator asking whether this process is alive does not hold one. It
+# returns the firewall's state as JSON — ok, degraded or fail — and nothing
+# about your rules or your host: no rule detail, no counters, no kernel release.
+#
+# It exists because a container once stayed "Up" for hours with a live core and
+# a dead web process: the health check only looked at the core's socket, and a
+# check on the core cannot see this half.
+#
+# Loopback only by default, which is where the container's own check and a local
+# monitoring probe both come from. Widen it to reach the endpoint from your
+# monitoring host:
+#
+#   health_allow = ["127.0.0.1/8", "::1/128", "10.20.0.0/24"]
+#
+# The list is matched against the TCP peer and never against X-Forwarded-For,
+# so a proxy in front of easywall cannot pass a monitoring host through it —
+# list the proxy. An empty list turns the endpoint off entirely; leaving the key
+# out means the default above.
+# A link-local entry (fe80::/64) matches on every interface: an entry names
+# no interface, so it admits a neighbour on any link the endpoint listens on.
+#
+# EASYWALL_WEB_HEALTH_ALLOW sets the same list, comma-separated.
+#
+# The container's HEALTHCHECK is `easywall-web -healthcheck`: it asks /healthz
+# at bind_addr, from that address, and the endpoint always admits a peer that
+# is its own local address — so moving bind_addr needs no change here. That
+# rule is not scoped to loopback: ANY process on this host that connects to
+# the bound address is admitted this way, including a same-host reverse proxy
+# relaying someone else's traffic. Only an empty list switches it off.
+health_allow = ["127.0.0.1/8", "::1/128"]
+
+# ─── Update check ───────────────────────────────────────────────────────────
+# The dashboard asks github.com once a day whether a newer release exists. It
+# never delays a page: the answer comes from a cache on disk. Set to false to
+# remove it entirely. This is one of the six requests easywall can make; the
+# others are the installation count below, a notification, the feeds switched on
+# under Blocklist, the country lookup below, and fetching a certificate when ACME
+# is switched on. This one and the country lookup are on by default; the other
+# four are off unless asked for. configuration.md lists all six.
+update_check = true
+
+# ─── Country lookup ─────────────────────────────────────────────────────────
+# Blocked traffic names the country each refused source address is registered
+# to — registered, not located: VPNs, clouds and Tor exits do not follow it.
+# On, easywall-web downloads ipverse's country list once a day (CC0, about
+# 1.7 MB) from github.com, which hands it out from
+# release-assets.githubusercontent.com, and keeps it in
+# <data_dir>/web/countries.tar.gz. Off (false), nothing is downloaded and the
+# page has no country column.
+#
+# EASYWALL_WEB_COUNTRY_LOOKUP sets the same switch.
+country_lookup = true
+
+# ─── Counting installations ─────────────────────────────────────────────────
+# Off unless switched on, and asked for during the first-run wizard rather than
+# assumed — and, while it is off, once more on the dashboard after each minor or
+# major update (not when EASYWALL_WEB_TELEMETRY is set). Once a day:
+#
+#   GET https://telemetry.wdkro.de/v1/count?id=<32 hex>&v=<version>
+#
+# A random identifier generated on this machine and the version — enough to tell
+# whether a critical fix reached everyone, not enough to describe anyone. Your
+# address is not recorded at the other end. The identifier lives in
+# <data_dir>/web/telemetry.json and may be deleted. Also switchable under System.
+#
+# Left out of this file on purpose: absent means nobody has answered yet, which
+# is a different state from "no" and the one the first-run wizard asks about. An
+# answer written here — by the wizard, by the System page, or by hand — is a
+# stored value and beats EASYWALL_WEB_TELEMETRY.
+#
+# telemetry = false
+
+# ─── Secret ─────────────────────────────────────────────────────────────────
+# Signs the session cookie, so anyone who knows it can forge one. Left as the
+# placeholder below, easywall generates a key on first start and writes it here
+# — the placeholder is published in this repository, and a firewall interface
+# signing cookies with a published key can be signed into by anyone.
+# To choose your own: openssl rand -hex 32
+# Signs the session cookie. There is no csrf_key: CSRF protection is Go 1.25's
+# net/http.CrossOriginProtection, which checks Origin and Sec-Fetch-Site rather
+# than issuing tokens, so it needs no secret of its own.
+session_key = "CHANGE_ME_32_BYTES_HEX_ENCODED_SESSION_SECRET_HERE_XXXXXXXX"
+
+# ─── Credentials — set via first-run wizard or fill in manually ─────────────
+username = ""
+password = ""  # argon2id hash, set by the first-run wizard
+
+# ─── Second factor ──────────────────────────────────────────────────────────
+# Written by the interface under Password → Second factor. Leaving both empty
+# does not get you an interface without one: since 2.18 a second factor is a
+# precondition for using easywall, so signing in with nothing enrolled lands on
+# Password → Second factor and goes nowhere else until one is.
+#
+# totp_secret is the base32 shared secret your authenticator app holds.
+# recovery_codes holds the argon2id hashes of the eight one-time codes — never
+# the codes themselves, which are shown once and cannot be read back.
+#
+# Locked out with the phone gone and the codes gone? Three things to clear, not
+# two, and no longer all of them in this file: empty both lines below, delete
+# passkeys.json in web/ inside data_dir (set at the top of this file —
+# /var/lib/easywall/web by default), then restart easywall-web. The password
+# alone signs you in again —
+# onto Password → Second factor, where you enrol a new one before the rest of
+# the interface opens. That is the way back in, not a way to stay without one.
+# A passkey left behind is a second factor of its own: it still sends you to
+# /login/verify, where the browser may refuse to offer it at all.
+totp_secret    = ""
+recovery_codes = []
+
+# ─── Notifications ──────────────────────────────────────────────────────────
+# A webhook or an ntfy push when something happens to the firewall. Off unless
+# you switch it on, and configurable under Notifications in the interface.
+#
+#   notify_kind = "ntfy"      # "webhook" | "ntfy" | "" (off)
+#   notify_url  = "https://ntfy.sh/your-private-topic"
+#
+# This and an own feed are the two requests whose destination easywall does not
+# name at all. The update check and the installation count are fixed, and the
+# certificate authority is a default you can replace; this one is yours.
+#
+# The URL is a credential — an ntfy topic is readable by anyone who knows it —
+# which is why it lives in this file at 0600 beside session_key and totp_secret.
+#
+# Redirects are refused: a destination that follows one can be pointed at a
+# third party by whoever controls its DNS.
+notify_kind = ""
+notify_url  = ""
+
+# What is worth telling you about. All off by default.
+notify_on_rolled_back   = false   # an apply was not confirmed and undid itself
+notify_on_accepted      = false   # an apply was confirmed
+notify_on_panic         = false   # panic mode engaged or ended
+notify_on_failed_logins = false   # repeated failures from one address
+
+[tls]
+# Leave empty to use an auto-generated self-signed certificate in ssl_dir.
+# For Let's Encrypt or custom certs, set paths here:
+cert = ""
+key = ""
+
+# The name this installation is reached by, e.g. "firewall.example.org".
+#
+# Two things use it and it is one setting on purpose:
+#   - ACME below issues a certificate for it
+#   - passkeys use it as the WebAuthn Relying Party ID
+#
+# Leave it empty if you reach easywall at an address like
+# https://192.168.1.10:12227. Both features are then unavailable, and the
+# interface says so rather than failing at the moment you try.
+hostname = ""
+
+# Fetch and renew a certificate automatically (Let's Encrypt by default).
+#
+# Three things have to be true, and easywall does none of them for you:
+#   1. hostname above resolves to this host from the public internet
+#   2. this host answers on port 80 — the service unit needs
+#      AmbientCapabilities=CAP_NET_BIND_SERVICE, which the package sets
+#   3. port 80 is open in your own easywall rules. easywall will not open a
+#      port by itself; the System page tells you whether it is open.
+acme = false
+
+# Optional. The certificate authority sends expiry warnings here.
+acme_email = ""
+
+# Required when acme = true. Issuing a certificate means agreeing to the
+# certificate authority's subscriber agreement:
+#   https://letsencrypt.org/repository/
+# easywall does not agree to it for you.
+acme_agree_tos = false
+
+# Directory URL override. Empty is Let's Encrypt production. Point this at
+#   https://acme-staging-v02.api.letsencrypt.org/directory
+# while you are getting the DNS and the port right — production has a rate
+# limit that exists for exactly that mistake.
+acme_directory = ""

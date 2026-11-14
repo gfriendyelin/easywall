@@ -1,0 +1,1158 @@
+package web
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/netip"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+// demoShapes are the kinds of refusal a small internet-facing host actually
+// sees, on documentation addresses only (RFC 5737, RFC 3849). Every source
+// address avoids the demo's seeded blocklist and allowlist, so a visitor
+// adding a source to one of those lists always sees a tangible change. Every
+// IPv4 documentation range falls into shared.BogonRanges and the demo runs
+// with Bogons: true, so on a real kernel these rows would be bogon drops; the
+// demo does not model that, because there is no other address space it may use.
+var demoShapes = []shared.PacketLogEntry{
+	{Rule: "ssh", Proto: "tcp", DstPort: 22, TCPFlags: "SYN", CtState: "new", Src: netip.MustParseAddr("192.0.2.23")},
+	{Rule: "portscan", Proto: "tcp", DstPort: 3389, TCPFlags: "FIN,PSH,URG", Src: netip.MustParseAddr("192.0.2.77")},
+	{Rule: "drop", Proto: "tcp", DstPort: 8080, TCPFlags: "SYN", CtState: "new", Src: netip.MustParseAddr("192.0.2.140")},
+	{Rule: "drop", Proto: "udp", DstPort: 161, CtState: "new", Src: netip.MustParseAddr("192.0.2.5")},
+	{Rule: "blocklist", Proto: "tcp", DstPort: 443, TCPFlags: "SYN", CtState: "new", Src: netip.MustParseAddr("192.0.2.42")},
+	{Rule: "icmp_flood", Proto: "icmp", ICMP: &shared.PacketICMP{Type: 8}, CtState: "new", Src: netip.MustParseAddr("192.0.2.99")},
+	{Rule: "invalid", Proto: "tcp", DstPort: 443, TCPFlags: "ACK", Src: netip.MustParseAddr("192.0.2.200")},
+	{Rule: "drop", Proto: "tcp", DstPort: 23, TCPFlags: "SYN", CtState: "new", Family: 6, Src: netip.MustParseAddr("2001:db8:5::17")},
+	// Two default drops whose reason is not "the port is closed": an IPv4 ping,
+	// which the demo's Answer pings — off — refuses, and the seeded 8443 rule,
+	// which is open only for 203.0.113.0/24.
+	{Rule: "drop", Proto: "icmp", ICMP: &shared.PacketICMP{Type: 8}, CtState: "new", Src: netip.MustParseAddr("192.0.2.61")},
+	{Rule: "drop", Proto: "tcp", DstPort: 8443, TCPFlags: "SYN", CtState: "new", Src: netip.MustParseAddr("192.0.2.88")},
+	// A feed's refusal (2.23): blocklist.de is switched on in the seeded
+	// rules, so its chip names it and leads to its row on /blocklist.
+	{Rule: "feed", Feed: "blocklist-de", Proto: "tcp", DstPort: 25, TCPFlags: "SYN", CtState: "new", Src: netip.MustParseAddr("192.0.2.180")},
+	// A country's refusal (2.26): Antarctica is switched on in the seeded
+	// rules, so its chip reads "Country: Antarctica" and leads to its row.
+	{Rule: "feed", Feed: "country-aq", Proto: "tcp", DstPort: 443, TCPFlags: "SYN", CtState: "new", Src: netip.MustParseAddr("192.0.2.190")},
+}
+
+// demoCountries is the demo's country table (2.27): the demo fetches nothing,
+// and its sources are documentation addresses, which belong to no country.
+// So it names three that single out no country of people — Antarctica and two
+// of the least populated places ipverse lists — and leaves the rest unnamed,
+// so the dash shows too. 192.0.2.190 is the packet Antarctica's feed refused,
+// and it reads AQ; Antarctica is switched on, so its rows offer no Block.
+var demoCountries = []struct{ prefix, cc string }{
+	{"192.0.2.0/26", "tk"},   // .5 .23 .42 .61 — Tokelau
+	{"192.0.2.64/26", "nf"},  // .77 .88 .99 — Norfolk Island
+	{"192.0.2.184/29", "aq"}, // .190 — Antarctica
+	{"2001:db8:5::/48", "aq"},
+}
+
+func demoCountryTable() *countryTable {
+	var v4, v6 []countryPrefix
+	for _, d := range demoCountries {
+		p := netip.MustParsePrefix(d.prefix)
+		r := newCountryPrefix(p, uint8(slices.Index(shared.CountryCodes, d.cc))) // #nosec G115 -- TestCountryCodesFitAByte
+		if p.Addr().Is4() {
+			v4 = append(v4, r)
+		} else {
+			v6 = append(v6, r)
+		}
+	}
+	return &countryTable{v4: buildCountryRanges(v4), v6: buildCountryRanges(v6), countries: 3}
+}
+
+// newDemoCountryLookup is the demo's lookup: its table, loaded, and no client
+// — the demo makes no outbound request, and builds no runner to call refresh.
+func newDemoCountryLookup(store *feedStore) *countryLookup {
+	l := &countryLookup{store: store, now: time.Now}
+	l.table.Store(demoCountryTable())
+	return l
+}
+
+// demoEvery is how often the demo "refuses" something new — enough for the
+// live tail to visibly move while someone looks at it.
+const demoEvery = 7 * time.Second
+
+// demoPacketLog is the demo's stream: a backlog of forty entries before start,
+// then one every demoEvery, newest first — a sliding window of the most
+// recent five hundred, not a stream that stops growing once `now` is far
+// enough past `start`. Derived from the clock rather than stored, so it needs
+// no goroutine and resets with the process like the rest of the demo, and it
+// keeps moving on an instance left running for days, not only its first hour.
+func demoPacketLog(start, now time.Time) []shared.PacketLogEntry {
+	const backlog, most = 40, 500
+	newest := backlog + int(now.Sub(start)/demoEvery)
+	oldest := max(0, newest-most)
+	out := make([]shared.PacketLogEntry, 0, newest-oldest)
+	for i := newest - 1; i >= oldest; i-- {
+		e := demoShapes[i%len(demoShapes)]
+		e.Seq = uint64(i + 1) // #nosec G115 -- i is non-negative (oldest is clamped to 0)
+		e.Time = start.Add(time.Duration(i-backlog) * demoEvery).UTC()
+		e.Hook, e.InDev, e.TTL = "input", "eth0", uint8(40+i%24) // #nosec G115 -- 40..63
+		if e.Family == 0 {
+			e.Family = 4
+		}
+		if e.Family == 6 {
+			e.Dst = netip.MustParseAddr("2001:db8::1")
+		} else {
+			e.Dst = netip.MustParseAddr("203.0.113.10")
+		}
+		if e.DstPort != 0 {
+			e.SrcPort = uint16(32768 + i%28000) // #nosec G115 -- bounded
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// demoState is an in-memory mock of easywall-core that powers the public
+// demo deployment. All commands sent through CoreClient.Send are dispatched
+// here when the client was constructed via NewDemoClient — no nftables, no
+// root, no Unix socket. State resets to seed values whenever the process
+// restarts (systemd-friendly for periodic reset on a public host).
+type demoState struct {
+	mu sync.Mutex
+
+	rules    shared.RulesState
+	options  shared.FirewallOptions
+	settings shared.NetworkSettings
+	system   shared.SystemSettings
+
+	// appliedConfig is what the demo's kernel would be holding: the options and
+	// settings as they were at the last apply. Seeded one switch away from
+	// d.options so the apply screen has a configuration drift to show — see
+	// seed().
+	appliedConfig shared.AppliedConfig
+
+	auditLog []shared.AuditLogEntry
+
+	// usage is what the Last used column reads, seeded so the public demo shows
+	// this release's headline feature without a visitor having to do anything.
+	// Nothing advances it — there is no kernel here — so the dates are fixed
+	// relative to process start, which is also when the demo resets.
+	usage shared.UsageResult
+
+	// feeds are the copies the demo's core would hold, by feed id. Seeded for
+	// the two the catalogue says to start with, and never refreshed: demo mode
+	// constructs no fetcher (spec §3), so UPDATE_FEED is refused here.
+	feeds map[string]shared.FeedStatus
+
+	acceptance shared.AcceptanceStatus
+	lastApply  string // RFC3339, empty when never applied
+
+	// acceptanceReason is why the last window ended — "timeout" or "cancelled
+	// by operator" — mirroring core.Acceptance.reason. Without it the demo
+	// answered acceptance_reason as empty always, which is the same false
+	// green docs-tech/protocol.md's "Adding a command" step 3 warns about: a
+	// demo client that answers without acting on the field the real core now
+	// fills in.
+	acceptanceReason string
+
+	// Pending acceptance timer; if it fires before CmdAccept arrives,
+	// state rolls back to .Backup and acceptance becomes "rolled_back".
+	acceptanceTimer *time.Timer
+
+	// acceptanceDeadline is when acceptanceTimer fires. time.Timer does not
+	// expose that, and the demo has to answer FirewallStatus.AcceptanceRemaining
+	// the way the core does — the public deployment is where most people ever
+	// see the window run.
+	acceptanceDeadline time.Time
+
+	// User identity recorded in audit log entries — overridable but
+	// "demo" by default since we don't have a real session here.
+	actor string
+
+	// panicMode mirrors shared.FirewallStatus.Panic. The demo has no kernel and
+	// no marker file, so this bool is the whole of panic mode here: CmdPanic
+	// sets it, CmdResume clears it, and statusLocked reports it the way the
+	// real core reports whatever EngagePanic/ClearPanic left on disk. Named
+	// panicMode rather than panic so nothing here reads like a call to the
+	// builtin.
+	panicMode bool
+
+	// packetStart is when the demo was created, used to generate a stream of
+	// refused packets in demoPacketLog.
+	packetStart time.Time
+}
+
+// newDemoState constructs the demo state machine and seeds it with a
+// realistic example rule set so the UI looks alive on first visit.
+func newDemoState() *demoState {
+	d := &demoState{
+		actor:       "demo",
+		acceptance:  shared.AcceptanceIdle,
+		packetStart: time.Now(),
+	}
+	d.seed()
+	return d
+}
+
+func (d *demoState) seed() {
+	// Seed every list with the kind of entries an experienced operator
+	// would actually have on a small-to-mid-sized internet-facing host.
+	// All IPs/CIDRs use RFC 5737 / RFC 3849 documentation prefixes so
+	// nothing here points at a real network.
+	example := shared.Rules{
+		TCP: []shared.PortRule{
+			{Port: "22", Description: "SSH (admin)", SSH: true},
+			{Port: "80", Description: "HTTP — redirect to HTTPS"},
+			{Port: "443", Description: "HTTPS — main web"},
+			// Source-restricted, no catalogue entry — the plain form of the field.
+			{Port: "8443", Description: "HTTPS — staging / backend", Sources: []string{"203.0.113.0/24"}},
+			{Port: "25", Description: "SMTP — incoming mail"},
+			{Port: "587", Description: "SMTP submission (STARTTLS)"},
+			{Port: "993", Description: "IMAPS"},
+			// Catalogue-derived: what "Add from catalogue" writes for PostgreSQL,
+			// so the public demo shows this release's headline feature without a
+			// visitor having to open the picker.
+			{Port: "5432", Description: "PostgreSQL — replication peer",
+				Sources: shared.SuggestedSources(shared.SuggestPrivate), Service: "postgresql"},
+			// 2.19's own headline, on the page it lives on: a port a container
+			// publishes arrives forwarded, so the rule for it is not an input
+			// rule. The demo's [docker] leaves published_ports open, which is
+			// the default, so /ports also shows what an inert forwarded rule
+			// looks like — the state the release exists to make visible.
+			{Port: "9000", Description: "MinIO — published by a container",
+				Scope: shared.ScopeForwarded},
+		},
+		UDP: []shared.PortRule{
+			{Port: "53", Description: "DNS — authoritative"},
+			{Port: "123", Description: "NTP"},
+			{Port: "51820", Description: "WireGuard VPN"},
+		},
+		Blocklist: []string{
+			"# scanner ranges observed in fail2ban logs over the last 30d",
+			"192.0.2.42",
+			"192.0.2.118",
+			"198.51.100.0/24",
+			"203.0.113.0/24",
+			"",
+			"# IPv6 — block known ranges from compromised cloud tenant",
+			"2001:db8:bad::/48",
+		},
+		Allowlist: []string{
+			"# always-allow management — never lock these out",
+			"203.0.113.10",
+			"203.0.113.11",
+			"",
+			"# office / VPN subnet",
+			"198.51.100.0/24",
+			"",
+			"# monitoring — Prometheus scraper",
+			"192.0.2.50/32",
+			"",
+			"# IPv6 admin range",
+			"2001:db8:1::/64",
+		},
+		Forwarding: []shared.ForwardingRule{
+			{Protocol: "tcp", SourcePort: 8080, DestPort: 80},
+			{Protocol: "tcp", SourcePort: 8443, DestPort: 443},
+			{Protocol: "tcp", SourcePort: 2222, DestPort: 22},
+			{Protocol: "udp", SourcePort: 51821, DestPort: 51820},
+		},
+		Custom: []string{
+			"# allow Prometheus node-exporter only from the monitoring host",
+			"ip saddr 192.0.2.50 tcp dport 9100 accept",
+			"",
+			"# rate-limit inbound DNS queries to mitigate amplification",
+			"udp dport 53 limit rate 50/second accept",
+			"",
+			"# log + drop traffic to legacy admin port",
+			"tcp dport 10000 log prefix \"legacy-admin: \" drop",
+		},
+		// The two the Feeds card says to start with, and three more, so the
+		// public demo's card shows every state a feed row has — see
+		// newDemoFeedStore for which row shows which. In Current as well as
+		// Staged, so the apply screen shows no feed change until a visitor
+		// makes one. And one country, so the Countries card has a row:
+		// Antarctica — four networks, and no country of people the public
+		// demo would be seen to single out.
+		Feeds: []string{"spamhaus-drop", "dshield", "blocklist-de-ssh", "blocklist-de", "et-compromised", "cins", "country-aq"},
+	}
+	d.rules = shared.RulesState{
+		Current: example,
+		Staged:  example,
+		Backup:  example,
+	}
+
+	// Ids first: the counters are keyed by them, and a demo rule with no id
+	// would render an em dash rather than a date.
+	shared.EnsureRuleIDs(&d.rules.Current)
+	d.rules.Staged = d.rules.Current
+	d.rules.Backup = d.rules.Current
+
+	// Then the usage, spread across the three states the column can show. 22,
+	// 80 and 443 are busy; 25 is a fortnight quiet; 8443 has not carried a
+	// packet in sixty days, which is what puts the second line on the dashboard
+	// tile and is the whole point of the feature.
+	now := time.Now().UTC()
+	ago := func(d time.Duration) time.Time { return now.Add(-d) }
+	byPort := map[string]time.Time{
+		"22":    ago(4 * time.Minute),
+		"80":    ago(90 * time.Second),
+		"443":   ago(20 * time.Second),
+		"25":    ago(14 * 24 * time.Hour),
+		"587":   ago(3 * 24 * time.Hour),
+		"993":   ago(31 * time.Hour),
+		"8443":  ago(60 * 24 * time.Hour),
+		"53":    ago(11 * time.Second),
+		"123":   ago(6 * time.Hour),
+		"51820": ago(45 * 24 * time.Hour),
+	}
+	d.usage = shared.UsageResult{
+		Usage:       map[string]shared.RuleUsage{},
+		CollectedAt: ago(30 * time.Second),
+	}
+	for _, list := range [][]shared.PortRule{d.rules.Current.TCP, d.rules.Current.UDP} {
+		for i, r := range list {
+			seen, ok := byPort[r.Port]
+			if !ok {
+				continue // 5432 stays "never" — a rule nobody has ever reached
+			}
+			d.usage.Usage[r.ID] = shared.RuleUsage{
+				Packets:   uint64(1000 * (i + 1)),
+				Bytes:     uint64(180000 * (i + 1)),
+				FirstSeen: seen.AddDate(0, -3, 0),
+				LastSeen:  seen,
+			}
+		}
+	}
+
+	d.options = shared.FirewallOptions{
+		SSHBruteForce:                true,
+		SSHBruteForceLog:             true,
+		SSHBruteForceConnectionLimit: 5,
+		SSHBruteForceLogLimit:        60,
+		// Off in the demo, against the shipped default, so /blocked's IPv4
+		// ping row shows the reason that leads to this switch (2.25).
+		ICMPAllowEchoRequest:     false,
+		ICMPFlood:                true,
+		ICMPFloodConnectionLimit: 10,
+		ICMPFloodLogLimit:        60,
+		SYNFlood:                 true,
+		SYNFloodLog:              true,
+		SYNFloodLimit:            100,
+		PortScan:                 true,
+		PortScanLog:              true,
+		InvalidPackets:           true,
+		Fragments:                true,
+		Bogons:                   true,
+		ConnectionLimit:          true,
+		ConnectionLimitMax:       100,
+		TCPRSTFloodLimit:         100,
+		LogBlocked:               true,
+		LogBlockedLimit:          60,
+		LogBlocklist:             true,
+		LogBlocklistLimit:        60,
+		LogFeed:                  true,
+		LogFeedLimit:             60,
+	}
+	// Spamhaus DROP's size is the one measured for the catalogue, 1710 v4 plus
+	// 91 v6 (spec §1); DShield is always twenty /24s. Spamhaus polls every 12 h,
+	// DShield hourly, so the two show different checked times. The sizes of
+	// the other two are spec §1's as well. CINS has no copy: its fetches fail
+	// (newDemoFeedStore).
+	d.feeds = map[string]shared.FeedStatus{
+		"spamhaus-drop": {ID: "spamhaus-drop", Stored: true, Entries: 1801,
+			ChangedAt: ago(7 * time.Hour), CheckedAt: ago(7 * time.Hour),
+			Packets: 3412, CountersRead: true},
+		// One of its /24s holds an allowlisted address: the overlap warning.
+		"dshield": {ID: "dshield", Stored: true, Entries: 20,
+			ChangedAt: ago(3 * time.Hour), CheckedAt: ago(38 * time.Minute),
+			Packets: 18873, CountersRead: true, AllowlistOverlap: 1},
+		// The SSH list, the one the catalogue recommends; "all" stays on beside
+		// it, a ✗ feed that is on (spec D4).
+		"blocklist-de-ssh": {ID: "blocklist-de-ssh", Stored: true, Entries: 4078,
+			ChangedAt: ago(2 * time.Hour), CheckedAt: ago(22 * time.Minute),
+			Packets: 1286, CountersRead: true},
+		// The last good copy is four hours old; the three lists since were
+		// refused as a shrink (ruling X1).
+		"blocklist-de": {ID: "blocklist-de", Stored: true, Entries: 32002,
+			ChangedAt: ago(4 * time.Hour), CheckedAt: ago(4 * time.Hour),
+			Packets: 5210, CountersRead: true},
+		// Checked 25 minutes ago and the same for 34 days: Feodo's failure.
+		"et-compromised": {ID: "et-compromised", Stored: true, Entries: 686,
+			ChangedAt: ago(34 * 24 * time.Hour), CheckedAt: ago(25 * time.Minute),
+			Packets: 97, CountersRead: true},
+		// ipverse's aggregated list for AQ: three IPv4 networks and one IPv6
+		// (2026-10-13), refreshed daily.
+		"country-aq": {ID: "country-aq", Stored: true, Entries: 4,
+			ChangedAt: ago(9 * 24 * time.Hour), CheckedAt: ago(5 * time.Hour),
+			Packets: 12, CountersRead: true},
+	}
+	d.settings = shared.NetworkSettings{
+		IPv6: shared.IPv6Config{
+			Mode:                           shared.IPv6Filter,
+			ICMPAllowRouterAdvertisement:   true,
+			ICMPAllowNeighborAdvertisement: true,
+		},
+		Docker: shared.DockerConfig{
+			Enabled:             true,
+			AllowBridgeNetworks: true,
+			CustomNetworks:      []string{"172.20.0.0/16"},
+		},
+		Routing: shared.RoutingConfig{
+			Mode:     shared.RoutingClosed,
+			Networks: []string{},
+		},
+	}
+	// One switch away from what is configured now, so a visitor opening /apply
+	// finds a configuration drift as well as a rule diff — the half of "what
+	// changes" that nothing could see before 2.10. drop_fragments because it is a
+	// plain on/off with no numeric partner to explain, and off -> on because that
+	// is the direction an operator reads as "I turned something on and have not
+	// applied it yet".
+	applied := d.options
+	applied.Fragments = false
+	d.appliedConfig = shared.AppliedConfig{Firewall: applied, Network: d.settings}
+	d.system = shared.SystemSettings{
+		Acceptance: shared.AcceptanceConfig{Enabled: true, Duration: 120},
+	}
+	// Audit log: 18 entries spanning the last ~30 hours to simulate
+	// realistic operator activity (apply cycles, individual rule edits,
+	// option toggles, an import, a rollback). Newest first.
+	//
+	// UTC, exactly as the core writes it — core/rules.go:319 and
+	// core/firewall.go:286. The demo used to store local time, which made it the
+	// only installation whose stamps carried an offset other than Z, and
+	// therefore the one place shortTime's offset-preserving behaviour looked
+	// correct. A demo that does not behave like the product cannot be used to
+	// check the product.
+	d.auditLog = buildSeedAuditLog(now)
+
+	// Recent, not two hours stale. The demo is reset every few hours and this is
+	// the first number a visitor reads; opening on a last apply from two hours
+	// ago reads as an installation nobody is looking after.
+	d.lastApply = now.Add(-4 * time.Minute).Format(time.RFC3339)
+}
+
+// buildSeedAuditLog returns ~18 plausible audit entries, newest first.
+// Times are spread across the last day with variable gaps so the table
+// looks like a real working log, not a demo stub.
+//
+// Details are written the way the core writes them — data, not prose. They used
+// to read "added 8443 (staging)" and "acceptance window expired", which was
+// English text no locale could reach, and it also promised a level of detail the
+// core does not record (see Known Gaps in DESIGN.md). "timeout" is the one token
+// the core does emit, and it is translated through auditDetailKeys.
+func buildSeedAuditLog(now time.Time) []shared.AuditLogEntry {
+	type e struct {
+		offset   time.Duration
+		action   string
+		ruleType string
+		detail   string
+		user     string
+	}
+	entries := []e{
+		{-4 * time.Minute, "apply_accepted", "", "", "demo"},
+		{-4*time.Minute - 30*time.Second, "rules_saved", "tcp", "+8443", "demo"},
+		{-3 * time.Hour, "options_saved", "", "ssh_brute_force_log", "demo"},
+		{-4 * time.Hour, "rules_saved", "blocklist", "+192.0.2.42", "demo"},
+		{-4*time.Hour - 12*time.Second, "rules_saved", "blocklist", "+192.0.2.118", "demo"},
+		{-5 * time.Hour, "settings_saved", "", "docker_enabled", "demo"},
+		{-6 * time.Hour, "system_saved", "", "acceptance_duration=120", "demo"},
+		{-8 * time.Hour, "apply_accepted", "", "", "demo"},
+		{-8*time.Hour - 45*time.Second, "rules_saved", "forwarding", "+8443→443/tcp", "demo"},
+		{-9 * time.Hour, "rules_saved", "allowlist", "+203.0.113.10/32", "demo"},
+		{-12 * time.Hour, "rules_saved", "udp", "+51820", "demo"},
+		{-14 * time.Hour, "rules_imported", "", "rules-2026-05-02.json", "demo"},
+		// The re-apply happened two minutes after the rollback it followed, which
+		// makes it the more recent of the pair — so in a newest-first list it goes
+		// above the rollback, not below. Listed the other way round for a while:
+		// same two offsets, swapped positions, and the log read as a rollback that
+		// happened after the apply it was rolling back, which is a sequence the
+		// real core cannot produce.
+		{-18*time.Hour + 2*time.Minute, "apply_accepted", "", "", "demo"},
+		{-18 * time.Hour, "apply_rolledback", "", "timeout", "demo"},
+		{-20 * time.Hour, "options_saved", "", "syn_flood_limit=100", "demo"},
+		{-24 * time.Hour, "rules_saved", "custom", "+1", "demo"},
+		{-26 * time.Hour, "apply_accepted", "", "", "demo"},
+		{-30 * time.Hour, "rules_saved", "tcp", "+22 +80 +443", "demo"},
+	}
+	out := make([]shared.AuditLogEntry, 0, len(entries))
+	for _, x := range entries {
+		out = append(out, shared.AuditLogEntry{
+			Time:     now.Add(x.offset).Format(time.RFC3339),
+			Action:   x.action,
+			RuleType: x.ruleType,
+			Detail:   x.detail,
+			User:     x.user,
+		})
+	}
+	return out
+}
+
+// Send dispatches a typed command to the in-memory handler.
+func (d *demoState) Send(cmd shared.Command) shared.Response {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	switch cmd.Type {
+	case shared.CmdGetStatus:
+		return demoOK(d.statusLocked())
+	case shared.CmdGetRules:
+		return demoOK(d.rules)
+	case shared.CmdSaveRules:
+		return d.handleSaveRules(cmd.Payload)
+	case shared.CmdApplyRules:
+		return d.handleApplyRules()
+	case shared.CmdAccept:
+		return d.handleAccept()
+	case shared.CmdCancelAcceptance:
+		return d.handleCancelAcceptance()
+	case shared.CmdGetOptions:
+		return demoOK(d.options)
+	case shared.CmdSaveOptions:
+		return d.handleSaveOptions(cmd.Payload)
+	case shared.CmdGetSettings:
+		return demoOK(d.settings)
+	case shared.CmdSaveSettings:
+		return d.handleSaveSettings(cmd.Payload)
+	case shared.CmdGetSystem:
+		return demoOK(d.system)
+	case shared.CmdGetAppliedConfig:
+		return demoOK(shared.AppliedConfigResult{Recorded: true, Config: d.appliedConfig})
+	case shared.CmdGetUsage:
+		return demoOK(d.usage)
+	case shared.CmdGetHealth:
+		// The demo has no network namespace to run the self-test's four claims
+		// in — see internal/core/netns.go — so answering "passed" would claim a
+		// proof this process never ran, and /healthz is unauthenticated: that
+		// claim would reach anyone who asks, in the shipped public demo.
+		// "unprovable" is the honest answer, and computeHealth treats it as ok
+		// rather than degraded — the same reasoning that keeps an ordinary
+		// installation without CAP_SYS_ADMIN from reporting itself broken.
+		//
+		// The state itself follows panicMode, because the alternative is the
+		// demo contradicting itself on one screen: statusLocked reports
+		// Active: !panicMode and the interface draws the panic banner over every
+		// page, and this answered ok/healthy underneath it.
+		//
+		// fail with reason panic is what computeHealth returns for the same
+		// machine, and both halves matter. fail rather than degraded because a
+		// panicked host is not filtering at all — Firewall.Panic leaves an empty
+		// input chain and Enforcing() reports that as not enforcing, so the
+		// answer comes out of computeHealth's first branch. panic rather than
+		// not_enforcing because that branch names the cause from the marker: a
+		// human took the rules away and a reboot will not bring them back. The
+		// demo has to say exactly what a real host says, or it is not worth
+		// rendering a review against.
+		res := shared.HealthResult{
+			State:  shared.HealthOK,
+			Reason: shared.HealthReasonHealthy,
+			Selftest: shared.HealthSelftest{
+				Version: shared.CurrentVersion,
+				Result:  shared.SelftestUnprovable,
+				At:      time.Now(),
+			},
+		}
+		if d.panicMode {
+			res.State, res.Reason = shared.HealthFail, shared.HealthReasonPanic
+		}
+		return demoOK(res)
+	case shared.CmdSaveSystem:
+		return d.handleSaveSystem(cmd.Payload)
+	case shared.CmdGetLog:
+		return demoOK(d.auditLog)
+	case shared.CmdGetPacketLog:
+		var f shared.PacketLogFilter
+		if len(cmd.Payload) > 0 {
+			if err := json.Unmarshal(cmd.Payload, &f); err != nil {
+				return demoErr(err)
+			}
+		}
+		match, err := f.Matcher()
+		if err != nil {
+			return demoErr(err)
+		}
+		all := demoPacketLog(d.packetStart, time.Now())
+		res := shared.PacketLogResult{
+			Entries: []shared.PacketLogEntry{}, Held: len(all), Listening: true,
+			Group: shared.PacketLogGroupDefault, Since: all[len(all)-1].Time,
+		}
+		for _, e := range all {
+			if match(e) {
+				res.Matched++
+				if len(res.Entries) < f.EffectiveLimit() {
+					res.Entries = append(res.Entries, e)
+				}
+			}
+		}
+		return demoOK(res)
+	case shared.CmdValidateCustom:
+		// There is no nft binary behind the demo, so it cannot judge syntax. It
+		// used to answer "no errors", which told every visitor their rules were
+		// valid whatever they typed — a false green on the one page where being
+		// wrong locks you out. Reporting the checker as unavailable is the truth,
+		// and the interface already has a state for exactly that.
+		return demoErr(errors.New("syntax checking needs the core daemon"))
+	case shared.CmdExportRules:
+		// Staged, like the core: import replaces staged, so this is the half
+		// that makes the pair lossless.
+		raw, err := json.Marshal(d.rules.Staged)
+		if err != nil {
+			return demoErr(err)
+		}
+		return shared.Response{Success: true, Data: raw}
+	case shared.CmdImportRules:
+		return d.handleImportRules(cmd.Payload)
+	case shared.CmdPanic:
+		return d.handlePanic()
+	case shared.CmdResume:
+		return d.handleResume()
+	case shared.CmdLogEvent:
+		return d.handleLogEvent(cmd.Payload)
+	case shared.CmdGetFeeds:
+		return demoOK(d.feedStatusLocked())
+	case shared.CmdUpdateFeed:
+		// Nothing in the demo sends it: demo mode constructs no fetcher. A
+		// visitor's browser reaching the public demo must not be the thing that
+		// makes it fetch a list from the internet.
+		return demoErr(errors.New("the demo fetches no feeds"))
+	}
+	return demoErr(fmt.Errorf("unknown command %q", cmd.Type))
+}
+
+// newDemoFeedStore is the demo's side of the feeds: what the web process
+// would remember about each refresh, held in memory and never written
+// (path ""): demo mode builds no fetcher, and saveOwnFeed refuses. With the
+// copies seeded above, the card shows every status and every warning:
+//
+//	spamhaus-drop   updated
+//	dshield         unchanged; 1 allowlist entry overlaps
+//	blocklist-de-ssh unchanged
+//	blocklist-de    failed, previous copy active; failed 3 times in a row;
+//	                refused as a shrink from 32 002 to 9 140
+//	et-compromised  unchanged; unchanged for 30 days; 2 lines not an address
+//	cins            failed, no copy; failed twice; in the kernel with an empty set
+//	country-aq      unchanged — the Countries card's one row
+//	any other       never fetched and "on once you apply", once a visitor
+//	                switches it on and saves
+//	own-1           configured and off: its host is the row's source
+func newDemoFeedStore(now time.Time) *feedStore {
+	ago := func(d time.Duration) time.Time { return now.Add(-d) }
+	return &feedStore{st: &feedStateFile{
+		OffsetSeconds: 1020,
+		Fetch: map[string]feedFetchState{
+			"spamhaus-drop":    {Status: FeedUpdated, LastAttempt: ago(7 * time.Hour)},
+			"dshield":          {Status: FeedUnchanged, LastAttempt: ago(38 * time.Minute)},
+			"blocklist-de-ssh": {Status: FeedUnchanged, LastAttempt: ago(22 * time.Minute)},
+			"blocklist-de": {Status: FeedFailedCopy, LastError: feedErrShrank, Failures: 3, LastAttempt: ago(20 * time.Minute),
+				ShrankFrom: 32002, ShrankTo: 9140},
+			"et-compromised": {Status: FeedUnchanged, LastAttempt: ago(25 * time.Minute),
+				Rejected: 2, RejectedSample: []string{"Rate limit exceeded.", "Try again in 10 minutes."}},
+			"cins": {Status: FeedFailedNoCopy, LastError: feedErrHTTPStatus, HTTPStatus: 503,
+				Failures: 2, LastAttempt: ago(50 * time.Minute)},
+			"country-aq": {Status: FeedUnchanged, LastAttempt: ago(5 * time.Hour)},
+			// The country lookup's line on /blocked: checked, unchanged.
+			countryLookupKey: {Status: FeedUnchanged, LastAttempt: ago(20 * time.Minute)},
+		},
+		// No user and no password: nothing a visitor could read back.
+		Own: [shared.MaxOwnFeeds]OwnFeed{{Name: "CrowdSec Raw IP List",
+			URL: "https://admin.api.crowdsec.net/v1/integrations/demo/content"}},
+	}}
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────
+
+// feedStatusLocked answers GET_FEEDS the way the core does: one status per id
+// that has a copy or is switched on in Current or Staged, in_kernel for the
+// ones in Current. A feed a visitor switches on has no copy, because nothing
+// here fetches one. contains_addr stays false: the seeded copies are counts,
+// not addresses. Caller holds d.mu.
+func (d *demoState) feedStatusLocked() shared.GetFeedsResult {
+	res := shared.GetFeedsResult{Feeds: []shared.FeedStatus{}}
+	seen := map[string]bool{}
+	add := func(id string) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		st, ok := d.feeds[id]
+		if !ok {
+			st = shared.FeedStatus{ID: id}
+			if shared.IsCountryFeedID(id) {
+				// Nothing here fetches, and /apply refuses a country with no
+				// copy: one visitor's country would block every visitor's apply.
+				now := time.Now()
+				st = shared.FeedStatus{ID: id, Stored: true, Entries: 3,
+					ChangedAt: now.Add(-24 * time.Hour), CheckedAt: now.Add(-time.Hour)}
+			}
+		}
+		st.InKernel = slices.Contains(d.rules.Current.Feeds, id)
+		if !st.InKernel {
+			st.Packets, st.CountersRead = 0, false
+		}
+		res.Feeds = append(res.Feeds, st)
+	}
+	for _, f := range shared.FeedCatalogue {
+		if _, ok := d.feeds[f.ID]; ok {
+			add(f.ID)
+		}
+	}
+	for _, id := range append(slices.Clone(d.rules.Current.Feeds), d.rules.Staged.Feeds...) {
+		add(id)
+	}
+	return res
+}
+
+func demoOK(data interface{}) shared.Response {
+	raw, err := json.Marshal(data)
+	if err != nil {
+		return demoErr(err)
+	}
+	return shared.Response{Success: true, Data: raw}
+}
+
+func demoErr(err error) shared.Response {
+	return shared.Response{Success: false, Error: err.Error()}
+}
+
+// hasPendingLocked compares Current to Staged via JSON marshal — order-stable
+// across slices and works for arbitrary nested types in shared.Rules — and then
+// the configuration against what the last apply put in the kernel, exactly as
+// core.Firewall.Status does. A demo whose pending state is computed differently
+// from the product's is a demo that teaches the wrong thing.
+func (d *demoState) hasPendingLocked() bool {
+	if len(shared.DiffRules(d.rules.Current, d.rules.Staged)) > 0 {
+		return true // the core's rule, RulesStore.HasPendingChanges
+	}
+	live := shared.AppliedConfig{Firewall: d.options, Network: d.settings}
+	return len(shared.DiffConfig(d.appliedConfig, live)) > 0
+}
+
+func (d *demoState) statusLocked() shared.FirewallStatus {
+	return shared.FirewallStatus{
+		// The real core reports Active false the moment Panic tears the table
+		// down; there is no kernel here to ask, so panicMode is the only signal
+		// this mock has and Active follows its negation the same way the rest
+		// of this struct's derived fields (HasPending) follow the state
+		// underneath them rather than being tracked independently.
+		Active:              !d.panicMode,
+		Panic:               d.panicMode,
+		Acceptance:          d.acceptance,
+		HasPending:          d.hasPendingLocked(),
+		LastApply:           d.lastApply,
+		AcceptanceRemaining: d.acceptanceRemainingLocked(),
+		AcceptanceReason:    d.acceptanceReasonLocked(),
+		// The same field applyLocked branches on, for the same reason the core
+		// reads its own config here: the demo must not advertise a window it
+		// will not open.
+		AcceptanceEnabled: d.system.Acceptance.Enabled,
+	}
+}
+
+// acceptanceReasonLocked mirrors core.Firewall.Status: the reason is only
+// meaningful once a window has ended, so it is withheld while one is still
+// open or before any has ever run — matching shared.FirewallStatus's own doc
+// comment. Caller holds d.mu.
+func (d *demoState) acceptanceReasonLocked() string {
+	if d.acceptance != shared.AcceptanceRolledBack {
+		return ""
+	}
+	return d.acceptanceReason
+}
+
+// acceptanceRemainingLocked mirrors core.Firewall.Status: whole seconds, rounded
+// up, zero when no window is open. Caller holds d.mu.
+func (d *demoState) acceptanceRemainingLocked() int {
+	if d.acceptance != shared.AcceptancePending {
+		return 0
+	}
+	left := time.Until(d.acceptanceDeadline)
+	if left <= 0 {
+		return 0
+	}
+	return int((left + time.Second - 1) / time.Second)
+}
+
+// audit appends a newest-first entry to the log, capped at 200 to mirror
+// the real core's behavior, attributed to the operator driving the demo.
+func (d *demoState) audit(action, ruleType, detail string) {
+	d.auditAs(action, ruleType, detail, d.actor)
+}
+
+// auditAs is audit with an explicit user. Its one caller other than audit
+// itself is handleLogEvent, which — like the real core — attributes a login
+// event to "web" rather than to whichever operator is driving the demo.
+func (d *demoState) auditAs(action, ruleType, detail, user string) {
+	e := shared.AuditLogEntry{
+		Time:     time.Now().UTC().Format(time.RFC3339),
+		Action:   action,
+		RuleType: ruleType,
+		Detail:   detail,
+		User:     user,
+	}
+	d.auditLog = append([]shared.AuditLogEntry{e}, d.auditLog...)
+	if len(d.auditLog) > 200 {
+		d.auditLog = d.auditLog[:200]
+	}
+}
+
+// ── Command handlers ─────────────────────────────────────────────────────
+
+func (d *demoState) handleSaveRules(payload []byte) shared.Response {
+	// Decode as raw map first, then dispatch by RuleType to the correct
+	// concrete type. The core does the same thing on its side.
+	var generic struct {
+		RuleType string          `json:"rule_type"`
+		Rules    json.RawMessage `json:"rules"`
+	}
+	if err := json.Unmarshal(payload, &generic); err != nil {
+		return demoErr(fmt.Errorf("invalid payload: %w", err))
+	}
+
+	// Kept so the audit entry can say what changed, exactly as the core does.
+	before := d.rules.Staged
+
+	switch generic.RuleType {
+	case "tcp":
+		var rs []shared.PortRule
+		if err := json.Unmarshal(generic.Rules, &rs); err != nil {
+			return demoErr(fmt.Errorf("invalid tcp rules: %w", err))
+		}
+		d.rules.Staged.TCP = rs
+	case "udp":
+		var rs []shared.PortRule
+		if err := json.Unmarshal(generic.Rules, &rs); err != nil {
+			return demoErr(fmt.Errorf("invalid udp rules: %w", err))
+		}
+		d.rules.Staged.UDP = rs
+	case "blocklist":
+		var rs []string
+		if err := json.Unmarshal(generic.Rules, &rs); err != nil {
+			return demoErr(fmt.Errorf("invalid blocklist: %w", err))
+		}
+		d.rules.Staged.Blocklist = rs
+	case "allowlist":
+		var rs []string
+		if err := json.Unmarshal(generic.Rules, &rs); err != nil {
+			return demoErr(fmt.Errorf("invalid allowlist: %w", err))
+		}
+		d.rules.Staged.Allowlist = rs
+	case "custom":
+		var rs []string
+		if err := json.Unmarshal(generic.Rules, &rs); err != nil {
+			return demoErr(fmt.Errorf("invalid custom: %w", err))
+		}
+		d.rules.Staged.Custom = rs
+	case "forwarding":
+		var rs []shared.ForwardingRule
+		if err := json.Unmarshal(generic.Rules, &rs); err != nil {
+			return demoErr(fmt.Errorf("invalid forwarding rules: %w", err))
+		}
+		d.rules.Staged.Forwarding = rs
+	case "feeds":
+		var rs []string
+		if err := json.Unmarshal(generic.Rules, &rs); err != nil {
+			return demoErr(fmt.Errorf("invalid feeds: %w", err))
+		}
+		d.rules.Staged.Feeds = rs
+	default:
+		return demoErr(fmt.Errorf("unknown rule type %q", generic.RuleType))
+	}
+
+	// The same assignment the core's SaveStaged makes. Without it a rule added
+	// in the demo has no id, renders an em dash for ever, and the demo shows
+	// something the product does not do.
+	shared.EnsureRuleIDs(&d.rules.Staged)
+
+	// The same check the core runs. Without it the demo accepted input the real
+	// thing refuses — and the demo is what people judge the product by before
+	// they install it.
+	if err := shared.ValidateRules(d.rules.Staged); err != nil {
+		d.rules.Staged = before
+		return demoErr(err)
+	}
+
+	d.audit("rules_saved", generic.RuleType, shared.DescribeRuleChange(generic.RuleType, before, d.rules.Staged))
+	return shared.Response{Success: true}
+}
+
+func (d *demoState) handleApplyRules() shared.Response {
+	// Refused for the same reason the real core refuses it: a human at the
+	// console took the firewall down on purpose, and the web interface does
+	// not get to override that by pushing a new apply through. Checked before
+	// the acceptance-window refusal below because panic mode outranks it —
+	// the marker, not any in-flight window, is what decides whether an apply
+	// may run at all.
+	if d.panicMode {
+		return shared.Response{Success: false, Error: shared.ErrPanicEngagedText}
+	}
+
+	// Refused while a window is open, exactly as the core refuses it. The demo
+	// used to accept it and silently restart the window instead — a third
+	// behaviour, in the one place where visitors form their idea of what the
+	// product does. The core's reason is in core.ErrApplyInProgress.
+	if d.acceptance == shared.AcceptancePending {
+		return shared.Response{Success: false, Error: shared.ErrApplyInProgressText}
+	}
+
+	// Cancel any in-flight pending timer so we don't roll back twice.
+	if d.acceptanceTimer != nil {
+		d.acceptanceTimer.Stop()
+		d.acceptanceTimer = nil
+		d.acceptanceDeadline = time.Time{}
+	}
+
+	// Snapshot the current rules as backup; promote staged → current.
+	d.rules.Backup = d.rules.Current
+	d.rules.Current = d.rules.Staged
+
+	// The configuration goes into the kernel with the rules, so the demo records
+	// it here for the same reason Firewall.apply does.
+	d.appliedConfig = shared.AppliedConfig{Firewall: d.options, Network: d.settings}
+
+	// The order the core writes these in, because the audit log is the thing a
+	// visitor reads to understand what easywall records.
+	//
+	// This used to write apply_accepted here, before the confirmation window had
+	// even opened, and stamp the last-apply time with it. An apply nobody
+	// confirmed therefore produced "Rules accepted" immediately followed by
+	// "Rules rolled back" for the same apply — a pair the real product cannot
+	// produce — and left the dashboard reporting a successful apply that had been
+	// undone. audit-log.md teaches operators to read exactly those two lines.
+	if d.system.Acceptance.Enabled {
+		d.audit("apply_started", "all", "")
+		d.acceptance = shared.AcceptancePending
+		dur := time.Duration(d.system.Acceptance.Duration) * time.Second
+		d.acceptanceDeadline = time.Now().Add(dur)
+		d.acceptanceTimer = time.AfterFunc(dur, d.rollback)
+	} else {
+		d.audit("apply_started", "all", "acceptance window disabled — applied without confirmation")
+		d.lastApply = time.Now().UTC().Format(time.RFC3339)
+		d.audit("apply_accepted", "all", "no confirmation required")
+		d.acceptance = shared.AcceptanceAccepted
+		// Match the real core: brief "accepted" pulse, then drop back to idle.
+		go d.delayedReset()
+	}
+
+	raw, _ := json.Marshal(map[string]string{"status": "started"})
+	return shared.Response{Success: true, Data: raw}
+}
+
+func (d *demoState) handleAccept() shared.Response {
+	// Nothing to accept unless a window is open. The core reports that, and so
+	// must the demo: a confirmation arriving after the window closed changes
+	// nothing, and saying otherwise is the one lie the apply page must not tell.
+	if d.acceptance != shared.AcceptancePending {
+		return demoOK(shared.AcceptResult{Accepted: false})
+	}
+
+	if d.acceptanceTimer != nil {
+		d.acceptanceTimer.Stop()
+		d.acceptanceTimer = nil
+		d.acceptanceDeadline = time.Time{}
+	}
+	// Confirmation is what makes an apply final, so this is where the log records
+	// it and where the dashboard's "last apply" is stamped.
+	d.lastApply = time.Now().UTC().Format(time.RFC3339)
+	d.audit("apply_accepted", "all", "")
+	d.acceptance = shared.AcceptanceAccepted
+	go d.delayedReset()
+	return demoOK(shared.AcceptResult{Accepted: true})
+}
+
+// handleCancelAcceptance is the operator asking for the rollback now. It runs
+// the demo's own rollback rather than a second copy of it, so the audit line,
+// the restored rule set and the status all match what a timeout produces —
+// which is the point: it is the same outcome, reached sooner.
+//
+// A demo client that silently does nothing is how the validation false-green
+// happened; docs-tech/protocol.md's "Adding a command" says so in step 3.
+//
+// Called from Send's dispatch switch, which already holds d.mu — unlike
+// rollback below, this must not lock again: sync.Mutex is not reentrant, and a
+// second Lock() from the same goroutine that holds the first blocks forever
+// rather than failing loudly.
+func (d *demoState) handleCancelAcceptance() shared.Response {
+	if d.acceptance != shared.AcceptancePending {
+		return demoOK(shared.CancelResult{Cancelled: false})
+	}
+	if d.acceptanceTimer != nil {
+		d.acceptanceTimer.Stop()
+		d.acceptanceTimer = nil
+	}
+	d.rollbackWithDetail("cancelled by operator")
+	return demoOK(shared.CancelResult{Cancelled: true})
+}
+
+// rollback fires from a time.AfterFunc when the acceptance window expires
+// without an Accept. It must lock independently because it runs on its own
+// goroutine.
+func (d *demoState) rollback() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// The timer may already have fired and be waiting on d.mu while an operator
+	// rollback ran under Send's lock. Without this it writes a second
+	// apply_rolledback, detail "timeout", for a window that was already ended by
+	// hand — one event, two entries, the second untrue. The same race exists
+	// against handleAccept, which this guard covers too.
+	if d.acceptance != shared.AcceptancePending {
+		return
+	}
+	d.rollbackWithDetail("timeout")
+}
+
+// rollbackWithDetail restores the previous rules and records why. The two
+// reasons — the window expiring and the operator asking — are one outcome and
+// one audit action; only the detail differs.
+//
+// Callers must already hold d.mu: rollback (above) takes it before calling in,
+// since it runs on its own goroutine; handleCancelAcceptance runs under the
+// lock Send already holds and calls straight in without a second Lock().
+func (d *demoState) rollbackWithDetail(detail string) {
+	d.rules.Current = d.rules.Backup
+	// The rules just reverted; record the configuration alongside them for the
+	// same reason Firewall.rollback does.
+	d.appliedConfig = shared.AppliedConfig{Firewall: d.options, Network: d.settings}
+	d.acceptance = shared.AcceptanceRolledBack
+	d.acceptanceReason = detail
+	d.audit("apply_rolledback", "all", detail) // the tokens the real core writes
+	d.acceptanceTimer = nil
+	d.acceptanceDeadline = time.Time{}
+}
+
+// delayedReset matches the real core's behavior: after Accept, the status
+// pulses "accepted" briefly before returning to idle so the dashboard can
+// reflect the success and then quiet down.
+func (d *demoState) delayedReset() {
+	time.Sleep(2 * time.Second)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.acceptance == shared.AcceptanceAccepted {
+		d.acceptance = shared.AcceptanceIdle
+	}
+}
+
+func (d *demoState) handleSaveOptions(payload []byte) shared.Response {
+	var opts shared.FirewallOptions
+	if err := json.Unmarshal(payload, &opts); err != nil {
+		return demoErr(fmt.Errorf("invalid payload: %w", err))
+	}
+	before := d.options
+	d.options = opts
+	d.audit("options_saved", "", shared.DescribeStructChange(before, opts))
+	return shared.Response{Success: true}
+}
+
+func (d *demoState) handleSaveSettings(payload []byte) shared.Response {
+	var s shared.NetworkSettings
+	if err := json.Unmarshal(payload, &s); err != nil {
+		return demoErr(fmt.Errorf("invalid payload: %w", err))
+	}
+	// The same check the core runs, for the same reason the custom-rule page
+	// reports its checker as unavailable rather than answering "no errors": the
+	// demo is the product to everyone who has not installed it. It accepted every
+	// network here, including ones a real installation refuses.
+	if err := shared.ValidateNetworkList("docker custom network", s.Docker.CustomNetworks); err != nil {
+		return demoErr(err)
+	}
+	if err := shared.ValidateNetworkList("routing network", s.Routing.Networks); err != nil {
+		return demoErr(err)
+	}
+	before := d.settings
+	d.settings = s
+	d.audit("settings_saved", "", shared.DescribeStructChange(before, s))
+	return shared.Response{Success: true}
+}
+
+func (d *demoState) handleSaveSystem(payload []byte) shared.Response {
+	var s shared.SystemSettings
+	if err := json.Unmarshal(payload, &s); err != nil {
+		return demoErr(fmt.Errorf("invalid payload: %w", err))
+	}
+	if !shared.ValidAcceptanceDuration(s.Acceptance.Duration) {
+		return demoErr(fmt.Errorf("acceptance duration %d is outside %d–%d seconds",
+			s.Acceptance.Duration, shared.AcceptanceDurationMin, shared.AcceptanceDurationMax))
+	}
+	before := d.system
+	d.system = s
+	d.audit("system_saved", "", shared.DescribeStructChange(before, s))
+	return shared.Response{Success: true}
+}
+
+func (d *demoState) handleImportRules(payload []byte) shared.Response {
+	// The export endpoint returns the Current rules as JSON. Import accepts
+	// the same shape and replaces Staged so the user can review + apply.
+	var imported shared.Rules
+	if err := json.Unmarshal(payload, &imported); err != nil {
+		return demoErr(fmt.Errorf("invalid rules: %w", err))
+	}
+	if err := shared.ValidateRules(imported); err != nil {
+		return demoErr(fmt.Errorf("import validation failed: %w", err))
+	}
+	d.rules.Staged = imported
+	d.audit("rules_imported", "", fmt.Sprintf("%d tcp, %d udp, %d blocklist, %d allowlist",
+		len(imported.TCP), len(imported.UDP), len(imported.Blocklist), len(imported.Allowlist)))
+	return shared.Response{Success: true}
+}
+
+// handlePanic mirrors core.Firewall.Panic for a visitor with no kernel behind
+// them: there is no table to tear down, so setting panicMode and writing the
+// same audit action the real core writes is the whole of it.
+func (d *demoState) handlePanic() shared.Response {
+	d.panicMode = true
+	d.audit("panic_engaged", "all", "the firewall was taken down from the console")
+	return shared.Response{Success: true}
+}
+
+// handleResume mirrors core.Firewall.Resume. The real core restores the
+// stored rules from disk here; the demo has no disk-backed "current" separate
+// from what panicMode already suppresses, so clearing the flag is the
+// restore.
+func (d *demoState) handleResume() shared.Response {
+	d.panicMode = false
+	d.audit("panic_resumed", "all", "panic mode was ended from the console")
+	return shared.Response{Success: true}
+}
+
+// handleLogEvent records a login event on the demo's log — refusing one the
+// protocol does not declare, because a demo that accepts what production
+// refuses is a demo that hides the refusal.
+//
+// It does not record one the way the core does: the core parses p.Addr with
+// netip.ParseAddr and normalises it (loginevents.go), folds bursts of the
+// stranger-triggerable events into a debounced summary, and never repeats one
+// address twice running. This handler skips all of that and echoes p.Addr
+// verbatim. That is not a security problem — rightmostUntrusted always returns
+// a canonical netip.Addr.String(), and in demo mode p.Addr is blank anyway —
+// and detailLabel escapes everything it did not write itself — but it is not
+// what the core does, so the comment must not claim it is.
+//
+// What it does share with the core is the log's cap: d.audit() below caps at
+// 200 entries, and a handler that appended straight to d.auditLog without that
+// cap turned 300 login attempts on the public demo into a /log page that grew
+// without bound — a slow leak, and a page that buries what the demo exists to
+// show.
+func (d *demoState) handleLogEvent(payload []byte) shared.Response {
+	var p shared.LogEventPayload
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return demoErr(fmt.Errorf("invalid payload: %w", err))
+	}
+	if !shared.ValidLoginEvent(p.Event) {
+		return demoErr(fmt.Errorf("unknown login event: %q", p.Event))
+	}
+	detail := ""
+	if p.Addr != "" {
+		detail = "from " + p.Addr
+		if p.Proxied {
+			// The same token the core writes. Unreachable in the demo since
+			// 2.13 — no address is recorded there, so this branch's `detail`
+			// is never built — and kept because the handler is the demo's copy
+			// of the protocol, not a copy of the demo's configuration: it must
+			// go on refusing and accepting exactly what the core does.
+			detail += shared.ProxyToken
+		}
+	}
+	d.auditAs(string(p.Event), "", detail, "web")
+	return shared.Response{Success: true}
+}

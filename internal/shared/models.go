@@ -1,0 +1,944 @@
+package shared
+
+import (
+	"strings"
+	"time"
+)
+
+// PortScope is the chain a port rule is evaluated in.
+//
+// The zero value is the host chain, which is what every rule written before
+// 2.19 means. It is spelled as an empty string rather than as ScopeHost so that
+// omitempty keeps such a file byte-identical until it is touched — the promise
+// ID made in 2.15 and Sources made in 2.11, kept the same way.
+type PortScope string
+
+const (
+	// ScopeHost: traffic addressed to this machine. Today's behaviour.
+	ScopeHost PortScope = "host"
+	// ScopeForwarded: traffic this machine passes on — a published container
+	// port, which Docker has already DNAT'd by the time the forward chain sees
+	// it. Only meaningful under docker.published_ports = "filtered".
+	ScopeForwarded PortScope = "forwarded"
+	// ScopeBoth: the same port, wherever it arrives.
+	ScopeBoth PortScope = "both"
+)
+
+// PortRule represents a TCP or UDP port to be opened.
+type PortRule struct {
+	// ID identifies this rule across applies, edits and reorderings. Usage
+	// counters are keyed by it, and 2.18's per-entry metadata will key by it
+	// too. Assigned once at creation, never rewritten.
+	//
+	// Twelve hex characters. omitempty keeps a rules.json written before 2.15
+	// byte-identical until it is touched — the promise Sources made in 2.11,
+	// kept the same way.
+	ID string `json:"id,omitempty"`
+
+	Port        string `json:"port"`        // single port "80" or range "8000:9000"
+	Description string `json:"description"` // human-readable label
+	SSH         bool   `json:"ssh"`         // route through SSH brute-force chain
+
+	// Scope is which chain this rule is evaluated in. Empty means host.
+	Scope PortScope `json:"scope,omitempty"`
+
+	// Sources restricts who may reach the port. Empty means anywhere, which is
+	// what every rule written before 2.11 means and what the field must go on
+	// meaning — omitempty keeps an untouched rules.json byte-identical.
+	Sources []string `json:"sources,omitempty"`
+
+	// Service is the catalogue id this rule was created from. It is a label and
+	// nothing else: no rule building, no validation and no verdict reads it, so
+	// an id the catalogue no longer knows renders as plain text and the firewall
+	// is unchanged. A catalogue edit can never alter a live rule.
+	Service string `json:"service,omitempty"`
+}
+
+// ForwardingRule represents a port forwarding (NAT PREROUTING) entry.
+type ForwardingRule struct {
+	Protocol   string `json:"protocol"`    // "tcp" or "udp"
+	SourcePort int    `json:"source_port"` // external port
+	DestPort   int    `json:"dest_port"`   // internal port
+}
+
+// Rules holds all firewall rule sets.
+type Rules struct {
+	TCP        []PortRule       `json:"tcp"`
+	UDP        []PortRule       `json:"udp"`
+	Blocklist  []string         `json:"blocklist"`  // blocked source IPs / CIDRs
+	Allowlist  []string         `json:"allowlist"`  // always-allowed source IPs / CIDRs
+	Forwarding []ForwardingRule `json:"forwarding"` // NAT port forwards
+	Custom     []string         `json:"custom"`     // raw nftables rule strings
+
+	// Feeds are the enabled feed ids — catalogue ids and own-1…own-3 — in the
+	// order they were switched on. Only the ids: a feed's contents are the
+	// core's feeds.json, never this file, which holds three copies of Rules
+	// and is re-marshalled on every status poll. omitempty: a rules.json with
+	// no feed switched on carries no "feeds" key.
+	Feeds []string `json:"feeds,omitempty"`
+}
+
+// IsEmpty reports whether this rule set says nothing at all.
+//
+// The distinction it exists for: an empty rule set is not a firewall policy, it
+// is the absence of one. RulesStore initialises a host that has never been
+// configured with exactly this value, and enforcing it means an input chain at
+// policy drop with nothing open — SSH closed, and the web interface that would
+// have opened it closed with it. See Firewall.everConfigured.
+//
+// Every field of Rules is counted, and TestRulesIsEmptyCountsEveryField holds it
+// to that by reflection: a seventh rule set added here and forgotten below would
+// make a configured host look unconfigured, which is the one direction that
+// silently stops a firewall.
+func (r Rules) IsEmpty() bool {
+	return len(r.TCP) == 0 &&
+		len(r.UDP) == 0 &&
+		len(r.Blocklist) == 0 &&
+		len(r.Allowlist) == 0 &&
+		len(r.Forwarding) == 0 &&
+		len(r.Custom) == 0 &&
+		len(r.Feeds) == 0
+}
+
+// RulesState holds the three-state rules system preventing lockouts.
+// current = applied to kernel, staged = pending user apply, backup = rollback target.
+type RulesState struct {
+	Current Rules `json:"current"`
+	Staged  Rules `json:"staged"`
+	Backup  Rules `json:"backup"`
+}
+
+// FirewallOptions controls which optional protection modules are enabled.
+type FirewallOptions struct {
+	// SSH brute-force prevention (rate-limits new connections to SSH port)
+	SSHBruteForce                bool `toml:"ssh_brute_force"`
+	SSHBruteForceLog             bool `toml:"ssh_brute_force_log"`
+	SSHBruteForceConnectionLimit int  `toml:"ssh_brute_force_connection_limit"`
+	SSHBruteForceLogLimit        int  `toml:"ssh_brute_force_log_limit"`
+
+	// Answer pings: accept ICMP type 8 and ICMPv6 type 128 (2.25). On by
+	// default, and on for a file that predates the key — LoadConfig sees to
+	// that, because a missing bool decodes to false.
+	ICMPAllowEchoRequest bool `toml:"icmp_allow_echo_request"`
+
+	// ICMP flood prevention
+	ICMPFlood                bool `toml:"icmp_flood"`
+	ICMPFloodLog             bool `toml:"icmp_flood_log"`
+	ICMPFloodConnectionLimit int  `toml:"icmp_flood_connection_limit"`
+	ICMPFloodLogLimit        int  `toml:"icmp_flood_log_limit"`
+
+	// SYN flood prevention (rate-limits new TCP SYN packets per source IP)
+	SYNFlood      bool `toml:"syn_flood"`
+	SYNFloodLog   bool `toml:"syn_flood_log"`
+	SYNFloodLimit int  `toml:"syn_flood_limit"`
+
+	// Port scan prevention (drops TCP packets with suspicious flag combinations)
+	PortScan    bool `toml:"port_scan"`
+	PortScanLog bool `toml:"port_scan_log"`
+
+	// Drop packets in INVALID conntrack state
+	InvalidPackets    bool `toml:"drop_invalid_packets"`
+	InvalidPacketsLog bool `toml:"drop_invalid_packets_log"`
+
+	// Drop IP fragments (common in evasion attacks)
+	Fragments    bool `toml:"drop_fragments"`
+	FragmentsLog bool `toml:"drop_fragments_log"`
+
+	// Bogon filter: drop packets from RFC-1918/loopback/link-local arriving on external interfaces
+	Bogons    bool `toml:"bogon_filter"`
+	BogonsLog bool `toml:"bogon_filter_log"`
+
+	// Connection limit per source IP
+	ConnectionLimit    bool `toml:"connection_limit_per_ip"`
+	ConnectionLimitMax int  `toml:"connection_limit_max"`
+
+	// TCP RST flood prevention
+	TCPRSTFlood      bool `toml:"tcp_rst_flood"`
+	TCPRSTFloodLog   bool `toml:"tcp_rst_flood_log"`
+	TCPRSTFloodLimit int  `toml:"tcp_rst_flood_limit"`
+
+	// Broadcast / multicast / anycast drop
+	DropBroadcast bool `toml:"drop_broadcast"`
+	DropMulticast bool `toml:"drop_multicast"`
+	DropAnycast   bool `toml:"drop_anycast"`
+
+	// General logging of blocked connections
+	LogBlocked      bool `toml:"log_blocked_connections"`
+	LogBlockedLimit int  `toml:"log_blocked_connections_limit"`
+
+	// Logging of blocklisted connections
+	LogBlocklist      bool `toml:"log_blocklist_connections"`
+	LogBlocklistLimit int  `toml:"log_blocklist_connections_limit"`
+
+	// Logging of connections a feed refuses, before the drop. One log rule per
+	// feed and address family, each with its own rate.
+	LogFeed      bool `toml:"log_feed_connections"`
+	LogFeedLimit int  `toml:"log_feed_connections_limit"`
+}
+
+// LogsAnything reports whether any of the eleven log switches is on. /blocked says
+// "nothing is switched on" when it is false, and TestLogsAnythingCountsEverySwitch
+// holds this to every `*_log` / `log_*` field by reflection.
+func (o FirewallOptions) LogsAnything() bool {
+	return o.SSHBruteForceLog || o.ICMPFloodLog || o.SYNFloodLog || o.TCPRSTFloodLog ||
+		o.PortScanLog || o.InvalidPacketsLog || o.FragmentsLog || o.BogonsLog ||
+		o.LogBlocklist || o.LogFeed || o.LogBlocked
+}
+
+// FirewallLimit describes one numeric option: what it is called, the range it
+// may hold, the value used when it is absent, and how to reach it in a
+// FirewallOptions.
+//
+// One table, because there were three and they disagreed. The options page
+// offered `max="9999"` on all nine fields, the JSON Schemas said 100, 1000,
+// 10000 and 100000 for five of them and nothing for the other four, and the
+// daemon had no upper bound at all — it checked only that an enabled module's
+// limit was positive. An HTML max is a hint to the browser and nothing more,
+// which is the same discovery that produced AcceptanceDurationMin/Max; these
+// nine were left behind by it.
+//
+// What the missing bound cost, measured against a real kernel. The limits are
+// handed to nftables expressions whose fields are 32 bits, so a large value does
+// not fail — it wraps:
+//
+//	connection_limit_max = 5000000000  ->  ct count over 705032704
+//	connection_limit_max = 4294967296  ->  ct count over 0           ← drops everything
+//	syn_flood_limit      = 3000000000  ->  limit rate over 3000000000/second burst 1705032704
+//
+// `ct count over 0` matches every connection from every source and drops it.
+// One number, entered on the options page or edited into easywall.toml, turns
+// the firewall into a total block — on a product whose first sentence is that it
+// cannot lock you out. The daemon logged nothing on any of the three.
+type FirewallLimit struct {
+	Key     string
+	Min     int
+	Max     int
+	Default int
+
+	// Enabled is the module switch this limit belongs to. A limit only has to be
+	// usable when its module is on.
+	Enabled func(*FirewallOptions) *bool
+	// Value is the limit itself.
+	Value func(*FirewallOptions) *int
+}
+
+// FirewallLimits is the one description of every numeric firewall option.
+//
+// The maxima are the ones the JSON Schemas already published where they had an
+// opinion, because those were considered and are what an operator's editor has
+// been enforcing. The four log limits had none: they are lines per minute, and
+// 10000 is 166 a second, which is far past what any disk wants and nowhere near
+// where the 32-bit fields wrap.
+var FirewallLimits = []FirewallLimit{
+	{"ssh_brute_force_connection_limit", 1, 100, 5,
+		func(o *FirewallOptions) *bool { return &o.SSHBruteForce },
+		func(o *FirewallOptions) *int { return &o.SSHBruteForceConnectionLimit }},
+	{"ssh_brute_force_log_limit", 1, 10000, 60,
+		func(o *FirewallOptions) *bool { return &o.SSHBruteForceLog },
+		func(o *FirewallOptions) *int { return &o.SSHBruteForceLogLimit }},
+	{"icmp_flood_connection_limit", 1, 1000, 10,
+		func(o *FirewallOptions) *bool { return &o.ICMPFlood },
+		func(o *FirewallOptions) *int { return &o.ICMPFloodConnectionLimit }},
+	{"icmp_flood_log_limit", 1, 10000, 60,
+		func(o *FirewallOptions) *bool { return &o.ICMPFloodLog },
+		func(o *FirewallOptions) *int { return &o.ICMPFloodLogLimit }},
+	{"syn_flood_limit", 1, 10000, 100,
+		func(o *FirewallOptions) *bool { return &o.SYNFlood },
+		func(o *FirewallOptions) *int { return &o.SYNFloodLimit }},
+	{"tcp_rst_flood_limit", 1, 10000, 100,
+		func(o *FirewallOptions) *bool { return &o.TCPRSTFlood },
+		func(o *FirewallOptions) *int { return &o.TCPRSTFloodLimit }},
+	{"connection_limit_max", 1, 100000, 100,
+		func(o *FirewallOptions) *bool { return &o.ConnectionLimit },
+		func(o *FirewallOptions) *int { return &o.ConnectionLimitMax }},
+	{"log_blocked_connections_limit", 1, 10000, 60,
+		func(o *FirewallOptions) *bool { return &o.LogBlocked },
+		func(o *FirewallOptions) *int { return &o.LogBlockedLimit }},
+	{"log_blocklist_connections_limit", 1, 10000, 60,
+		func(o *FirewallOptions) *bool { return &o.LogBlocklist },
+		func(o *FirewallOptions) *int { return &o.LogBlocklistLimit }},
+	{"log_feed_connections_limit", 1, 10000, 60,
+		func(o *FirewallOptions) *bool { return &o.LogFeed },
+		func(o *FirewallOptions) *int { return &o.LogFeedLimit }},
+}
+
+// InRange reports whether v is a value this limit may hold.
+func (l FirewallLimit) InRange(v int) bool { return v >= l.Min && v <= l.Max }
+
+// Clamp brings v into range, for the file path where refusing to start is the
+// worse outcome.
+func (l FirewallLimit) Clamp(v int) int { return min(max(v, l.Min), l.Max) }
+
+// AcceptanceConfig controls the two-step activation safety mechanism.
+type AcceptanceConfig struct {
+	Enabled  bool `toml:"enabled"`
+	Duration int  `toml:"duration"` // seconds before auto-rollback
+}
+
+// Bounds on the acceptance window. The settings page has advertised these as
+// the permitted range from the beginning — as an HTML min/max, which is a hint
+// to the browser and nothing more. The server took any positive number.
+//
+// Both ends matter. Below ten seconds the window closes before anyone can read
+// the confirmation page, let alone click it, so every apply rolls back and the
+// firewall can never be changed. Above an hour a lockout you have already
+// noticed keeps you shut out for the rest of it.
+const (
+	AcceptanceDurationMin = 10
+	AcceptanceDurationMax = 3600
+)
+
+// ValidAcceptanceDuration reports whether d is within the permitted range.
+func ValidAcceptanceDuration(d int) bool {
+	return d >= AcceptanceDurationMin && d <= AcceptanceDurationMax
+}
+
+// UsageIntervalDefault is how often the per-rule counters are read, in seconds,
+// when nothing says otherwise. Five minutes: "last used" needs a resolution
+// that does not depend on somebody opening the page, and a netlink read of one
+// chain every five minutes costs nothing measurable on the hardware this
+// product is written for.
+const UsageIntervalDefault = 300
+
+// UsageConfig controls how often the per-rule packet counters are read.
+type UsageConfig struct {
+	// Interval is seconds between counter reads. Unset means
+	// UsageIntervalDefault; 0 stops the ticker.
+	//
+	// A pointer for the same reason WebConfig.UpdateCheck is one: every
+	// installation upgrading from 2.14 has no [usage] section, and an int whose
+	// zero value means "off" would switch the feature off on all of them
+	// without anybody choosing it.
+	//
+	// 0 stops the *ticker* only. An apply still collects, because that call
+	// exists to keep the flush from destroying a number rather than to sample
+	// one — so a host with collection switched off still shows a Last used that
+	// advances at every apply, and configuration.md says exactly that instead of
+	// leaving it to be discovered.
+	Interval *int `toml:"interval"`
+}
+
+// The packet log's defaults. 12227 is easywall's web port: outside ulogd2's
+// conventional 0–2 and the small numbers a hand-written nflog rule reaches
+// for, and recognisable in a collision report. 20000 entries is ≈4 MB and ≈5.5
+// hours at the default 60 log lines a minute.
+const (
+	PacketLogGroupDefault   = 12227
+	PacketLogEntriesDefault = 20000
+	PacketLogEntriesMin     = 1000
+	PacketLogEntriesMax     = 200000
+)
+
+// PacketLogConfig is [packet_log]. Read once at start: the NFLOG group is bound
+// for the life of the process, so a SIGHUP reports a change and ignores it.
+type PacketLogConfig struct {
+	// Pointers for the reason UsageConfig.Interval is one: every installation
+	// upgrading from 2.20 has no [packet_log] section, and group 0 is exactly
+	// the group ulogd2 already holds.
+	Group   *int `toml:"nflog_group"`
+	Entries *int `toml:"entries"`
+	// Persist writes every entry to log_dir/packets.log as well, so the ring
+	// survives a restart. Off by default: the file holds IP addresses.
+	Persist bool `toml:"persist"`
+}
+
+// IPv6Mode says what the firewall does with IPv6 traffic.
+//
+// This replaces a boolean that could not express the question. `enabled = false`
+// was documented — in the interface, in its warning, and in configuration.md —
+// as "IPv6 traffic is not filtered at all". It did nothing of the sort: the
+// table is `inet`, so every rule and the drop policy still applied to IPv6 and
+// only the ICMPv6 exemptions were removed. IPv6 came out filtered *and* broken,
+// which was neither of the two things an operator might have wanted.
+type IPv6Mode string
+
+const (
+	// IPv6Filter applies every rule to IPv6 as well as IPv4, and permits the
+	// ICMPv6 types IPv6 needs to function. The default, and what almost
+	// everyone wants.
+	IPv6Filter IPv6Mode = "filter"
+
+	// IPv6Passthrough accepts all IPv6 before any other rule is consulted.
+	// For hosts where IPv6 is somebody else's problem — an upstream firewall,
+	// a cloud security group. easywall then protects IPv4 only.
+	IPv6Passthrough IPv6Mode = "passthrough"
+
+	// IPv6Block drops all IPv6 before any other rule is consulted, apart from
+	// loopback. For hosts that have no business speaking IPv6 at all.
+	IPv6Block IPv6Mode = "block"
+)
+
+// Valid reports whether m is a mode the core knows how to apply.
+func (m IPv6Mode) Valid() bool {
+	switch m {
+	case IPv6Filter, IPv6Passthrough, IPv6Block:
+		return true
+	default:
+		return false
+	}
+}
+
+// IPv6Config controls IPv6 support.
+type IPv6Config struct {
+	Mode IPv6Mode `toml:"mode" json:"mode"`
+
+	// Enabled is the pre-2.5.0 spelling, kept only so an existing config still
+	// loads. Config.Normalise translates it into Mode and it is not written
+	// back. Nothing should read it.
+	Enabled bool `toml:"enabled" json:"enabled"`
+
+	ICMPAllowRouterAdvertisement   bool `toml:"icmp_allow_router_advertisement" json:"icmp_allow_router_advertisement"`
+	ICMPAllowNeighborAdvertisement bool `toml:"icmp_allow_neighbor_advertisement" json:"icmp_allow_neighbor_advertisement"`
+}
+
+// RoutingMode says what the firewall does with traffic this host would route
+// rather than receive — between two interfaces, out of a container, into a
+// published container port.
+//
+// A three-way choice for the same reason IPv6Mode is one: the two useful
+// answers at the ends are "nothing is routed" and "routing is somebody else's
+// business", and between them sits the case most hosts actually have, which is
+// a named list. A boolean can express two of the three, and the one it drops is
+// the one a VPN gateway needs.
+//
+// This exists because the forward chain used to be a base chain with policy
+// drop and no rules in it, which is not neutrality: it destroyed every routed
+// packet, including ones another table's forward chain had already accepted,
+// and nothing in the configuration or the documentation mentioned it.
+type RoutingMode string
+
+const (
+	// RoutingClosed routes nothing beyond what Docker coexistence has allowed.
+	// The default, and what easywall has always done — a plain server routes
+	// nothing and loses nothing by it.
+	RoutingClosed RoutingMode = "closed"
+
+	// RoutingNetworks additionally lets the networks in RoutingConfig.Networks
+	// cross the forward chain, in either direction.
+	RoutingNetworks RoutingMode = "networks"
+
+	// RoutingOpen leaves routed traffic alone: the forward chain accepts, and
+	// easywall filters what arrives for this host only. For a router whose
+	// peers change — a VPN concentrator — where there is no list to write down.
+	RoutingOpen RoutingMode = "open"
+)
+
+// Valid reports whether m is a mode the core knows how to apply.
+func (m RoutingMode) Valid() bool {
+	switch m {
+	case RoutingClosed, RoutingNetworks, RoutingOpen:
+		return true
+	default:
+		return false
+	}
+}
+
+// RoutingConfig controls what crosses the forward chain.
+type RoutingConfig struct {
+	Mode RoutingMode `toml:"mode" json:"mode"`
+
+	// Networks are the networks allowed across, consulted under
+	// RoutingNetworks. Traffic with a source or a destination inside one of
+	// them may cross; everything else still meets the drop policy.
+	Networks []string `toml:"networks" json:"networks"`
+}
+
+// DockerConfig controls Docker coexistence mode.
+type DockerConfig struct {
+	Enabled             bool     `toml:"enabled"`               // auto-detect Docker bridges
+	AllowBridgeNetworks bool     `toml:"allow_bridge_networks"` // allowlist detected bridge networks
+	CustomNetworks      []string `toml:"custom_networks"`       // additional networks to allowlist
+
+	// PublishedPorts decides what happens to traffic this host forwards to a
+	// container. "open" is Docker's business, which is what it has always been;
+	// "filtered" means only a forwarded port rule lets anything in.
+	//
+	// Anything unrecognised reads as "open". The safe direction is the one that
+	// leaves containers reachable: a typo that silently closed every published
+	// port would be 2.5.0 with a spelling mistake in front of it.
+	PublishedPorts string `toml:"published_ports"`
+}
+
+const (
+	// PublishedPortsOpen: Docker decides who reaches a published port.
+	PublishedPortsOpen = "open"
+	// PublishedPortsFiltered: only a forwarded port rule lets anything in.
+	PublishedPortsFiltered = "filtered"
+)
+
+// FiltersPublishedPorts reports whether the forward chain takes verdicts on
+// traffic arriving from outside for a container address.
+func (d DockerConfig) FiltersPublishedPorts() bool {
+	return d.PublishedPorts == PublishedPortsFiltered
+}
+
+// CoreConfig is the full configuration for easywall-core.
+type CoreConfig struct {
+	Firewall   FirewallOptions  `toml:"firewall"`
+	Acceptance AcceptanceConfig `toml:"acceptance"`
+	Usage      UsageConfig      `toml:"usage"`
+	PacketLog  PacketLogConfig  `toml:"packet_log"`
+	IPv6       IPv6Config       `toml:"ipv6"`
+	Docker     DockerConfig     `toml:"docker"`
+	Routing    RoutingConfig    `toml:"routing"`
+	SocketPath string           `toml:"socket_path"`
+	DataDir    string           `toml:"data_dir"`
+	LogDir     string           `toml:"log_dir"`
+}
+
+// TLSConfig controls TLS certificate settings for the web server.
+//
+// Three sources of a certificate, and they are mutually exclusive: nothing set
+// means a self-signed pair easywall generates and renews in ssl_dir; CertFile
+// and KeyFile mean a pair the operator owns and easywall only reloads; ACME
+// means autocert fetches and renews one for Hostname.
+type TLSConfig struct {
+	CertFile string `toml:"cert"` // path to custom cert (empty = auto-generate)
+	KeyFile  string `toml:"key"`  // path to custom key (empty = auto-generate)
+
+	// Hostname is the name this installation is reached by. It has two
+	// consumers and it is one field on purpose: it is the domain ACME issues
+	// for, and it is the WebAuthn Relying Party ID. Two settings that must
+	// agree is one setting that will not.
+	//
+	// Empty is the normal case for an installation reached at
+	// https://192.168.1.10:12227, and it means both features are unavailable
+	// rather than misconfigured.
+	Hostname string `toml:"hostname"`
+
+	// ACME turns on certificate issuance through Let's Encrypt (or whatever
+	// ACMEDirectory names). HTTP-01 only, which means a listener on port 80 —
+	// see internal/web/acme.go.
+	ACME bool `toml:"acme"`
+
+	// ACMEEmail is optional and reaches the CA, which uses it for expiry
+	// warnings. Empty registers an account without one.
+	ACMEEmail string `toml:"acme_email"`
+
+	// ACMEAgreeTOS is the operator agreeing to the CA's subscriber agreement.
+	// Required, and deliberately not defaulted: autocert.AcceptTOS would make
+	// easywall accept a third party's legal terms for somebody who never read
+	// them.
+	ACMEAgreeTOS bool `toml:"acme_agree_tos"`
+
+	// ACMEDirectory overrides the directory URL. Empty is Let's Encrypt
+	// production. Its reason for existing is the Pebble integration test; an
+	// operator may also point it at the staging endpoint while getting the
+	// DNS and the port right, which is the friendlier way to hit the rate
+	// limit that exists for exactly that mistake.
+	ACMEDirectory string `toml:"acme_directory"`
+}
+
+// WebConfig is the full configuration for easywall-web.
+type WebConfig struct {
+	BindAddr   string    `toml:"bind_addr"` // e.g. "0.0.0.0:12227"
+	SocketPath string    `toml:"socket_path"`
+	SSLDir     string    `toml:"ssl_dir"`
+	DataDir    string    `toml:"data_dir"` // the data directory; this process's state is in <data_dir>/web
+	TLS        TLSConfig `toml:"tls"`
+	Language   string    `toml:"language"`    // default locale, e.g. "en"
+	SessionKey string    `toml:"session_key"` // HMAC key for gorilla/sessions
+	Username   string    `toml:"username"`
+	Password   string    `toml:"password"` // argon2id hash
+
+	// TOTPSecret is the base32 shared secret for the single account's second
+	// factor, empty when no factor is enrolled. It is written by the interface
+	// and read on every login.
+	//
+	// In web.toml rather than in data_dir because it belongs with the credential
+	// it strengthens: the way back from a lost phone is editing this file, and
+	// an operator who has been told "edit web.toml" must find everything that
+	// stands between them and the interface in the one place they were sent to.
+	TOTPSecret string `toml:"totp_secret"`
+
+	// RecoveryCodes holds the argon2id hashes of the eight one-time codes, never
+	// the codes themselves. They are shown once, at enrolment, and one is removed
+	// from this list each time it is used.
+	RecoveryCodes []string `toml:"recovery_codes"`
+
+	// UpdateCheck controls whether the dashboard asks the GitHub releases API
+	// for the newest version. Unset means on, and on an isolated network it is a
+	// request an operator may reasonably want gone entirely rather than merely
+	// failing quietly.
+	//
+	// One of the six requests easywall can make. The others are Telemetry
+	// below, a notification to NotifyURL, the feeds switched on in Rules.Feeds,
+	// CountryLookup's archive, and autocert fetching a certificate when
+	// TLSConfig.ACME is on. CountryLookup is on by default, like this one; the
+	// other four are off unless switched on. The notification and an own feed
+	// are the two whose destination easywall does not name.
+	// docs/_docs/security.md lists all six.
+	UpdateCheck *bool `toml:"update_check"`
+
+	// Telemetry records whether the operator agreed to easywall counting this
+	// installation. Unset means no: consent is asked for, never assumed.
+	//
+	// When it is on, shared.Reporter sends one request a day carrying a random
+	// identifier generated on the machine and the version, and nothing else. The
+	// System page turns it off again without the core being reachable, because
+	// consent you can only withdraw while another process is up is not consent.
+	Telemetry *bool `toml:"telemetry" json:"telemetry"`
+
+	// NotifyKind selects the notification transport: "webhook", "ntfy", or ""
+	// for off. Flat top-level keys rather than a [notifications] table because
+	// mergeConfig — the in-place editor that keeps this file's comments — skips
+	// every table wholesale, and these six are keys the interface writes.
+	NotifyKind string `toml:"notify_kind"`
+	// NotifyURL is where the notification is posted. Operator-chosen, so it is
+	// the first outbound destination easywall does not name itself.
+	NotifyURL string `toml:"notify_url"`
+
+	// The four triggers, all off unless switched on — the same posture as
+	// Telemetry, for the same reason: a request that leaves the host is asked
+	// for, never assumed.
+	NotifyOnRolledBack   bool `toml:"notify_on_rolled_back"`
+	NotifyOnAccepted     bool `toml:"notify_on_accepted"`
+	NotifyOnPanic        bool `toml:"notify_on_panic"`
+	NotifyOnFailedLogins bool `toml:"notify_on_failed_logins"`
+
+	// DemoMode runs the web binary against an in-memory mock instead of the
+	// Unix socket — no easywall-core required. Used by the public demo
+	// deployment so visitors can explore every page without affecting any
+	// real firewall. State resets when the process restarts.
+	DemoMode bool `toml:"demo_mode"`
+
+	// CountryLookup names, on /blocked, the country each refused source
+	// address is registered to (2.27). On, this process downloads ipverse's
+	// release archive once a day, a request that leaves the host; false makes
+	// none. A plain bool, but it ships true: an absent key decodes to false, so
+	// LoadConfig restores the shipped value for a file that predates the key.
+	CountryLookup bool `toml:"country_lookup"`
+
+	// TrustedProxies lists the addresses and networks whose forwarding header
+	// may be believed. Empty — the default — means no header's value is ever
+	// read and the TCP peer stays authoritative, which is 2.12's behaviour
+	// exactly and what TestTheEmptyListIsTwoPointTwelve holds to.
+	//
+	// A list and never a boolean. "Trust the header" is the vulnerability
+	// GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp and GHSA-9g5q-2w5x-hmxf
+	// describe, and docs-tech/threat-model.md says so in those words.
+	//
+	// Being on this list is total trust in that peer: it chooses the address
+	// easywall records, verdicts on, and rate limits. Listing a network wider
+	// than the proxies it holds hands that choice to anything that can reach
+	// the port from inside it.
+	TrustedProxies []string `toml:"trusted_proxies"`
+
+	// HealthAllow lists the addresses and networks that may read /healthz —
+	// the one route on this process that answers without a session, because an
+	// orchestrator holds none. Absent means the loopback default; an explicitly
+	// empty list means nobody, which is how an operator turns the endpoint off.
+	//
+	// It is not TrustedProxies and shares nothing with it but the parser. This
+	// list decides whether an unauthenticated endpoint answers at all, and it is
+	// matched against the TCP peer only — never against a forwarding header, or
+	// anything behind a trusted proxy could claim to be loopback by writing one.
+	// See handleHealthz and docs-tech/threat-model.md.
+	HealthAllow []string `toml:"health_allow"`
+}
+
+// NetworkSettings groups the IPv6, Docker and routing configuration for IPC
+// transport. These are the three questions the Network page asks, and an apply
+// needs all of them at once.
+type NetworkSettings struct {
+	IPv6    IPv6Config    `json:"ipv6"`
+	Docker  DockerConfig  `json:"docker"`
+	Routing RoutingConfig `json:"routing"`
+}
+
+// AppliedConfig is the configuration that went into the kernel with the rules
+// that are in it. The core stores it whenever nft.Apply succeeds; the web
+// process compares it against what is configured now to answer the half of
+// "what changes" that the rule diff cannot see.
+type AppliedConfig struct {
+	Firewall FirewallOptions `json:"firewall"`
+	Network  NetworkSettings `json:"network"`
+}
+
+// AppliedConfigResult is the reply to GET_APPLIED_CONFIG. Recorded is false on
+// an installation that has not applied or restarted since 2.10, and that state
+// means *unknown*, not *identical*: nothing is reported as pending on the
+// strength of a file that is not there.
+type AppliedConfigResult struct {
+	Recorded bool          `json:"recorded"`
+	Config   AppliedConfig `json:"config"`
+}
+
+// RuleUsage is what one port rule has carried, and what the daemon needs to
+// keep booking it correctly across restarts and applies.
+//
+// It is both the stored record and the reply to GET_USAGE. The baseline fields
+// travel with it because they have to be in the file, and they are harmless on
+// the wire — the interface reads LastSeen and nothing else.
+type RuleUsage struct {
+	Packets uint64 `json:"packets"`
+	Bytes   uint64 `json:"bytes"`
+
+	// FirstSeen is the first interval in which this rule carried anything, and
+	// LastSeen the most recent one. Zero means never observed — which is not the
+	// same as a rule with no id, and the interface says so with a different word.
+	FirstSeen time.Time `json:"first_seen,omitzero"`
+	LastSeen  time.Time `json:"last_seen,omitzero"`
+
+	// KernelPackets and KernelBytes are the last values read out of the kernel:
+	// the baseline the next delta is measured from.
+	//
+	// Persisted, not held in memory, and that is the whole point of the field. A
+	// baseline that started at zero on every start would make the first collect
+	// after a restart re-count every packet already booked before it — a port
+	// that saw one packet a month ago reporting as busy today.
+	// TestUsageStore_ADaemonRestartDoesNotDoubleCount is what holds it.
+	//
+	// The claim here used to be "the nftables table outlives the daemon", which
+	// is narrower than it sounds: Daemon.Start calls RestoreCurrent
+	// unconditionally, so on the ordinary restart the table is rebuilt and its
+	// counters are back at zero. What prevents the double count on that path is
+	// Collect's below-baseline branch. The persistence is load-bearing for the
+	// paths where the table really does survive — a daemon that crashed or was
+	// stopped and started while the rules stayed live, and a boot restore that
+	// failed — and it is the cheaper of the two guarantees to keep, since a
+	// baseline in a struct field would need both branches to be right.
+	KernelPackets uint64 `json:"kernel_packets"`
+	KernelBytes   uint64 `json:"kernel_bytes"`
+}
+
+// UsageResult is the reply to GET_USAGE: what every rule has carried, keyed by
+// rule id, and when the figures were last read out of the kernel.
+type UsageResult struct {
+	Usage       map[string]RuleUsage `json:"usage"`
+	CollectedAt time.Time            `json:"collected_at,omitzero"`
+}
+
+// SelftestResult is the outcome the self-test recorded: whether it ran and what
+// it found, or that it could not run at all. See spec §4.
+type SelftestResult string
+
+const (
+	SelftestPassed     SelftestResult = "passed"
+	SelftestFailed     SelftestResult = "failed"
+	SelftestUnprovable SelftestResult = "unprovable"
+)
+
+// SelftestStamp is what the self-test proved, and against what. Version and
+// Kernel are the pair a rerun is skipped on — see StampStore.Stale for why
+// both must match. See spec §4.
+type SelftestStamp struct {
+	Version string         `json:"version"`
+	Kernel  string         `json:"kernel"`
+	Result  SelftestResult `json:"result"`
+	At      time.Time      `json:"at"`
+	Detail  string         `json:"detail"`
+}
+
+// HealthState is the answer GET_HEALTH gives, and the exit code
+// `easywall-core health` maps onto: ok → 0, degraded → 1, fail → 2.
+//
+// Three values, not a boolean, because "the firewall is up" and "the firewall
+// is doing what it says" are different claims and this release exists because
+// they were conflated. For five releases the input chain's
+// `ct state established,related accept` matched no packet — the conntrack masks
+// were byte-reversed — so the stateful half enforced nothing while every
+// surface reported the firewall active. A boolean has nowhere to put that.
+type HealthState string
+
+const (
+	HealthOK       HealthState = "ok"
+	HealthDegraded HealthState = "degraded"
+	HealthFail     HealthState = "fail"
+)
+
+// HealthReason names which fact decided the state. A closed enum, never free
+// text, for the same reason ReachReason is one: this ends up on a page and in
+// two locale files, and a sentence assembled in Go cannot be translated.
+type HealthReason string
+
+const (
+	HealthReasonNotEnforcing   HealthReason = "not_enforcing"
+	HealthReasonPanic          HealthReason = "panic"
+	HealthReasonStatefulDead   HealthReason = "stateful_dead"
+	HealthReasonBuildFindings  HealthReason = "build_findings"
+	HealthReasonSelftestFailed HealthReason = "selftest_failed"
+	HealthReasonHealthy        HealthReason = "healthy"
+
+	// HealthReasonCoreUnreachable is the only reason the *web* process
+	// originates, and it exists because not_enforcing would have been a lie.
+	//
+	// The two are claims about different things. not_enforcing is a claim about
+	// the kernel — computeHealth read the ruleset and found the input chain not
+	// filtering. core_unreachable is a claim about the socket: the web process
+	// asked and got no answer, and it has no path to netlink to check for
+	// itself. That is the whole design — a bug in form parsing is not a firewall
+	// bug — and it cuts both ways: the unprivileged half is never entitled to
+	// report on the kernel, only on whether it could reach the half that is.
+	//
+	// The kernel may well still be filtering perfectly behind a core that
+	// crashed, and saying otherwise on an unauthenticated endpoint, in the
+	// release whose subject is not making false claims about the firewall, is
+	// the one thing this release cannot ship.
+	//
+	// It is still fail, and /healthz still answers 503: a live web process in
+	// front of a dead core is exactly the half-dead container
+	// docker/entrypoint.sh:12-18 records, and an orchestrator must restart it.
+	// What changes is what the operator is told, not what the orchestrator does.
+	HealthReasonCoreUnreachable HealthReason = "core_unreachable"
+)
+
+// AllHealthReasons is the complete list, and it is what the interface's guard
+// hangs off: both locale files must label every one of these. AllReachReasons
+// exists for the same reason and is checked the same way.
+//
+// Six of the seven come out of computeHealth in the core. core_unreachable is
+// the exception — handleHealthz produces it, because it is the one answer the
+// core cannot give about itself — and TestEveryHealthReasonIsListed names that
+// exception rather than dropping the reverse check for everything.
+var AllHealthReasons = []HealthReason{
+	HealthReasonNotEnforcing, HealthReasonPanic, HealthReasonStatefulDead,
+	HealthReasonBuildFindings, HealthReasonSelftestFailed, HealthReasonHealthy,
+	HealthReasonCoreUnreachable,
+}
+
+// HealthSelftest is the self-test stamp as the *health reply* carries it: what
+// was proven, against which version and kernel, and when.
+//
+// Deliberately not SelftestStamp itself, and this is the whole reason the type
+// exists. SelftestStamp.Detail is free text written by the proof — "an open
+// port accepts a connection — port 12227 was dropped" — and it names a port
+// number and the claim that failed. HealthResult is rendered by /healthz, which
+// is unauthenticated by necessity because an orchestrator holds no session, so
+// embedding the stamp would publish which of an operator's ports the firewall
+// is currently getting wrong to anyone who can reach the endpoint.
+//
+// Detail is not lost: it goes to the audit log and to `easywall-core selftest`,
+// both of which are local to the host. Not to `easywall-core health` — that
+// subcommand renders a HealthResult, which is this reduced type by definition,
+// so there is no detail there for it to print. The exclusion is the reason, not
+// an oversight in the console: a reader who takes this comment as naming
+// `health` will conclude the field ought to be reachable from HealthResult and
+// "fix" the very thing /healthz depends on.
+//
+// TestHealthResultCarriesNoRuleDetail is what keeps this type reduced — adding a
+// field back to it turns that test red.
+//
+// Every field is omitempty or omitzero, on one principle: an empty field where
+// a value belongs is a claim, and absence is not.
+//
+// Version and Result carried neither until the review. A fresh container — the
+// normal state of every Docker deployment, where nothing runs the proof —
+// rendered {"version":"","result":""}: two empty enum values invented by the
+// JSON alone, where `easywall-core health` words that state as "never recorded"
+// and the dashboard omits the fact entirely. A monitoring script written from
+// features/health.md's documented example switches on selftest.result and meets
+// an undocumented fourth value.
+//
+// The kernel is separately not rendered by /healthz at all — writeHealth drops
+// it — and stays here because the authenticated dashboard reads the same reply.
+type HealthSelftest struct {
+	Version string `json:"version,omitempty"`
+	// The demo has no kernel to name: internal/web cannot reach the privileged
+	// core.KernelRelease() — it imports internal/core nowhere, by design — so
+	// the demo's unprovable stamp carries the zero value where a real host's
+	// unprovable stamp carries a release.
+	Kernel string         `json:"kernel,omitempty"`
+	Result SelftestResult `json:"result,omitempty"`
+	At     time.Time      `json:"at,omitzero"`
+}
+
+// HealthResult is what GET_HEALTH answers with: the state, a closed
+// translatable reason, and the stamp's identity.
+//
+// No rule detail, no counter values, no finding text. See HealthSelftest.
+type HealthResult struct {
+	State    HealthState    `json:"state"`
+	Reason   HealthReason   `json:"reason"`
+	Selftest HealthSelftest `json:"selftest"`
+}
+
+// SystemSettings groups the acceptance window configuration for IPC transport.
+type SystemSettings struct {
+	Acceptance AcceptanceConfig `json:"acceptance"`
+}
+
+// AuditLogEntry is a single parsed line from the audit log.
+type AuditLogEntry struct {
+	Time     string `json:"time"`
+	Action   string `json:"action"`
+	RuleType string `json:"rule_type"`
+	Detail   string `json:"detail"`
+	User     string `json:"user"`
+}
+
+// AcceptanceStatus represents the current state of a two-step activation cycle.
+type AcceptanceStatus string
+
+const (
+	AcceptanceIdle       AcceptanceStatus = "idle"
+	AcceptancePending    AcceptanceStatus = "pending"
+	AcceptanceAccepted   AcceptanceStatus = "accepted"
+	AcceptanceRolledBack AcceptanceStatus = "rolled_back"
+)
+
+// FirewallStatus is returned by the core daemon for dashboard display.
+type FirewallStatus struct {
+	Active     bool             `json:"active"`
+	Acceptance AcceptanceStatus `json:"acceptance"`
+	HasPending bool             `json:"has_pending"`
+	LastApply  string           `json:"last_apply"` // RFC3339 timestamp or empty
+	// Panic is true while this installation is deliberately unfiltered. It is
+	// carried in the status rather than read from disk by the web process
+	// because only the core knows where its data directory is — the two may be
+	// configured apart — and because the interface has to show it on every page.
+	Panic bool `json:"panic"`
+	// AcceptanceRemaining is whole seconds left in the open window, 0 when none
+	// is open.
+	//
+	// Relative rather than an absolute instant, on purpose. An absolute deadline
+	// is read against the browser's clock, and the machines a firewall is
+	// administered from are exactly the ones whose clocks drift — a Pi with no
+	// RTC, a laptop that just changed timezone, a VPN client. A relative count
+	// cannot be wrong about a clock it never crosses. The browser ticks locally
+	// between polls and takes this number as the correction on each one.
+	AcceptanceRemaining int `json:"acceptance_remaining"`
+	// AcceptanceReason is why the window ended, empty while one is open or when
+	// none has run. It exists because "rolled back" is one status for two very
+	// different events, and the interface said "the window closed without a
+	// confirmation" to an operator who had just ended it by hand — on the screen
+	// whose whole argument is that it says what is true.
+	AcceptanceReason string `json:"acceptance_reason"`
+	// AcceptanceEnabled says whether a window is configured at all, as opposed
+	// to whether one is open now.
+	//
+	// Without it, `acceptance: idle` is two states in one word — no window open
+	// at this moment, and no window that will ever open — and a script polling
+	// the status reported the first while its host was in the second, ten times
+	// over, with nothing in the status able to tell it apart.
+	AcceptanceEnabled bool `json:"acceptance_enabled"`
+	// UnknownBridges are Docker networks that exist now and are not in the
+	// rules in force — created after the last apply (spec 2.24 D5). What that
+	// means depends on routing.mode: more closed than intended under closed
+	// or networks, less under open. A warning, not a health state: the
+	// firewall enforces the ruleset it says it enforces, and one apply fixes it.
+	UnknownBridges []UnknownBridge `json:"unknown_bridges,omitempty"`
+}
+
+// UnknownBridge is one Docker bridge with networks the rules in force do not
+// name.
+type UnknownBridge struct {
+	Interface string   `json:"interface"`
+	CIDRs     []string `json:"cidrs"`
+}
+
+// CIDRList is the networks as one line, for the status line and the dashboard.
+func (b UnknownBridge) CIDRList() string { return strings.Join(b.CIDRs, ", ") }
+
+// FiltersHost reports whether this rule belongs in the input chain.
+//
+// Asked rather than compared, in both the rule builder and the interface, so
+// that "what does an empty scope mean" has one answer in one place.
+func (r PortRule) FiltersHost() bool {
+	return r.Scope == "" || r.Scope == ScopeHost || r.Scope == ScopeBoth
+}
+
+// FiltersForwarded reports whether this rule belongs in the forward chain.
+func (r PortRule) FiltersForwarded() bool {
+	return r.Scope == ScopeForwarded || r.Scope == ScopeBoth
+}

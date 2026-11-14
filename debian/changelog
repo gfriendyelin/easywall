@@ -1,0 +1,866 @@
+easywall (2.29.2) unstable; urgency=medium
+
+  * What an audit turned up: a rollback undoes option and network changes,
+    blocklist, feeds and countries refuse forwarded traffic, port forwarding
+    matches only local destinations, 2FA budgets hold under parallel requests.
+  * Image rebuilt on Python 3.14.10 (CVE-2026-115557).
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Fri, 30 Oct 2026 10:00:00 +0100
+
+easywall (2.29.1) unstable; urgency=medium
+
+  * Built with Go 1.27.3: crypto/x509 distrusts compromised intermediate
+    certificates (GO-2026-6809).
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Sun, 25 Oct 2026 20:30:00 +0100
+
+easywall (2.29.0) unstable; urgency=low
+
+  * Which lists, and which country: /blocked filters by country over the whole
+    log; blocklist.de's SSH list is recommended and its full list is not.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Thu, 15 Oct 2026 19:30:00 +0200
+
+easywall (2.28.0) unstable; urgency=low
+
+  * An update asks once: while counting is off, the dashboard asks after each
+    minor or major update whether this installation may be counted.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Thu, 15 Oct 2026 18:30:00 +0200
+
+easywall (2.27.1) unstable; urgency=low
+
+  * /blocked shows each country with its flag; the name opens on a tap and
+    reads in full on a phone. The row action reads "Block country".
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Thu, 15 Oct 2026 12:48:06 +0200
+
+easywall (2.27.0) unstable; urgency=medium
+
+  * Where it comes from: a Country column on Blocked, from ipverse's dataset
+    loaded once a day by easywall-web, and a Block XX row action.
+  * New outbound request to GitHub, on by default; switch it off with
+    country_lookup = false (also for hosts that set update_check = false).
+  * easywall-web warns at start about web.toml keys it does not read.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Wed, 14 Oct 2026 19:10:07 +0200
+
+easywall (2.26.0) unstable; urgency=medium
+
+  * Countries: block the networks registered to a country, each switched on
+    by itself on the Blocklist page, at most 30, refreshed daily from
+    ipverse/country-ip-blocks.
+  * Apply waits until a country switched on has its first copy.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Wed, 14 Oct 2026 09:32:39 +0200
+
+easywall (2.25.2) unstable; urgency=medium
+
+  * /blocked's live tail asks for new rows only and gets 204 when there
+    are none, instead of resending the whole table every five seconds.
+  * The tail says when and why it is paused; Pause and Resume added.
+  * New rows are marked until the next ones arrive.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Wed, 14 Oct 2026 09:00:00 +0200
+
+easywall (2.25.1) unstable; urgency=high
+
+  * A core that died inside the acceptance window no longer comes back
+    enforcing the unconfirmed set; the last confirmed set is restored.
+  * PANIC and RESUME are accepted from root only.
+  * A failed upgrade no longer leaves the services disabled; maintainer
+    scripts carry #DEBHELPER# and handle abort-upgrade.
+  * easywall-web starts while the core is stopped.
+  * Saving a long list no longer empties it.
+  * Go 1.27.2 (GO-2026-6617).
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Tue, 13 Oct 2026 08:30:00 +0200
+
+easywall (2.25.0) unstable; urgency=medium
+
+  * Pings are answered in IPv4 and IPv6, behind a new switch that is on by
+    default (Options, Answer pings; [firewall] icmp_allow_echo_request).
+    An upgraded host answers IPv4 pings from now on.
+  * The stateless ICMP accepts the return-traffic rule already covered are
+    gone: ICMPv4 0, 3, 11, 12 and ICMPv6 1-4, 129.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Sun, 27 Sep 2026 22:18:09 +0200
+
+easywall (2.24.1) unstable; urgency=medium
+
+  * A port Docker publishes on loopback is no longer named as having no
+    forwarded rule: the host's own connection never crosses the forward
+    chain.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Sat, 26 Sep 2026 20:00:00 +0200
+
+easywall (2.24.0) unstable; urgency=medium
+
+  * A Docker bridge's IPv6 networks are detected and forwarded like its
+    IPv4 ones; a container reachable on IPv6 needed 2.24.
+  * A Docker network the rules in force do not know is named on the
+    dashboard and by easywall-core status.
+  * The published-port check reads ip6 DNAT too.
+  * ipv6.mode = "block" also keeps IPv6 away from containers.
+  * Fix: the published-port warning named nothing on hosts where Docker
+    uses its default iptables backend (since 2.20.1) — iptables-nft
+    writes DNAT as an xtables target the check did not read.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Sat, 26 Sep 2026 12:00:00 +0200
+
+easywall (2.23.2) unstable; urgency=medium
+
+  * /blocklist's feeds are a table, one row per list, and own feeds one
+    row each.
+  * /options is one row per protection, in a card per group.
+  * /blocked's filters sit inside the card, under its title.
+  * The sidebar groups Blocked and Audit Log under Activity.
+  * The demo is entered with a button; it has no password form.
+  * /options says fragment drop also breaks VPN tunnels (WireGuard).
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Fri, 25 Sep 2026 23:45:00 +0200
+
+easywall (2.23.1) unstable; urgency=medium
+
+  * Fix: an apply with more than about a hundred kernel rules failed with
+    "no buffer space available" (since at least 2.22; about 107 without
+    feeds, about 96 with four curated feeds). The core now sizes both netlink socket buffers for
+    every write from what it sends.
+  * Fix: a failed apply no longer claims nothing was written to the kernel
+    when the kernel had committed it.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Fri, 25 Sep 2026 22:00:00 +0200
+
+easywall (2.23.0) unstable; urgency=medium
+
+  * Breaking: the blocklist's kernel log prefix is "easywall blocklist: ".
+    Anything that greps the kernel log or packets.log for the old prefix
+    finds nothing new.
+  * Breaking: 2.22 reads a rules.json written by 2.23 as an empty blocklist
+    and allowlist. Export the rules before upgrading if you might go back.
+  * New: eight curated feeds and up to three own feeds by URL, each
+    switched on individually, all off by default, checked after the
+    allowlist. Only the web process downloads; the core checks every list
+    it is sent and keeps the last good copy.
+  * New: UPDATE_FEED and GET_FEEDS on the socket; /apply names a feed that
+    holds your own address; /blocked names the feed that dropped a packet;
+    log_feed_connections and its limit.
+  * Change: the two lists are called blocklist and allowlist everywhere.
+    Old routes redirect, old TOML keys are still read with a warning, and
+    rules.json and exports are read in either spelling.
+  * Change: an apply is one kernel transaction; a refused apply leaves the
+    old rules live instead of an empty table.
+  * Change: the socket limit is 8 MiB each way, from 1 MiB.
+  * Change: an apply or resume can be refused for a moment while a feed
+    refresh holds the apply slot; try again.
+  * Fix: the guard against tracked personal addresses was red from the
+    release's first commit; the research notes no longer quote one.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Fri, 25 Sep 2026 20:00:00 +0200
+
+easywall (2.22.0) unstable; urgency=medium
+
+  * Security: whoever finished /firstrun first owned the firewall, Docker
+    and Debian alike. easywall-web now prints a 160-bit setup token once at
+    start (docker compose logs, the journal); step 1 of /firstrun refuses
+    without it, checked before the password is hashed.
+  * Security: an anonymous POST /firstrun cost a 64 MiB Argon2id hash before
+    any proof of host access; the token check now runs first.
+  * Security: the web user could make the root core write anywhere.
+    /var/lib/easywall is root's now (0750); the web process keeps its own
+    state in data_dir/web, and both install paths migrate the old layout
+    automatically.
+  * New: easywall-web -healthcheck loads the configuration and asks the
+    address bind_addr names, including a zoned IPv6 bind. The container's
+    HEALTHCHECK and docker-compose.yml use it instead of a hardcoded
+    127.0.0.1.
+  * New: every switch on /options says what it breaks — protects against,
+    can break, turn it on if — with a link to its section of filters.md. A
+    card above the grid names what a public server, a home network behind
+    NAT, and a container host each want.
+  * New: the packet log records an ICMP packet's type and code, so a
+    blocked ICMP row can say what kind of packet it was.
+  * New: a default-drop row on /blocked now says why — port not open, IPv4
+    pings not answered, ICMP type not accepted. A module row's chip links
+    to that option's card on /options.
+  * Changed: docker.enabled = true is the default in a new easywall.toml;
+    an existing file keeps what it already says.
+  * Changed: the compose mount moved from ./config to ./easywall-config, so
+    the account no longer lives in a git-tracked directory. Upgrading a git
+    checkout from 2.21 or earlier needs this once, before pulling: docker
+    compose down; sudo mv config easywall-config && sudo rm -f
+    easywall-config/embed.go; git checkout -- config && git pull; docker
+    compose up -d.
+  * Fix: a signed-out htmx request swapped /login into /blocked's table; it
+    now gets 401 with HX-Redirect instead.
+  * Fix: fragment drop, ICMP flood and TCP RST flood acted on almost no
+    traffic — fragment drop matched nothing in the input chain, and both
+    meters sat behind the established-connection accept. All three now act
+    on real traffic; fragment drop can now break a UDP reply too large for
+    one packet, most visibly DNSSEC, and stays off by default.
+  * Fix: the lockout check ignored a port rule that only filters forwarded
+    traffic, so it read as reachable on /apply when it was not.
+  * Fix: an IPv4-mapped network (::ffff:10.0.0.0/104) failed every apply
+    with EINVAL; it is now read as the IPv4 network it names.
+  * Fix: debian/control did not depend on adduser, which postinst calls.
+  * Fix: Docker's documentation gained the pages Debian always had —
+    recovery, remote access, passkeys, module loading, a corrected
+    X-Forwarded-For claim, and a corrected compose health check.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Thu, 24 Sep 2026 20:00:00 +0200
+
+easywall (2.21.1) unstable; urgency=medium
+
+  * Fix: a row on /blocked offered whitelist, blacklist or open-the-port even
+    where the input chain could not have let the packet through them — "Open
+    3389" on a port-scan row invited the scanner. Each row now offers only
+    what the chain order (modules, blacklist, whitelist, ports, final drop)
+    lets it change.
+  * Fix: the live tail moved rows under the pointer and dropped keyboard
+    focus every poll. It now pauses while the pointer or keyboard focus is
+    inside the table, says so in the toolbar, and catches up at the next
+    poll, within five seconds of leaving it.
+  * Fix: row actions rested at 55% opacity, measuring under the 4.5:1 WCAG AA
+    text contrast needs; they now rest at a muted ink colour at full opacity
+    and return to full ink on row hover or focus.
+  * Fix: German said Whitelist/Blacklist on /blocked and the apply screen,
+    Erlaubnisliste/Sperrliste everywhere else. Both terms are now unified.
+  * Fix: "Log blocked" and "Log blacklist" still said they write to the
+    system log; both now say the entries show on the Blocked page.
+  * Fix: the /blocked filter form put empty fields in the URL and an
+    unreadable filter cleared what was typed. A readable filter now
+    redirects once to its canonical query; an unreadable one keeps every
+    field visible and marks the one at fault.
+  * Fix: the header's staged count and the apply screen's count could
+    disagree; both now read the same total from the same preview.
+  * Fix: the demo's refused packets came from networks its own blacklist and
+    whitelist already covered, so acting on a row never changed anything
+    visible. Demo sources no longer overlap the demo's own lists.
+  * Fix: a container recreated without /var/log/easywall mounted lost its
+    audit log to a fresh, empty anonymous volume with nothing said. docker.md
+    now names the three paths that must persist, and easywall-core warns at
+    start when the log looks lost.
+  * Fix: a /blocked card at phone width broke addresses and ports
+    mid-number, and a German button ran into Details.
+  * Fix: the status could report live rules with no acceptance window
+    during an apply: Status() read the window before the kernel, whose query
+    waits on the lock the write holds. In since 2.14.
+  * Fix: the German IPv6 warning closed its „ quotation with an ASCII "
+    instead of the matching “.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Wed, 23 Sep 2026 20:00:00 +0200
+
+easywall (2.21.0) unstable; urgency=medium
+
+  * New: blocked traffic is a page. The ten log switches send what they refuse
+    to an NFLOG group (12227 by default, [packet_log] nflog_group), and
+    easywall-core decodes each packet's headers into a typed entry kept in a
+    ring of 20000. /blocked filters them by source, destination, port,
+    protocol, rule and interface, with a drill-down and a live tail.
+  * New: three actions on every row — whitelist the source, blacklist the
+    source, open the port. They stage and never apply, and they refuse, with
+    the reason, anything that would stop a new connection from the address
+    the operator is signed in from, or from the trusted proxy in front.
+  * Changed: journalctl -k no longer shows easywall's log lines on a host where
+    the core binds its group. If the group cannot be bound — ulogd2 holds it,
+    or the process lacks CAP_NET_ADMIN — the core says so at start, the page
+    says so, and logging falls back to the kernel log, so an apply never fails
+    because of it. With easywall-core stopped, logged packets are discarded.
+  * Security: the optional spill file (persist = true, off by default) holds IP
+    addresses, is 0600 root, rewrites itself once it holds more than twice the
+    ring, and is never handed to logrotate. Nothing leaves the host.
+  * New dependency: github.com/florianl/go-nflog/v2 v2.3.0 (MIT); its own
+    dependencies were already in the module graph.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Wed, 23 Sep 2026 03:55:34 +0200
+
+easywall (2.20.1) unstable; urgency=medium
+
+  * Fix: the start-up log promised an acceptance window that was switched off.
+    On a host nothing had ever been applied to, the restore summary said the
+    first apply had the acceptance window to undo it, whether or not one was
+    configured — a sentence that reads as a safety net and is not one. The
+    promise now drops that clause where no window exists, start-up warns once
+    when the window is off, and `easywall-core status` says so too.
+  * Fix: health called an unprovable selftest a missing one. Inside a container
+    there is no CAP_SYS_ADMIN, so the proof cannot be taken; the line said
+    "never recorded", which reads as a failure somebody should chase. It now
+    says the proof is unavailable there, probed from the process's own
+    capabilities and failing open.
+  * Fix: a Docker container could publish a port that no rule covered, and
+    nothing said so. Every apply now names each published port with no matching
+    rule, decoded from Docker's own DNAT rules over netlink and filtered to
+    targets inside the bridges it detects. It names the port the forward chain
+    will see: a remapped publish is DNAT'd before that chain, so `-p 8080:80`
+    needs a rule for 80 and the line says both numbers. A forwarded rule that
+    names sources does not silence the warning for a container outside them.
+  * Docs: how a service published on a bridge gateway is reached, why it needs
+    a forwarded rule of its own, and how to prove a silent UDP service is
+    reachable by reading the packet counters rather than waiting for a reply.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Tue, 15 Sep 2026 18:54:34 +0200
+
+easywall (2.20.0) unstable; urgency=medium
+
+  * Feat: a webhook or an ntfy push when the firewall moves — an apply undone,
+    an apply confirmed, panic mode started or ended, and repeated failed
+    sign-ins from one address. Four triggers, each settable on its own, all off
+    until switched on. The core still opens no connection outward: the web
+    process reads the firewall's own state and posts.
+  * Feat: a Send a test button, so an operator can prove the endpoint works
+    without waiting for a real rollback. It dials the address in the field and
+    ignores the four switches, because a test that respects them proves nothing.
+  * Fix: an unconfirmed FIRST apply locked the host out. The first-run wizard
+    stages rules and never applies them, so the state captured before the first
+    apply is empty — and the rollback enforced that empty set at policy drop
+    instead of leaving the machine not filtering, closing SSH and the interface
+    with it. It now takes the table down. Both entrances, timeout and operator
+    cancel, are pinned against a real kernel.
+  * Fix: the published list of outbound requests had been missing ACME since
+    2.18. Both pages said two; autocert fetches and renews a certificate from
+    the certificate authority, which neither page listed. Four rows now, bound
+    to the code by a guard.
+  * Fix: four controls showed focus with an outline and no border change, which
+    DESIGN.md has required since it was written and measured at 1.31-1.34:1 in
+    2026-09.
+  * Fix: the notifications page refuses to write web.toml in demo mode, like
+    every other route that stores a credential.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Tue, 15 Sep 2026 08:13:13 +0200
+
+easywall (2.19.0) unstable; urgency=medium
+
+  * Feat: a port rule can name traffic this host forwards to a container, not
+    only traffic addressed to it. A published container port is routed, not
+    received, so it crosses the forward chain and never input — on a measured
+    host that meant four of fourteen open ports reached easywall's rules. A
+    rule now carries a scope: host, forwarded, or both.
+  * Feat: [docker] published_ports, "open" by default and unchanged from 2.18.
+    Under "filtered" the forward chain gains the forwarded accepts and the deny
+    that gives them meaning, ordered before the CIDR exceptions — because a
+    rule rendered after them can never refuse anything.
+  * Feat: a forwarded rule's kernel counter is read. RuleCounters walked the
+    input chain alone, so such a rule reported "never used" for ever while
+    carrying a host's entire mail service.
+  * Fix: the SSH brute-force limiter metered ports from every rule regardless
+    of scope, and its empty-list fallback then suppressed the default port-22
+    protection. A forwarded SSH rule silently turned the limiter off.
+  * Fix: a forwarded accept naming no source carried no address-family test in
+    an inet table, so it matched forwarded IPv6 that 2.18's policy drop refused.
+  * Security: lodash-es is pinned above GHSA-r5fr-rjxr-66jc and
+    GHSA-f23m-r3pf-42rh, both of which arrived with mermaid 12. Build-time only;
+    no npm package reaches a shipped artefact.
+  * check:ui can now see a select truncating and reads German, which closed the
+    carried-forward entry about its English-only sweep.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Sat, 12 Sep 2026 18:30:00 +0200
+
+easywall (2.18.0) unstable; urgency=medium
+
+  * Feat: a second factor is mandatory. An operator with none is sent to the
+    enrolment page after signing in, not refused at the login form, so an
+    upgrade locks nobody out. Demo mode is the one exemption. There is no
+    "remind me later", because the version of this with one is the version
+    nobody ever passes through.
+  * Feat: passkeys, as a second step and never a first. Several per account,
+    each named and dated, in passkeys.json under data_dir. Two conditions must
+    hold or the button is absent rather than broken: a registrable hostname in
+    [tls], and a certificate the browser trusts.
+  * Feat: ACME via Let's Encrypt, at the cost of no new dependency. HTTP-01
+    only. easywall never accepts a certificate authority's terms on the
+    operator's behalf, and never opens port 80 itself — it reads the rule set
+    and reports open, restricted, not covered, or unknown.
+  * Feat: a password needs twelve characters, a digit and a symbol. A symbol is
+    any rune that is neither letter nor digit, so a passphrase with a space
+    qualifies. Not configurable.
+  * Fix: an account whose only factor was a passkey was signed in by the
+    password alone. handleLoginPOST decided whether a second step existed by
+    reading the TOTP secret, which such an account does not have.
+  * Fix: the second-factor attempt budget was held in the client's own cookie,
+    so three attempts bound only a browser that sent back what the server gave
+    it. Measured at 200 guesses from one password round. It is now the
+    server's.
+  * Fix: signing out could be undone. Any save of a session re-signed its
+    cookie with a fresh timestamp, and three paths saved one they had not
+    authenticated, so a wrong password every nine minutes kept a revoked cookie
+    alive until the revocation record expired.
+  * Fix: an unreadable passkeys.json removed the mandate — a corrupt store read
+    as "no passkeys", and the password alone signed in. It now counts as a
+    factor, because the truth is unknown and the recovery codes still work.
+  * Fix: a passkey assertion could be replayed. The signature counter was no
+    backstop: go-webauthn exempts an authenticator reporting zero, which is
+    most platform passkeys.
+  * Fix: enrolling a passkey did not ask for the current password, the only
+    credential write on that page that did not.
+  * Fix: the documentation's last-resort recovery was wrong. Clearing
+    totp_secret and recovery_codes left an enrolled passkey standing as a
+    factor while destroying the eight codes. All five places now name
+    passkeys.json as the third thing to clear.
+  * Fix: an account whose only factor was a passkey could neither see how many
+    recovery codes remained nor mint new ones. They have their own card now —
+    they belong to the account, not to TOTP.
+  * Fix: the documentation landing page rendered as unstyled prose at full page
+    width for two releases. The guard read web/templates/ and app.js only.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Fri, 11 Sep 2026 14:03:00 +0200
+easywall (2.17.0) unstable; urgency=medium
+
+  * Fix: all three conntrack masks are native-endian. For five releases the
+    established/related accept, the invalid-packet drop and the SSH
+    brute-force meter matched no packet while every surface reported them
+    enabled. `nft list ruleset` renders byte order invisibly, which is why
+    reading the rules found nothing.
+  * Fix: the established-accept rule carried no counter and no id comment, so
+    `RuleCounters` skipped it. It now carries both under the reserved id
+    `_established` — the one counter that catches this defect class again.
+  * Fix: a finding named the wrong rule. `Finding.Index` was a plain zero for
+    both per-chain checks, so a jump at input rule 3 was audited as
+    "input rule 0".
+  * Feat: `easywall-core health` — three lines and an exit code, 0 ok,
+    1 degraded, 2 fail, with seven reasons because a state with no cause is
+    not actionable at three in the morning.
+  * Feat: `GET /healthz` on the web process, the one route that answers
+    without a session. Loopback only until an operator widens it, matched
+    against the TCP peer and never a forwarding header.
+  * Feat: every nftables expression is checked before it reaches netlink — a
+    byte-reversed mask, an undefined bit, a jump to a chain nobody creates.
+    Findings surface as degraded; the check never refuses to write.
+  * Feat: four behavioural claims proven with real packets over a veth pair in
+    a throwaway network namespace, built with netlink alone.
+    `easywall-selftest.service` runs it once per version and kernel, and is
+    the only place CAP_SYS_ADMIN appears in this repository.
+  * Feat: the image gets its first HEALTHCHECK, a year after the compose file
+    got one. A plain `docker run` was checked by nothing at all.
+  * Feat: `Type=notify` and `WatchdogSec=60s` on easywall-core.service.
+    Under `Type=simple` the unit was active the instant exec returned, before
+    the socket the web unit waits for existed.
+  * Fix: `supervisorctl` works inside the image. It answered ".ini file does
+    not include supervisorctl section" and exited 2, so every documented way
+    of stopping one of the two processes printed an error and did nothing.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Wed, 09 Sep 2026 23:28:51 +0200
+
+easywall (2.16.0) unstable; urgency=medium
+
+  * Feat: colour stops decorating and starts meaning something. The ice-blue
+    accent is removed from the application and the documentation site, and
+    state-ok, state-warn and state-crit are the entire remaining palette — a
+    screen with no colour on it is a screen with nothing to report. Focus,
+    selection and the one primary action are carried by fill, edge and weight
+    instead. The protection toggles get clearer rather than dimmer: an on-toggle
+    was 4.73:1 in light mode and is now 18.88:1.
+  * Fix: the keyboard focus indicator was rgba(143,211,251,0.13), which is
+    11.4:1 as a colour and 1.31:1 once composited over the card behind it. 66
+    controls per theme failed WCAG 1.4.11's 3:1; all of them pass now, and
+    check:ui tabs to every focusable element on all thirteen pages and measures
+    the composite rather than reading the stylesheet.
+  * Fix: .table-wrap scrolled 10px sideways in card mode at every width the
+    container query switches at, and the page-level overflow check could not see
+    it — a container with overflow-x: auto absorbs its own overflow. check:ui now
+    measures every such container against its own children.
+  * Fix: .col-port was 120px against a documented 8000:9000 needing 122.
+  * The sidebar groups get the divider and indent the documentation sidebar was
+    given three design reviews ago; the six dashboard tiles become three plus a
+    list; the page title takes a mono display voice; and the topbar version chip
+    shows the release instead of a truncated `git describe` string.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Tue, 08 Sep 2026 06:21:45 +0200
+
+easywall (2.15.1) unstable; urgency=high
+
+  * Fix: the conntrack state masks were written in the wrong byte order, so
+    the `established,related` accept rule in the input chain matched nothing.
+    An installation with a live table could not complete a single outbound
+    connection, and applying the rules dropped whatever SSH session was
+    already open. The invalid-packet drop and the SSH brute-force meter were
+    the same mistake failing open. Reported after a VPS was cut off
+    immediately following `docker compose up -d`.
+  * Fix: a host where nothing has ever been applied is no longer made to
+    enforce the empty rule set a new installation ships with. That closed
+    every port, including SSH and the web interface whose first-run wizard is
+    the only thing that opens them. Filtering now starts at the first
+    deliberate apply, which has the acceptance window to undo it.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Mon, 07 Sep 2026 22:54:41 +0200
+
+easywall (2.15.0) unstable; urgency=medium
+
+  * Feat: every port rule carries a kernel packet counter and a stable id, so
+    the port pages say when each port last carried a packet the firewall
+    accepted, and the dashboard says how many open ports nobody has used in
+    thirty days. An open port nobody uses is the most common avoidable
+    exposure on a hobby server, and until now nothing here could point at one.
+    The figure survives an apply, which rebuilds the table and resets every
+    counter in it: the counters are read immediately before the flush and
+    accumulated in /var/lib/easywall/usage.json, and the baseline is kept
+    there too so a daemon restart does not re-count what it already booked.
+    [usage] interval sets how often they are read, 300 seconds by default;
+    0 stops the periodic read, not the counting.
+  * Fix: ten entries carried forward from earlier releases — two races, four
+    paths through apply that failed without writing an audit entry, two guards
+    that read less than they claimed, and four wording defects. One more,
+    shipped in 2.14 and found here: a request arriving as the daemon shut down
+    could be abandoned rather than answered.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Mon, 07 Sep 2026 14:25:39 +0200
+
+easywall (2.14.0) unstable; urgency=medium
+
+  * Feat: the acceptance window is visible while it runs. Every apply reverts
+    itself after 120 seconds unless it is confirmed, and the interface showed
+    that with a static clock glyph and the word Open — two screenshots nine
+    seconds apart were pixel-identical. There is now a countdown at 40px on the
+    apply screen, a chip carrying the same number in the topbar of every other
+    page, and Roll back now beside Confirm. The number and the timer that fires
+    come from one instant, so they cannot disagree.
+  * Feat: CANCEL_ACCEPTANCE, the twentieth protocol command. It reaches the
+    Cancel that has existed since 2.7 and had no route to it. Rolling back
+    restores the last confirmed rule set — the state the operator already
+    approved — so it grants nothing that waiting out the window does not.
+  * Fix: a SIGTERM landing between an apply starting and its window opening was
+    discarded, and shutdown then waited out the whole window — past systemd's
+    TimeoutStopSec, after which SIGKILL left the unconfirmed rules live. That is
+    the failure the window exists to prevent.
+  * Fix: the window now opens before the rules reach the kernel, as
+    Acceptance.Start's own contract had always required. It used to open after
+    two file writes, during which the kernel held unconfirmed rules while the
+    interface reported no window at all.
+  * Fix: an operator rollback is recorded as one audit entry saying so, rather
+    than two of which the second claimed a timeout.
+  * Fix: the Add from catalogue button drew a solid block instead of an icon,
+    and had done since the catalogue shipped in 2.11.
+
+ -- JP <12394156+jp1337@users.noreply.github.com>  Wed, 02 Sep 2026 20:58:21 +0200
+
+easywall (2.13.0) unstable; urgency=medium
+
+  * Feat: trusted_proxies, and EASYWALL_WEB_TRUSTED_PROXIES beside it. A list
+    of addresses and networks whose X-Forwarded-For header easywall believes.
+    When the TCP peer is on that list — and only then — the resolved client
+    becomes the address in the audit log, the address the lockout verdict is
+    computed for, and the key the login limiter counts against. Empty by
+    default, and an empty list behaves exactly as 2.12 did. A list and never a
+    boolean: "trust the header" with no way to say whose is
+    GHSA-3fxj-6jh8-hvhx, GHSA-rjr7-jggh-pgcp and GHSA-9g5q-2w5x-hmxf, and no
+    configuration of easywall can express it. Listing a network wider than the
+    proxies it holds hands address spoofing to anything that can reach the
+    port from inside it
+  * Change: the login limiter now counts per resolved client. Behind a reverse
+    proxy it counted per proxy, which is one budget for everybody: five
+    attempts per ten minutes shared by every operator, exhausted by one
+    attacker. THIS CHANGES BEHAVIOUR FOR ANYONE ALREADY RUNNING BEHIND A
+    PROXY — and only once trusted_proxies names that proxy. Until it does,
+    nothing changes
+  * Change: the via-proxy marker now means the recorded address is a stand-in,
+    not a confirmed client. True whenever resolution falls back to the peer —
+    an untrusted peer sending a forwarding header, same as before, or a
+    trusted one whose header named nobody — and false only when the walk
+    actually named a client
+  * Change: the demo records no login addresses. Its audit log shows that
+    somebody signed in and not from where — the field is omitted, not filled
+    with a placeholder
+  * Feat: five proofs against a real peer address. The resolution is measured
+    over a veth pair, where the peer comes from the kernel rather than from a
+    struct a test filled in, and each was watched failing with the feature
+    reverted before it was counted as written. The integration job now covers
+    internal/web as well as internal/core, with a guard test that fails if
+    that path ever narrows again
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Fri, 28 Aug 2026 17:05:36 +0200
+
+easywall (2.12.0) unstable; urgency=medium
+
+  * Change: a stored value now beats the environment variable naming the same
+    key. Until 2.12 the environment overlaid the parsed file, so a value set
+    in the interface — or written into web.toml by hand — came back changed
+    after a restart, with nothing anywhere saying why. The order is now
+    stored value, then environment variable, then built-in default, and it is
+    the same order for all thirteen variables. THIS IS A BEHAVIOUR CHANGE FOR
+    EXISTING DOCKER INSTALLATIONS: a variable that used to win now loses to a
+    value stored in the file. The reset control on /system is the way back
+  * Change: "stored" means the file's value differs from the built-in default,
+    never that the key is present in the file. -write-config emits every
+    default and that file is what the container image ships; the other
+    reading would have disabled every environment variable in the product on
+    exactly the installations that use them
+  * Change: config/web.toml no longer pre-answers the counting question. The
+    telemetry = false line is now a commented example, because absent means
+    nobody has answered yet — a different state from "no", and under the new
+    precedence a pre-answered default would have let EASYWALL_WEB_TELEMETRY
+    overrule an operator who genuinely declined
+  * Change: the Options, Network and System pages save when you press Save.
+    They posted over HTMX on every change *and* carried a Save button, so the
+    button reported a write that had already happened. The button stays; the
+    automatic write goes
+  * Feat: every setting whose key an environment variable names says so on the
+    page. The control keeps working; beneath it the interface says either
+    "set by the environment" or "the environment says X — overridden here",
+    and in the second case offers "Reset to the environment value". Reset
+    removes the stored line rather than writing the default, because for a
+    flag whose absence is a state those are different files
+  * Feat: EASYWALL_WEB_TELEMETRY switches the installation count on from the
+    environment, so the public demo reports like any other installation —
+    which also means the number means installations including the demo.
+    Consent semantics are unchanged: unset still means no, and an answer
+    given in the interface beats the variable
+  * Feat: a precedence section and a diagram on the Environment Variables
+    documentation page, with a Control column saying which variables the
+    interface also offers
+  * Fix: the counting toggle on the System page can be saved without
+    JavaScript. Its form carried no submit button at all — hx-trigger was the
+    only thing that ever submitted it — so a script-free operator could move
+    a consent switch and never store the answer
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Fri, 28 Aug 2026 00:00:00 +0000
+
+easywall (2.11.0) unstable; urgency=medium
+
+  * Feat: a port rule can name who may reach it. Sources is a comma-separated
+    list of addresses and networks on every TCP and UDP rule; empty still
+    means everyone. Each usable entry becomes its own nft rule matched before
+    the port is tested, and a source list holding nothing usable opens the
+    port to nobody rather than to the world. /apply gained a matching
+    reachability reason, port_source_mismatch
+  * Feat: a catalogue of 29 services fills in a rule in one click. "Add from
+    catalogue" on /ports appends the ports a service listens on with a
+    suggested source restriction already filled in, everything left editable
+    and nothing applied until you apply it. The service name rides along as a
+    label only
+  * Feat: a new aside on /ports explains what an empty Sources field means and
+    why the catalogue's private-networks suggestion may not be enough on its
+    own over IPv6
+  * Fix: the SSH brute-force chain no longer outranks the blacklist. It
+    jumped to sshbrute before the blacklist was consulted and ended in
+    accept, so a blacklisted address could still open an SSH connection under
+    the rate limit. The chain now returns, so traffic under the rate limit
+    falls back into the input chain and meets the blacklist, then the
+    whitelist, then the port rule, exactly as if the module were not there
+  * Change: a host with SSH brute-force protection on and no rule opening
+    port 22 no longer has port 22 open by itself; if you were relying on the
+    module alone to keep SSH reachable, add an explicit rule for it before
+    you apply this release. An under-rate SSH connection now also traverses
+    the module rules that follow the jump — connection limit, RST flood,
+    broadcast/multicast/anycast drops — which the old accept short-circuited
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Thu, 27 Aug 2026 00:00:00 +0000
+
+easywall (2.10.0) unstable; urgency=medium
+
+  * Feat: what changes is on the screen. Before you press Apply, the interface
+    lists every difference between the staged rules and the running ones — six
+    rule sets, each compared the way the kernel reads it, so a reordered port
+    list is not a change and a moved custom rule is — and beside it the
+    configuration drift, which no page could see before: options and network
+    settings were in no pending calculation at all, so /options said "apply to
+    activate" while /apply said there was nothing to apply
+  * Feat: a lockout verdict above the diff, naming the address the request came
+    from and the port the interface answers on. Three answers — reachable,
+    blocks new connections, cannot tell — and every uncertain case says which
+    rule it could not decide. It is about a *new* connection: applying rules
+    does not touch conntrack, so the browser connection you are reading it on
+    survives an apply that admits nobody, which is why confirming from a page
+    that still answers can confirm a lockout
+  * Feat: GET_APPLIED_CONFIG, the 19th command, and an applied-config.json the
+    core writes wherever nft.Apply succeeds and nowhere else. A missing file
+    means unknown, never identical, so no existing installation is greeted with
+    a pending change it did not make
+  * Fix: the forwarding rows share one top edge again. display:flex on a <td>
+    stops the element being a table cell, so the separator under that column
+    sat about ten pixels below the others — invisible below the reflow
+    breakpoint, which is why it survived a release
+  * Fix: a login recorded through a reverse proxy says so. The address is still
+    the TCP peer and X-Forwarded-For is still refused; what was missing was
+    telling the reader that the number is not the client's. Entries carry a
+    via-proxy token in the log and a neutral chip in the interface, and the flag
+    comes from a header's presence, never its value
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Thu, 27 Aug 2026 00:00:00 +0000
+
+easywall (2.9.0) unstable; urgency=medium
+
+  * Feat: the interface speaks French. locales/fr.json ships the whole
+    interface — 463 strings — marked as unreviewed, because nobody who speaks
+    French has read it yet; the language switcher says so beside the endonym,
+    and so does the coverage report. That state had to exist before a
+    contributed translation could
+  * Feat: parity is now a rule for en and de alone. Every other language may
+    have gaps: a missing key renders the English string, which go-i18n already
+    did per message ID, and the gap is counted rather than hidden. Coverage
+    never rounds up to 100, and declines to count an empty string or a value
+    byte-identical to the English one, so the number cannot be raised by
+    pasting
+  * Feat: EASYWALL_CORE_* and EASYWALL_WEB_* — twelve variables, and the first
+    environment either binary has ever read. The overlay runs inside
+    LoadConfig, ahead of the Validate() call main already makes, so a malformed
+    value from the environment is rejected exactly as one from the file is. The
+    list stops at deployment: the environment configures where easywall runs,
+    the interface configures what the firewall does
+  * Change: the language switcher is a select with a submit button, not two
+    chips. It still works with JavaScript switched off — an operator who cannot
+    read the interface should not also need JavaScript to fix that
+  * Fix: a malformed locales/status.json refused to start easywall-web. A
+    syntax error in metadata about the documentation is now logged and read as
+    "nothing is reviewed"
+  * Fix: a wrapped tile label on the dashboard pushed its own number 20px below
+    its neighbours. The tiles now take their four rows from the grid above
+    them, at no cost to any language whose labels fit one line
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Fri, 21 Aug 2026 00:00:00 +0000
+
+easywall (2.8.0) unstable; urgency=medium
+
+  * Feat: a stolen password alone no longer opens the firewall. RFC 6238 TOTP
+    for the single account, verified against the RFC's own published test
+    vectors, plus eight one-time recovery codes stored argon2-hashed rather
+    than in the clear. Setup lives on Password -> Second factor and nothing is
+    written until a code confirms it. /login/verify becomes the second step of
+    signing in whenever a factor is enrolled: the password step ends in an
+    intermediate cookie, not a session, and issues no session until the code is
+    right too. There is no reset link — clear totp_secret and recovery_codes in
+    web.toml on the host, the same file the password already lives in
+  * Feat: the first-run wizard offers a second factor too, unticked by default.
+    Skipping is a first-class answer: POST /firstrun/skip creates the account
+    with a password alone regardless of what the code field held, because
+    easywall runs on boards with no RTC that come up at the epoch until NTP
+    lands, and TOTP cannot verify against a clock like that
+  * Feat: LOG_EVENT is the eighteenth command the socket protocol declares and
+    the first one the web process sends rather than receives. Nine login events
+    reach the audit log from a fixed enum rather than free text; the three a
+    stranger can trigger without any credential are debounced in the core
+  * Fix: an unauthenticated POST /logout could erase the visible audit log. The
+    route is public and unlimited and recorded an event even for a request
+    carrying no session, so a bare curl loop with no cookie pushed the whole
+    200-line history out of view in under two seconds
+  * Fix: the public demo could be locked. POST /password wrote credentials for
+    real with no demo-mode test in any handler, so a visitor could overwrite the
+    demo password and shut everyone else out until the process was restarted.
+    Every credential-writing route now refuses in demo mode
+  * Fix: the sidebar read "v2" — the major, not the version — and would have
+    read v2 in 2.19 as well. A test now scans every shipped template for a
+    version literal
+  * Fix: Renovate found all seven Go toolchain pins and updated none of them.
+    Two-component pins under npm versioning yield an empty candidate set, and
+    one file pattern still named a page the Jekyll restructure had left behind
+    as a redirect stub. The toolchain moves to 1.27.0
+  * Changed: every session in flight ends once on upgrade — the credential
+    fingerprint now covers the TOTP state as well as the password hash
+  * See CHANGELOG.md for the complete account
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Thu, 20 Aug 2026 00:00:00 +0000
+
+easywall (2.7.0) unstable; urgency=medium
+
+  * Fix: nftables forgets every rule on a restart, and nothing put them back —
+    a reboot left the machine unfiltered until somebody opened the web
+    interface and pressed Apply. The core now restores the stored rule set
+    into the kernel before its socket accepts a single connection, with no
+    acceptance window: that ruleset already survived one on the way in
+  * Feat: easywall-core panic / resume / status, a console-only way back into
+    a machine your own rules have shut you out of. The marker at
+    /var/lib/easywall/panic survives a restart on purpose, and the interface
+    shows a loud banner with no button — ending panic mode is console-only,
+    without exception
+  * Fix: every timestamp in the interface was compared in the wrong zone, so
+    "how long ago" and the date-format boundary could both be wrong, including
+    the calendar day. Nothing stored on disk changes; the container image was
+    also missing tzdata on its runtime stage
+  * PANIC and RESUME are the sixteenth and seventeenth socket commands, now
+    tied to one declared list instead of three independently maintained counts
+  * One mutex now guards every method on NftablesManager; panic outranks an
+    in-flight apply; the panic marker is re-read after every kernel write, not
+    only checked before one, and fsynced before panic reports success
+  * A man page, easywall-core(1), and features/recovery.md
+  * See CHANGELOG.md for the complete account, including the audit actions
+    this release adds and the earlier defects the panic-marker work closed
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Tue, 18 Aug 2026 00:00:00 +0000
+
+easywall (2.6.0) unstable; urgency=medium
+
+  * Fix: connection_limit_max and eight other firewall limits had three
+    different sets of bounds and none of them was enforced. A limit landing
+    in a 32-bit nftables field did not fail when too large — it wrapped:
+    4294967296 arrived as `ct count over 0`, a rule that drops every
+    connection from every source, with nothing logged. One table now carries
+    the range for all nine, and the daemon enforces it rather than the page
+    or the schema hinting at it
+  * Security: GET /logout sat outside Go's CrossOriginProtection, which
+    exempts safe methods by design, so any page the operator had open could
+    end their session with a single cross-site image tag. It is a POST now
+  * Fix: an unattended package upgrade could leave easywall unconfigured,
+    with the old processes still serving. easywall.toml was shipped as a
+    dpkg conffile, and easywall rewrites it on every saved setting, which
+    dpkg reads as locally modified — a release that also changed the
+    shipped default stopped the upgrade at the conffile prompt and left it
+    "install ok unpacked": new binaries on disk, postinst never run. It
+    ships as easywall.toml.template now, the arrangement web.toml has
+    always had
+  * Fix: the post-incident nftables snapshot attributed chains to the wrong
+    table when a same-named table existed in another family, and reported
+    an unreadable rule count as zero rather than as unreadable
+  * Fix: a mistyped or padded network in easywall.toml's Docker or routing
+    lists reached the kernel as no rule at all, or as a rule in one chain
+    and not its neighbour; the network editor, the core and the demo now
+    share one definition of what a network is
+  * Fix: an import that succeeded could be reported as failed under a slow
+    nft --check; the client's deadline now matches the one the core itself
+    enforces
+  * Feat: --write-config, the flag the documentation had already promised,
+    writes either binary's commented default configuration file
+  * Feat: a Debian package for arm64, built and verified on a runner of its
+    own architecture
+  * Four documented pages the interface already had: First Run, Applying
+    Rules, Dashboard, and a Roadmap page
+  * Diagram rendering, CI guards and further documentation corrections —
+    see CHANGELOG.md
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Sun, 16 Aug 2026 00:00:00 +0000
+
+easywall (2.5.1) unstable; urgency=medium
+
+  * Fix: the .deb is published on the release. The documented install command
+    fetched it from the releases page, where no release has ever carried one —
+    it existed only as a seven-day CI artefact behind a GitHub login. The
+    release now builds it from this debian/ directory, checks the artefact
+    holds both binaries and the tag's version, and uploads it
+  * Fix: the maintainer field no longer carries a private address
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Wed, 12 Aug 2026 00:00:00 +0000
+
+easywall (2.5.0) unstable; urgency=high
+
+  * Fix: the packaged core daemon could not talk to the web interface at all.
+    CapabilityBoundingSet=CAP_NET_ADMIN leaves a root service without CAP_CHOWN
+    and CAP_DAC_OVERRIDE, so the control socket stayed root:root and the web
+    user was refused on connect, and /var/lib/easywall — owned by that user —
+    was unreadable to the daemon, which never wrote rules.json. The unit now
+    runs the daemon in the easywall group and the data directory is group
+    writable; neither needs a wider capability set
+  * Fix: a session cookie was accepted for thirty days rather than the
+    documented ten minutes, and logging out therefore wore off — replaying the
+    cookie once the revocation record had expired signed the visitor back in
+  * Fix: the version was never compiled in. It was a constant, and the linker's
+    -X silently does nothing to a constant, so every build reported the literal
+    in the source whatever tag it came from. Both binaries now accept --version
+  * Firewall rule ordering, per-source rate limiting, logging, the acceptance
+    window, first-run wizard and Debian layout fixes — see CHANGELOG.md
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Tue, 11 Aug 2026 00:00:00 +0000
+
+easywall (2.0.0) unstable; urgency=medium
+
+  * Complete rewrite in Go (nftables via netlink, no Python dependency)
+  * Two-process architecture: privileged core daemon + unprivileged web process
+  * Direct nftables netlink API — no subprocess, no injection risk
+  * Argon2id password hashing (replaces SHA512 with hostname salt)
+  * Two-step activation with auto-rollback prevents SSH lockouts
+  * Docker coexistence: own nftables table inet easywall
+  * i18n: English and German
+  * Light/Dark mode with OS preference detection
+  * Export/Import rules as JSON
+  * Auto-renewing self-signed TLS certificate
+  * Debian package: only depends on nftables and openssl
+  * logrotate config for audit log
+  * CI: GitHub Actions, Dependabot, CodeQL, govulncheck
+
+ -- easywall maintainers <12394156+jp1337@users.noreply.github.com>  Fri, 25 Apr 2026 00:00:00 +0000

@@ -1,0 +1,870 @@
+package web
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/jp1337/easywall/internal/shared"
+)
+
+func TestNewServer_Success(t *testing.T) {
+	fc := newFakeCore(t)
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+	cfgPath := dir + "/web.toml"
+	_ = os.WriteFile(cfgPath, []byte(`
+bind_addr = "127.0.0.1:0"
+socket_path = "`+fc.socketPath+`"
+ssl_dir = "`+sslDir+`"
+data_dir = "`+dir+`"
+session_key = "test-session-key-32bytes-padding!"
+language = "en"
+username = ""
+password = ""
+[tls]
+cert = ""
+key  = ""
+`), 0600)
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	// NewServer should succeed and create SSL certs
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil server")
+	}
+
+	// Check SSL cert was generated
+	certPath := sslDir + "/cert.pem"
+	if _, err := os.Stat(certPath); err != nil {
+		t.Errorf("cert.pem not generated: %v", err)
+	}
+}
+
+// testConfigForNewServer writes a minimal web.toml — the same shape
+// TestNewServer_Success uses — in its own temp dir, and loads it with demo
+// mode set as requested.
+func testConfigForNewServer(t *testing.T, fc *fakeCore, demo bool) *Config {
+	t.Helper()
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+	cfgPath := dir + "/web.toml"
+	_ = os.WriteFile(cfgPath, []byte(`
+bind_addr = "127.0.0.1:0"
+socket_path = "`+fc.socketPath+`"
+ssl_dir = "`+sslDir+`"
+data_dir = "`+dir+`"
+session_key = "test-session-key-32bytes-padding!"
+language = "en"
+username = ""
+password = ""
+[tls]
+cert = ""
+key  = ""
+`), 0600)
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cfg.DemoMode = demo
+	return cfg
+}
+
+// The notifier's half of the claim the dispatcher test below makes for the
+// audit events, and it is NewServer's to make rather than Start's: the T5
+// review looked for the blind spot in Start() and found it narrower than
+// reported — httpSrv, events and the notifier are all built in NewServer, and
+// Start only launches goroutines over them. So the wiring is assertable with no
+// listener, the way the dispatcher test below does it.
+//
+// What would be silent without this: notifyStop left nil (Stop closes nothing
+// and runNotifier never returns), notifyBurst left nil (the first failed login
+// panics on a nil map), or onBurst never assigned (every failed login is
+// counted by nothing and no notification is ever raised). All three are single
+// lines in NewServer with no other reader.
+func TestNewServer_AlwaysWiresTheNotifier(t *testing.T) {
+	fc := newFakeCore(t)
+	for _, demo := range []bool{false, true} {
+		cfg := testConfigForNewServer(t, fc, demo)
+		s, err := NewServer(cfg)
+		if err != nil {
+			t.Fatalf("NewServer(demo=%v): %v", demo, err)
+		}
+		if s.notifyStop == nil {
+			t.Errorf("NewServer(demo=%v) left s.notifyStop nil; Stop closes nothing and "+
+				"runNotifier polls until the process ends", demo)
+		}
+		if s.notifyBurst == nil {
+			t.Errorf("NewServer(demo=%v) left s.notifyBurst nil; the first failed login "+
+				"from any address panics", demo)
+		}
+		if s.events == nil || s.events.onBurst == nil {
+			t.Errorf("NewServer(demo=%v) did not hook notifyLoginFailure onto the events "+
+				"dispatcher; failed logins are counted by nothing", demo)
+		}
+
+		// Stop closes the channel — and a second Stop must not panic on it.
+		// notifyOnce is the only thing between that and a closed-channel close,
+		// and Stop is reachable twice: a signal handler and a deferred Stop
+		// both call it.
+		s.Stop()
+		select {
+		case <-s.notifyStop:
+		default:
+			t.Errorf("NewServer(demo=%v): Stop left notifyStop open; runNotifier keeps "+
+				"polling after shutdown", demo)
+		}
+		s.Stop()
+	}
+}
+
+// The nil guard in recordLoginEvent makes a mis-wiring invisible: no panic, no
+// log line, just an audit trail that is permanently empty. The two setup lines
+// sit immediately after an `if !cfg.DemoMode` block, so the easy slip is moving
+// them inside it. This is what notices.
+func TestNewServer_AlwaysBuildsTheAuditEventDispatcher(t *testing.T) {
+	fc := newFakeCore(t)
+	for _, demo := range []bool{false, true} {
+		cfg := testConfigForNewServer(t, fc, demo)
+		s, err := NewServer(cfg)
+		if err != nil {
+			t.Fatalf("NewServer(demo=%v): %v", demo, err)
+		}
+		if s.events == nil {
+			t.Errorf("NewServer(demo=%v) left s.events nil; every login event is "+
+				"silently discarded and nothing says so", demo)
+		}
+		if s.eventsStop == nil {
+			t.Errorf("NewServer(demo=%v) left s.eventsStop nil; Start would never "+
+				"drain the queue", demo)
+		}
+
+		// The wiring itself, not just its presence: a demo-configured Server
+		// must hand recordLoginEvent's caller an events dispatcher that drops
+		// the address, and a non-demo one must not. No run() goroutine is
+		// started here (that only happens in Start()), so the payload
+		// recordLoginEvent queues can be read straight off the channel.
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "203.0.113.7:1234"
+		s.recordLoginEvent(req, shared.EvLoginOK, 0)
+		wantAddr := "203.0.113.7"
+		if demo {
+			wantAddr = ""
+		}
+		if p := <-s.events.ch; p.Addr != wantAddr {
+			t.Errorf("NewServer(demo=%v): recordLoginEvent queued Addr=%q, want %q",
+				demo, p.Addr, wantAddr)
+		}
+
+		s.Stop()
+	}
+}
+
+// A malformed status.json is review metadata, not something load-bearing: it
+// names nothing but whether a human ticked a box next to a language. NewBundle
+// never refuses to start over a broken locale file — a bad de.json logs a
+// warning per file and moves on — and status.json carries strictly less than
+// that. This web interface is what an operator reaches for when locked out of
+// everything else, so a cosmetic label bug must not manufacture one more way
+// to be locked out.
+func TestNewServer_MalformedLocaleStatusDoesNotPreventStartup(t *testing.T) {
+	fc := newFakeCore(t)
+	cfg := testConfigForNewServer(t, fc, false)
+
+	// LocalesDir() is a fixed "locales" relative to the working directory, so
+	// this puts a broken status.json exactly where NewServer looks for it.
+	// Two locale files, not one: languageOptions only reports anything with
+	// more than one language installed.
+	wd := t.TempDir()
+	localesDir := filepath.Join(wd, "locales")
+	if err := os.MkdirAll(localesDir, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localesDir, "en.json"),
+		[]byte(`[{"id":"language_name","translation":"English"}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localesDir, "fr.json"),
+		[]byte(`[{"id":"language_name","translation":"Français"}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localesDir, "status.json"),
+		[]byte(`{not valid json`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(wd)
+
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer refused to start over a malformed status.json: %v", err)
+	}
+	defer s.Stop()
+
+	req := httptest.NewRequest("GET", "/dashboard", nil)
+	opts := s.languageOptions(req, "en")
+	if len(opts) != 2 {
+		t.Fatalf("got %d language options, want 2: %+v", len(opts), opts)
+	}
+	for _, o := range opts {
+		if o.Reviewed {
+			t.Errorf("%s reported reviewed after status.json failed to parse", o.Code)
+		}
+	}
+}
+
+func TestNewServer_SSLDirIsFile(t *testing.T) {
+	dir := t.TempDir()
+	// Create a file at the SSL dir path — os.MkdirAll will fail with ENOTDIR
+	sslPath := dir + "/ssl"
+	_ = os.WriteFile(sslPath, []byte("not a dir"), 0600)
+
+	cfg := &Config{}
+	cfg.BindAddr = "127.0.0.1:0"
+	cfg.SocketPath = "/run/x"
+	cfg.SSLDir = sslPath
+	cfg.SessionKey = "test-key-32bytes-padding-padding!"
+
+	_, err := NewServer(cfg)
+	if err == nil {
+		t.Error("expected error when SSLDir path is a file")
+	}
+}
+
+func TestNewServer_CertGenerationError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		// The premise is a directory the process cannot write to, and root can
+		// write to it anyway. Since 2.13 CI runs this package under sudo for
+		// the integration tag, where the assertion below would otherwise fail
+		// on a claim the test never actually set up.
+		t.Skip("root ignores the mode this test relies on")
+	}
+
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+	// Remove write permission so generateSelfSignedCert fails
+	_ = os.Chmod(sslDir, 0555)
+	defer func() { _ = os.Chmod(sslDir, 0750) }()
+
+	cfg := &Config{}
+	cfg.BindAddr = "127.0.0.1:0"
+	cfg.SocketPath = "/run/x"
+	cfg.SSLDir = sslDir
+	cfg.SessionKey = "test-key-32bytes-padding-padding!"
+
+	_, err := NewServer(cfg)
+	if err == nil {
+		t.Error("expected error when SSL dir is not writable")
+	}
+}
+
+func TestNewServer_WithCustomTLSPaths(t *testing.T) {
+	fc := newFakeCore(t)
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+
+	// Generate a self-signed cert for the test
+	if err := generateSelfSignedCert(sslDir); err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+
+	cfgPath := dir + "/web.toml"
+	_ = os.WriteFile(cfgPath, []byte(`
+bind_addr = "127.0.0.1:0"
+socket_path = "`+fc.socketPath+`"
+ssl_dir = "`+sslDir+`"
+data_dir = "`+dir+`"
+session_key = "test-session-key-32bytes-padding!"
+language = "en"
+username = ""
+password = ""
+[tls]
+cert = "`+sslDir+`/cert.pem"
+key  = "`+sslDir+`/key.pem"
+`), 0600)
+	cfg, err := LoadConfig(cfgPath)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer with custom TLS: %v", err)
+	}
+	if s == nil {
+		t.Fatal("expected non-nil server")
+	}
+}
+
+func TestLoadTemplates_StubTFunction(t *testing.T) {
+	// loadTemplates registers a stub T so ParseGlob succeeds before any request
+	// exists. Executing a template without going through render() — which swaps in
+	// the per-request T — is what exercises that stub.
+	tmpl, err := loadTemplates("testdata/templates")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf strings.Builder
+	if err := tmpl.ExecuteTemplate(&buf, "nonce.html", PageData{Nonce: "stub-probe"}); err != nil {
+		t.Fatalf("execute fixture template: %v", err)
+	}
+	if !strings.Contains(buf.String(), "stub-probe") {
+		t.Errorf("unexpected output: %s", buf.String())
+	}
+}
+
+func TestLoadTemplates_Error(t *testing.T) {
+	_, err := loadTemplates("/nonexistent/templates/dir")
+	if err == nil {
+		t.Error("expected error for non-existent templates dir")
+	}
+}
+
+func TestLoadTemplates_ValidDir(t *testing.T) {
+	// testdata/templates should work
+	tmpl, err := loadTemplates("testdata/templates")
+	if err != nil {
+		t.Fatalf("loadTemplates: %v", err)
+	}
+	if tmpl == nil {
+		t.Error("expected non-nil template")
+	}
+}
+
+func TestRender_NilTemplates(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	s.tmpl = nil // force nil tmpl
+
+	req := httptest.NewRequest("GET", "/login", nil)
+	rec := httptest.NewRecorder()
+	s.render(rec, req, "login.html", "login", nil)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 with nil tmpl, got %d", rec.Code)
+	}
+}
+
+func TestRender_WithFlash(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+	fc.SetResponse(shared.CmdGetStatus, successResp(shared.FirewallStatus{Active: true}))
+
+	// First: set a flash via a POST that fails
+	cookie := makeAuthCookie(t, s)
+
+	// Set flash in the session directly
+	req1 := httptest.NewRequest("GET", "/dashboard", nil)
+	req1.AddCookie(cookie)
+	rec1 := httptest.NewRecorder()
+	s.setFlash(rec1, req1, "saved")
+
+	// Get the updated session cookie
+	cookies1 := rec1.Result().Cookies()
+	if len(cookies1) == 0 {
+		t.Fatal("expected session cookie after setFlash")
+	}
+
+	// Now make a GET request with that session cookie — render should clear the flash
+	req2 := httptest.NewRequest("GET", "/dashboard", nil)
+	req2.AddCookie(cookies1[0])
+	rec2 := httptest.NewRecorder()
+	s.router.ServeHTTP(rec2, req2)
+	// Dashboard should render successfully
+	assertStatus(t, rec2, http.StatusOK)
+}
+
+// The banner has to be on every page, not only the dashboard: panic mode is the
+// state where not noticing is the entire problem.
+func TestRender_PanicBannerAppearsOnEveryAuthenticatedPage(t *testing.T) {
+	srv := newTestServerWithStatus(t, &shared.FirewallStatus{Panic: true, Acceptance: shared.AcceptanceIdle})
+	enrollFactor(t, srv)
+
+	for _, path := range []string{"/dashboard", "/ports", "/blocklist", "/log", "/apply"} {
+		t.Run(path, func(t *testing.T) {
+			rec := getAuthenticated(t, srv, path)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("GET %s = %d", path, rec.Code)
+			}
+			if !strings.Contains(rec.Body.String(), "panic-banner") {
+				t.Errorf("no panic banner on %s", path)
+			}
+		})
+	}
+}
+
+func TestRender_NoPanicBannerWhenNotInPanicMode(t *testing.T) {
+	srv := newTestServerWithStatus(t, &shared.FirewallStatus{Panic: false, Active: true, Acceptance: shared.AcceptanceIdle})
+
+	rec := getAuthenticated(t, srv, "/dashboard")
+	if strings.Contains(rec.Body.String(), "panic-banner") {
+		t.Error("the banner must not appear when panic mode is off")
+	}
+}
+
+// The login page must not reach the core: it is served before anyone is
+// authenticated, and it has to work when the core is down.
+func TestRender_LoginPageDoesNotAskTheCoreForStatus(t *testing.T) {
+	srv, calls := newTestServerCountingStatusCalls(t)
+
+	rec := httptest.NewRecorder()
+	srv.router.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/login", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /login = %d", rec.Code)
+	}
+	if got := atomic.LoadInt32(calls); got != 0 {
+		t.Errorf("the login page made %d status calls to the core; want 0", got)
+	}
+}
+
+func TestRender_NonceFromContext(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+
+	// nonce.html exists only as a fixture — it is a probe for the nonce plumbing,
+	// not part of the interface, so it is not in web/templates.
+	tmpl, err := loadTemplates("testdata/templates")
+	if err != nil {
+		t.Fatalf("load fixture templates: %v", err)
+	}
+	s.tmpl = tmpl
+
+	const testNonce = "abc123testNONCEvalue"
+	req := httptest.NewRequest("GET", "/", nil)
+	req = req.WithContext(context.WithValue(req.Context(), nonceCtxKey, testNonce))
+
+	rec := httptest.NewRecorder()
+	s.render(rec, req, "nonce.html", "test", nil)
+
+	if body := rec.Body.String(); !strings.Contains(body, testNonce) {
+		t.Errorf("render did not propagate nonce to template; body=%q", body)
+	}
+}
+
+// A template that cannot be rendered is a server error and has to be reported
+// as one. Executing straight into the ResponseWriter committed a 200 first, so
+// the failure arrived as an empty page that looked like a successful one — and
+// this test asserted nothing, so it passed either way.
+func TestRender_TemplateErrorIsAServerError(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	s.render(rec, req, "nonexistent-template.html", "test", nil)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 for a template that does not exist, got %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "<html") {
+		t.Error("no partial page may be written before the error is known")
+	}
+}
+
+// The same for a fragment: htmx swaps the body into the page, so half a
+// fragment is swapped in as though it were the whole one.
+func TestRenderPartial_TemplateErrorIsAServerError(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+
+	req := httptest.NewRequest("POST", "/iplist/validate", nil)
+	rec := httptest.NewRecorder()
+	s.renderPartial(rec, req, "no-such-partial", nil)
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("expected 500 for a fragment that does not exist, got %d", rec.Code)
+	}
+}
+
+func TestSetFlash(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+
+	req := httptest.NewRequest("GET", "/", nil)
+	rec := httptest.NewRecorder()
+	s.setFlash(rec, req, "test-flash-message")
+
+	if len(rec.Result().Cookies()) == 0 {
+		t.Error("expected session cookie after setFlash")
+	}
+}
+
+func TestBuildRouter_RegistersRoutes(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+
+	// Verify static files handler exists
+	req := httptest.NewRequest("GET", "/static/style.css", nil)
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+	// Not found is OK (no static files in test), but should not redirect to login
+	if rec.Code == http.StatusSeeOther && rec.Header().Get("Location") == "/login" {
+		t.Error("static file request should not be redirected to login")
+	}
+}
+
+func TestBuildRouter_CSRFDenyHandler(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+
+	// A POST with Sec-Fetch-Site: cross-site is rejected by CrossOriginProtection.
+	req := httptest.NewRequest("POST", "/login", strings.NewReader(""))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	rec := httptest.NewRecorder()
+	s.router.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for cross-origin POST, got %d", rec.Code)
+	}
+}
+
+func TestConfigLocalesDir(t *testing.T) {
+	cfg := &Config{}
+	if d := cfg.LocalesDir(); d != "locales" {
+		t.Errorf("expected 'locales', got %q", d)
+	}
+}
+
+func TestConfigTemplatesDir(t *testing.T) {
+	cfg := &Config{}
+	if d := cfg.TemplatesDir(); d != "web/templates" {
+		t.Errorf("expected 'web/templates', got %q", d)
+	}
+}
+
+func TestConfigStaticDir(t *testing.T) {
+	cfg := &Config{}
+	if d := cfg.StaticDir(); d != "web/static" {
+		t.Errorf("expected 'web/static', got %q", d)
+	}
+}
+
+func TestConfigKeyPath_Default(t *testing.T) {
+	cfg := &Config{}
+	cfg.SSLDir = "/etc/easywall/ssl"
+	if kp := cfg.KeyPath(); kp != "/etc/easywall/ssl/key.pem" {
+		t.Errorf("expected default key path, got %q", kp)
+	}
+}
+
+func TestConfigVersionCachePath_NoDataDir(t *testing.T) {
+	cfg := &Config{}
+	cfg.SSLDir = "/etc/easywall/ssl"
+	vcp := cfg.VersionCachePath()
+	if vcp == "" {
+		t.Error("expected non-empty VersionCachePath when DataDir is empty")
+	}
+}
+
+// An unusable session key is replaced rather than rejected — refusing to start
+// would break `docker compose up` out of the box, and an operator told to edit
+// a file inside a container image reaches for the fastest way past the message.
+// What must never happen is running with one.
+func TestValidate_ReplacesAnUnusableSessionKey(t *testing.T) {
+	for _, unusable := range []string{
+		"",
+		"CHANGE_ME_32_BYTES_HEX_ENCODED_SESSION_SECRET_HERE_XXXXXXXX",
+		"short",
+	} {
+		cfg := newCfgWith("0.0.0.0:12227", "/run/x", "/tmp", unusable)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate(%q): %v", unusable, err)
+		}
+		if cfg.SessionKey == unusable {
+			t.Errorf("%q was kept as the signing key", unusable)
+		}
+		if len(cfg.SessionKey) < minSessionKeyLen {
+			t.Errorf("the generated key is only %d characters", len(cfg.SessionKey))
+		}
+		if strings.Contains(cfg.SessionKey, sessionKeyPlaceholder) {
+			t.Error("the generated key still contains the placeholder")
+		}
+	}
+}
+
+// A key the operator chose is left alone.
+func TestValidate_KeepsAConfiguredSessionKey(t *testing.T) {
+	const mine = "1f0c1a3e5b7d9f11335577991bbddff11f0c1a3e5b7d9f11335577991bbddff1"
+	cfg := newCfgWith("0.0.0.0:12227", "/run/x", "/tmp", mine)
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SessionKey != mine {
+		t.Error("a configured session key must not be replaced")
+	}
+}
+
+// And the replacement is persisted, so sessions survive a restart.
+func TestValidate_PersistsTheGeneratedSessionKey(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "web.toml")
+	if err := os.WriteFile(path, []byte(`
+bind_addr = "0.0.0.0:12227"
+socket_path = "/run/easywall/core.sock"
+ssl_dir = "/etc/easywall/ssl"
+session_key = "CHANGE_ME_32_BYTES_HEX_ENCODED_SESSION_SECRET_HERE_XXXXXXXX"
+`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.SessionKey != cfg.SessionKey {
+		t.Error("the generated key was not written back, so every restart would sign with a different one")
+	}
+	if strings.Contains(reloaded.SessionKey, sessionKeyPlaceholder) {
+		t.Error("the placeholder is still in the file")
+	}
+}
+func TestSaveCredentials_InvalidPath(t *testing.T) {
+	cfg := &Config{}
+	cfg.configPath = "/nonexistent/path/web.toml"
+	err := cfg.SaveCredentials("admin", "hash")
+	if err == nil {
+		t.Error("expected error for invalid config path")
+	}
+}
+
+func TestSaveConfig_AtomicWrite(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "web.toml")
+	cfg := &Config{}
+	cfg.configPath = cfgPath
+	cfg.BindAddr = "0.0.0.0:12227"
+	cfg.SocketPath = "/run/x"
+	cfg.SSLDir = "/tmp/ssl"
+	cfg.SessionKey = "test-key"
+	cfg.Language = "en"
+
+	if err := cfg.saveLocked(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// Verify the file was created
+	if _, err := os.Stat(cfgPath); err != nil {
+		t.Errorf("config file not created: %v", err)
+	}
+}
+
+func TestServer_Stop_NeverStarted(t *testing.T) {
+	fc := newFakeCore(t)
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+	if err := generateSelfSignedCert(sslDir); err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+
+	cfg := &Config{}
+	cfg.configPath = dir + "/web.toml"
+	cfg.BindAddr = "127.0.0.1:0"
+	cfg.SocketPath = fc.socketPath
+	cfg.SSLDir = sslDir
+	cfg.SessionKey = "test-key-32bytes-padding-padding!"
+
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	// Stop without ever calling Start — must not panic
+	s.Stop()
+}
+
+func TestServer_StartStop(t *testing.T) {
+	fc := newFakeCore(t)
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+	if err := generateSelfSignedCert(sslDir); err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+
+	cfg := &Config{}
+	cfg.configPath = dir + "/web.toml"
+	cfg.BindAddr = "127.0.0.1:0"
+	cfg.SocketPath = fc.socketPath
+	cfg.SSLDir = sslDir
+	cfg.SessionKey = "test-key-32bytes-padding-padding!"
+
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	// NewServer resolves the asset directories against the working directory,
+	// which under `go test` is this package. Start refuses to serve without
+	// templates — on purpose — so hand it the ones that ship.
+	if s.tmpl, err = loadTemplates(repoTemplates(t)); err != nil {
+		t.Fatalf("loadTemplates: %v", err)
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- s.Start() }()
+
+	// Give the server time to bind the port before stopping
+	time.Sleep(50 * time.Millisecond)
+	s.Stop()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start returned unexpected error after Stop: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Error("Start did not return within 3s after Stop")
+	}
+}
+
+// Stop waits for a refresh in progress: a country download that finished after
+// Stop returned wrote into a data_dir the caller had already removed (CI, 2.29).
+func TestServer_StopWaitsForTheRefreshInProgress(t *testing.T) {
+	asked := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		asked <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	// A failing path must not leave the handler blocked: srv.Close waits for it.
+	defer func() {
+		select {
+		case release <- struct{}{}:
+		default:
+		}
+	}()
+	was := countryArchiveURL
+	countryArchiveURL = srv.URL + "/country-ip-blocks.tar.gz"
+	t.Cleanup(func() { countryArchiveURL = was })
+
+	fc := newFakeCore(t)
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+	if err := generateSelfSignedCert(sslDir); err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+	cfg := &Config{}
+	cfg.configPath = dir + "/web.toml"
+	cfg.BindAddr = "127.0.0.1:0"
+	cfg.SocketPath = fc.socketPath
+	cfg.SSLDir = sslDir
+	cfg.DataDir = dir
+	cfg.SessionKey = "test-key-32bytes-padding-padding!"
+	cfg.CountryLookup = true
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	if s.tmpl, err = loadTemplates(repoTemplates(t)); err != nil {
+		t.Fatalf("loadTemplates: %v", err)
+	}
+	go func() { _ = s.Start() }()
+	select {
+	case <-asked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the runner never asked for the country table")
+	}
+
+	stopped := make(chan struct{})
+	go func() { s.Stop(); close(stopped) }()
+	select {
+	case <-stopped:
+		t.Fatal("Stop returned while a refresh was still in progress")
+	case <-time.After(300 * time.Millisecond):
+	}
+	release <- struct{}{}
+	select {
+	case <-stopped:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop did not return after the refresh finished")
+	}
+}
+
+func TestPageDataCarriesTheInstalledVersion(t *testing.T) {
+	fc := newFakeCore(t)
+	s := newTestServer(t, fc)
+	enrollFactor(t, s)
+
+	rec := getAuthenticated(t, s, "/dashboard")
+	assertStatus(t, rec, http.StatusOK)
+	if !strings.Contains(rec.Body.String(), shared.CurrentVersion) {
+		t.Errorf("the dashboard does not name %s anywhere; the installed version is the "+
+			"first question on every bug report", shared.CurrentVersion)
+	}
+
+	rec = getAuthenticated(t, s, "/ports")
+	if !strings.Contains(rec.Body.String(), shared.CurrentVersion) {
+		t.Errorf("the sidebar chip does not carry %s", shared.CurrentVersion)
+	}
+}
+
+func TestServer_Start_MissingCert(t *testing.T) {
+	fc := newFakeCore(t)
+	dir := t.TempDir()
+	sslDir := dir + "/ssl"
+	_ = os.MkdirAll(sslDir, 0750)
+	// Generate cert so NewServer doesn't fail
+	if err := generateSelfSignedCert(sslDir); err != nil {
+		t.Fatalf("generateSelfSignedCert: %v", err)
+	}
+
+	cfg := &Config{}
+	cfg.configPath = dir + "/web.toml"
+	cfg.BindAddr = "127.0.0.1:0"
+	cfg.SocketPath = fc.socketPath
+	cfg.SSLDir = sslDir
+	cfg.SessionKey = "test-key-32bytes-padding-padding!"
+
+	s, err := NewServer(cfg)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	// Point the certificate manager at a file that does not exist. The server
+	// no longer hands paths to ListenAndServeTLS — the certificate comes from
+	// the manager on each handshake — so Start checks it can load one before it
+	// binds the port, rather than accepting connections it cannot complete.
+	s.certs.certPath = dir + "/nonexistent.pem"
+	s.certs.cert = nil
+	// Templates first, so the error below is the certificate's and not the
+	// missing-asset check that also guards Start.
+	if s.tmpl, err = loadTemplates(repoTemplates(t)); err != nil {
+		t.Fatalf("loadTemplates: %v", err)
+	}
+
+	err = s.Start()
+	if err == nil {
+		t.Fatal("expected error when TLS cert file doesn't exist")
+	}
+	if !strings.Contains(err.Error(), "TLS certificate") {
+		t.Errorf("error %q is not about the certificate", err)
+	}
+}
