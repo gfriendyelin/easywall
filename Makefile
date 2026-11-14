@@ -1,0 +1,89 @@
+VERSION     ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS     := -s -w -X github.com/jp1337/easywall/internal/shared.CurrentVersion=$(VERSION)
+BUILD_FLAGS := -ldflags "$(LDFLAGS)"
+
+BINARIES := easywall-core easywall-web
+
+# `docker` is in here because it shares its name with the docker/ directory, and
+# make answers a target with a file of that name by declaring it up to date.
+# It did: `make docker` printed "'docker' is up to date", built nothing and
+# exited 0 — the same shape as the defect the target's own comment warns about,
+# a build that produces nothing and reports success. `deb` collides with no path
+# today (the directory is debian/) and is listed with it because a target that
+# only works by the absence of a file is one rename away from not working.
+.PHONY: all build css docs-css test lint vuln clean install release docker deb
+
+## Build both binaries
+all: build
+
+## Build CSS from Tailwind source (app)
+css:
+	npx @tailwindcss/cli -i web/src/app.css -o web/static/style.css --minify
+
+## Build CSS for the GitHub Pages documentation site
+docs-css:
+	npx @tailwindcss/cli -i web/src/docs.css -o docs/assets/css/style.css --minify
+
+build: css
+	@echo "Building $(VERSION)..."
+	CGO_ENABLED=0 go build $(BUILD_FLAGS) -o bin/easywall-core ./cmd/easywall-core
+	CGO_ENABLED=0 go build $(BUILD_FLAGS) -o bin/easywall-web  ./cmd/easywall-web
+
+## Cross-compile for Linux amd64 + arm64
+release:
+	@mkdir -p dist
+	GOOS=linux GOARCH=amd64  CGO_ENABLED=0 go build $(BUILD_FLAGS) -o dist/easywall-core-linux-amd64  ./cmd/easywall-core
+	GOOS=linux GOARCH=amd64  CGO_ENABLED=0 go build $(BUILD_FLAGS) -o dist/easywall-web-linux-amd64   ./cmd/easywall-web
+	GOOS=linux GOARCH=arm64  CGO_ENABLED=0 go build $(BUILD_FLAGS) -o dist/easywall-core-linux-arm64  ./cmd/easywall-core
+	GOOS=linux GOARCH=arm64  CGO_ENABLED=0 go build $(BUILD_FLAGS) -o dist/easywall-web-linux-arm64   ./cmd/easywall-web
+
+## Run all tests with race detector
+test:
+	go test -race -coverprofile=coverage.out -covermode=atomic ./cmd/... ./internal/...
+	go tool cover -html=coverage.out -o coverage.html
+
+## Lint via golangci-lint
+lint:
+	golangci-lint run
+
+## Security vulnerability scan
+vuln:
+	govulncheck ./...
+
+## Security linter. -tests is what makes -tags do anything: everything behind
+## the integration tag is a _test.go file, and gosec skips those unless asked.
+gosec:
+	gosec -tests -tags integration -fmt text ./...
+
+## Update i18n messages (requires go-i18n CLI)
+i18n-extract:
+	goi18n extract -outdir locales -format json ./...
+	goi18n merge  -outdir locales -format json locales/en.json
+
+## Install to system (requires root)
+install: build
+	install -d /usr/sbin /usr/share/easywall /etc/easywall
+	install -m 0755 bin/easywall-core /usr/sbin/
+	install -m 0755 bin/easywall-web  /usr/sbin/
+	cp -r web locales /usr/share/easywall/
+	install -m 0644 systemd/easywall-core.service     /lib/systemd/system/
+	install -m 0644 systemd/easywall-web.service      /lib/systemd/system/
+	install -m 0644 systemd/easywall-selftest.service /lib/systemd/system/
+	systemctl daemon-reload
+
+## Docker image
+# `docker` here may not be docker. On Fedora and the RHEL family, podman-docker
+# installs /usr/bin/docker as a shim over podman — and podman's default image
+# format is OCI, which has no healthcheck field, so the Dockerfile's HEALTHCHECK
+# is dropped with one warning and this target still exits 0. Add
+# `--format docker` if that is your machine; the Dockerfile's HEALTHCHECK
+# comment carries the argument.
+docker:
+	docker build --build-arg VERSION=$(VERSION) -t easywall:$(VERSION) .
+
+## Build Debian package
+deb:
+	dpkg-buildpackage -us -uc -b
+
+clean:
+	rm -rf bin/ dist/ coverage.out coverage.html

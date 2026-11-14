@@ -1,0 +1,173 @@
+# ── Stage 1: Build ──────────────────────────────────────────────────────────
+# Pinned to the patch, and to the same one as go.mod's toolchain line — a test
+# compares the two. `golang:1.26-alpine` floated to whatever the newest 1.26 was,
+# which is how this image came to be built by a Go version no workflow tested with.
+FROM golang:1.27.3-alpine AS builder
+
+WORKDIR /src
+
+# Cache dependencies separately from source
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Build both binaries with version injection
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build \
+      -ldflags "-s -w -X github.com/jp1337/easywall/internal/shared.CurrentVersion=${VERSION}" \
+      -o /out/easywall-core ./cmd/easywall-core && \
+    CGO_ENABLED=0 GOOS=linux go build \
+      -ldflags "-s -w -X github.com/jp1337/easywall/internal/shared.CurrentVersion=${VERSION}" \
+      -o /out/easywall-web ./cmd/easywall-web
+
+# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
+FROM alpine:3.24
+
+# Provenance, set here rather than in one of the workflows, because there are
+# three build paths — GoReleaser for a release, publish-edge for :edge, and a
+# plain `docker build` for anyone building their own — and only this file is on
+# all three. installation/docker.md tells operators to read the revision back
+# and compare it against the tag; before this, release images carried no labels
+# at all and the instruction could not work.
+ARG VERSION=dev
+ARG REVISION=unknown
+LABEL org.opencontainers.image.title="easywall" \
+      org.opencontainers.image.description="Linux firewall management with a web interface" \
+      org.opencontainers.image.source="https://github.com/jp1337/easywall" \
+      org.opencontainers.image.url="https://easywall-project.org" \
+      org.opencontainers.image.documentation="https://easywall-project.org" \
+      org.opencontainers.image.licenses="GPL-3.0-or-later" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+
+# nftables for firewall management; supervisor to run both processes; tini for
+# signal handling; tzdata so TZ (docker-compose.yml) resolves to an actual
+# zone. Alpine carries none of the /usr/share/zoneinfo database by default —
+# without this package, Go's time.LoadLocation fails for anything but "UTC"
+# and "Local" silently means UTC regardless of what TZ says, which is a TZ
+# variable that looks respected and is not.
+#
+# The ids are pinned to what alpine happened to assign when they were not:
+# 101 and 100, measured in the v2.21.1 image. Pinned so a bind-mounted
+# directory can be handed over with one stable `chown 100:101`, and unchanged
+# so no existing volume changes owner on upgrade.
+RUN apk add --no-cache nftables supervisor tini tzdata && \
+    addgroup -S -g 101 easywall && \
+    adduser  -S -u 100 -G easywall easywall
+
+COPY --from=builder /out/easywall-core /usr/sbin/easywall-core
+COPY --from=builder /out/easywall-web  /usr/sbin/easywall-web
+
+# Assets served by the web process (relative to WorkingDirectory)
+COPY web/     /usr/share/easywall/web/
+COPY locales/ /usr/share/easywall/locales/
+
+# Default configs — can be overridden with a bind mount, which is why a pristine
+# copy stays here as well: a bind mount of an empty directory brings no
+# configuration with it, and the entrypoint installs these into it.
+COPY config/*.toml /etc/easywall/
+COPY config/*.toml /usr/share/easywall/config/
+
+# Runtime directories
+# Ownership mirrors the Debian layout, and for the same reason: /etc/easywall
+# holds easywall.toml, which the root core reads. Handing the whole directory to
+# the unprivileged web user — as `chown -R easywall:easywall /etc/easywall` did
+# — let a network-facing process rewrite the configuration root loads.
+# /var/lib/easywall is the core's in the same way, and the web keeps its state
+# in web/ inside it: until 2.22 the two shared one 0770 directory, and the web
+# user could replace the core's files there and plant links root wrote through.
+# A named volume is filled from this layout; the entrypoint repairs any other.
+RUN mkdir -p /run/easywall /var/lib/easywall/web /var/log/easywall /etc/easywall/ssl && \
+    chown root:easywall /run/easywall     && chmod 750 /run/easywall && \
+    chown root:easywall /etc/easywall     && chmod 750 /etc/easywall && \
+    chown root:root     /etc/easywall/easywall.toml && chmod 600 /etc/easywall/easywall.toml && \
+    chown easywall:easywall /etc/easywall/web.toml  && chmod 600 /etc/easywall/web.toml && \
+    chown easywall:easywall /etc/easywall/ssl       && chmod 750 /etc/easywall/ssl && \
+    chown root:easywall /var/lib/easywall && chmod 750 /var/lib/easywall && \
+    chown easywall:easywall /var/lib/easywall/web && chmod 700 /var/lib/easywall/web && \
+    chown root:easywall /var/log/easywall && chmod 750 /var/log/easywall
+
+# Supervisor config
+COPY docker/supervisord.conf /etc/supervisord.conf
+
+# The ownership above is set at build time and a bind mount replaces all of it.
+# The entrypoint restores it at start, which is what makes `docker compose up -d`
+# with the shipped ./easywall-config mount work at all — read its header.
+COPY docker/entrypoint.sh /usr/local/bin/easywall-entrypoint
+RUN chmod 0755 /usr/local/bin/easywall-entrypoint
+
+EXPOSE 12227
+
+# One request, and it covers both halves of the recorded incident.
+#
+# docker/entrypoint.sh's header describes a container that stayed "Up" with a
+# live core and a dead web process: easywall-web could not write its own config,
+# exited 1, supervisord restarted it for ever, and the check of the day looked
+# only at the core's socket. A check on the core cannot see that half, and until
+# this line a plain `docker run` had no check at all — only docker-compose.yml
+# did, so anybody not using compose got the container's status from nothing but
+# whether PID 1 was alive.
+#
+# Do not "restore" a second command asking easywall-core. It was here, and it
+# was wrong twice over. /healthz already sees everything it saw:
+#
+#   - the endpoint is *served by the web process*, so an answer at all proves
+#     that process is alive. That is the incident above, and the only half a
+#     core-side check could never see.
+#   - the handler *asks the core over the socket*, so a dead core is
+#     fail/core_unreachable → 503, and a kernel that is not carrying the rules
+#     is fail/not_enforcing → 503.
+#
+# One request therefore sees a dead web process, a dead core, and a firewall that
+# has stopped filtering. The second command added no coverage — and it broke the
+# one state that must not restart anything. handler_health.go answers 200 for
+# `degraded` deliberately, because every cause of `degraded` is immune to a
+# restart: a failed proof is the same binary, a build finding is the same binary,
+# a dead stateful counter is the same rules. Restarting buys nothing and costs a
+# window in which the machine is not filtering at all. `easywall-core health`
+# exits 1 on `degraded`, so a composite `health && wget` marked the container
+# unhealthy anyway and made the handler's argument unreachable.
+#
+# start-period is 15s and not docker-compose.yml's old 5s: the entrypoint does
+# its ownership work over a bind-mounted /etc/easywall before supervisord starts
+# anything, and a first-run container generates its certificate after that.
+#
+# Podman needs `--format docker`, and so does `podman compose build`. Its
+# default image format is OCI, and the OCI spec has no healthcheck field, so a
+# podman build prints one warning — "not supported for OCI image format and will
+# be ignored" — and produces an image with no check in it, from a build that
+# exits 0. Building this file with podman and no flag gives you back exactly the
+# state this line exists to remove, which is why it is written here next to the
+# check rather than only in the installation guide.
+#
+# `podman compose build` is the sharper edge of the two, because
+# docker-compose.yml has a `build:` section and `podman compose up -d` is the
+# documented path: an operator who follows the documentation on a podman host
+# builds an OCI image locally and gets no health check and no error. That is
+# named again in docker-compose.yml and is carried in carried-forward.md,
+# because a comment is not a fix — the real answers are making the documented
+# path pull a published image or accepting a compose-level check, and both are
+# decisions past this release.
+#
+# `easywall-web -healthcheck` and not a wget, since 2.22. The wget was fixed at
+# https://127.0.0.1:12227, and bind_addr is the operator's: a specific address
+# refuses loopback and a moved port answers nothing, so the container read
+# `unhealthy` for ever on a firewall that was fine. The flag reads bind_addr at
+# run time — web.toml, then EASYWALL_WEB_BIND_ADDR — dials from that address,
+# and /healthz admits a peer that is its own local address. It writes nothing.
+#
+# Shell form, deliberately: build.yml runs `.Config.Healthcheck.Test[1]`, which
+# is the whole command only under CMD-SHELL.
+#
+# The self-test needs CAP_SYS_ADMIN to build the namespace it proves rules in,
+# and this image asks for NET_ADMIN and nothing else — so health reports the
+# self-test as never recorded. That is not `degraded` and must not make the
+# container unhealthy: being unable to prove something is not the same as it
+# being broken. computeHealth's last branch is where that is decided.
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+  CMD easywall-web -healthcheck
+
+VOLUME ["/etc/easywall", "/var/lib/easywall", "/var/log/easywall"]
+
+ENTRYPOINT ["/sbin/tini", "--", "/usr/local/bin/easywall-entrypoint"]
+CMD ["/usr/bin/supervisord", "-c", "/etc/supervisord.conf", "-n"]

@@ -1,0 +1,53 @@
+# 🔐 Security Policy
+
+## Supported Versions
+
+| Version | Supported |
+|---|---|
+| 2.x (current) | ✅ |
+| 0.x (archived Python rewrite) | ❌ |
+
+## Reporting a Vulnerability
+
+**Do not open a public GitHub issue for security vulnerabilities.**
+
+Use **[GitHub Security Advisories](https://github.com/jp1337/easywall/security/advisories/new)** for private, coordinated disclosure. This keeps the report confidential until a fix is ready.
+
+### What to include
+
+- Description of the vulnerability and its potential impact
+- Steps to reproduce (proof of concept if possible)
+- Affected version(s)
+- Any suggested mitigations or patches
+
+### Response timeline
+
+| Milestone | Target |
+|---|---|
+| Initial acknowledgement | ≤ 48 hours |
+| Confirmed / triaged | ≤ 7 days |
+| Patch for critical issues | ≤ 14 days |
+| Public disclosure | After patch is released |
+
+### Research is welcome, and unpaid
+
+You may test easywall and report what you find. There is no payment: easywall is a volunteer project, and every report serves the people who rely on it. With your consent, we credit you in the security advisory and the release notes. Test on your own installation, never on other people's.
+
+---
+
+## Security Architecture
+
+easywall is designed with a layered approach — each layer independently limits the blast radius of a compromise:
+
+- **No subprocess for typed rules** — typed rules go to nftables over netlink
+  (`google/nftables`) as Go structs, so there is no command line to inject into. Custom
+  rules are the one exception: they are arbitrary nftables expressions and need the
+  official parser, so they reach `nft -f -` over **stdin** — no argv — and only inside
+  the privileged core. The web process never invokes a shell.
+- **Process isolation** — the web interface runs as an unprivileged user (`easywall`). Only the core daemon runs as root, and it only accepts typed JSON commands over a Unix socket.
+- **Argon2id authentication** — resistant to GPU-based brute-force attacks.
+- **CSRF protection** — via `net/http.CrossOriginProtection` (Go 1.25 native).
+- **XSS prevention** — Go's `html/template` auto-escapes all output by default.
+- **Two-step activation** — firewall changes require confirmation within a configurable window, preventing accidental lockouts.
+
+See the full [Security Model](https://easywall-project.org/security/) in the documentation.

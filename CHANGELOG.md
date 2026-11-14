@@ -1,0 +1,3203 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [2.29.2] — 2026-10-30
+
+**What an audit turned up.**
+
+### Security
+
+- **The image carries Python 3.14.10** (Alpine `python3` 3.14.10-r0, was
+  3.14.8-r0), whose `ssl` module distrusts compromised certificates
+  (CVE-2026-115557, critical). Python is in the image only because
+  `supervisord` is written in it, and supervisord opens no TLS connection;
+  easywall's own HTTPS requests go through Go's `crypto/x509`. A rebuild picks
+  the fix up, so 2.29.1 images stay flagged until replaced.
+- **A rollback now undoes an option or network change, not only the rules.**
+  Confirm `ipv6.mode = "filter"`, apply `block`, let the window close: the old
+  rules came back, but the kernel still held `meta nfproto ipv6 drop` under a
+  status reading *rolled back*, and `/apply` said nothing was pending. A restart
+  inside the window did the same. Saving an option rewrites the live
+  configuration, and the rollback rebuilt the table from it. An apply now keeps
+  the configuration in force before it, in memory and in the `unconfirmed`
+  marker; the change stays configured and shows as pending.
+- **The blocklist, the feeds and the countries refuse forwarded traffic too.**
+  They were written into the input chain only, so a blocklisted client, or one
+  in a feed or country you switched on, still reached a container on any port
+  with a forwarded rule. Measured in a network namespace: connected before,
+  refused after. The forward chain now checks the same sets, in the same order,
+  before every forwarded port rule; container networks are exempt, and the
+  allowlist exempts from the feeds without opening anything.
+- **Port forwarding no longer captures traffic the host only routes.** A client
+  dialling another machine's port 80 through this host was answered by its
+  forwarded 8080: the redirect matched the port alone. It now matches only
+  packets addressed to this host (`fib daddr type local`), as the forwarding page
+  always said.
+- **The second-factor budget holds against parallel requests.** Codes sent
+  concurrently on one frozen intermediate cookie got 5–9 checks against a budget
+  of 3 in process, 3–4 over HTTP/2: the count was read before the check and
+  booked after it. An attempt is now reserved atomically first, for codes and
+  passkeys alike.
+- **A recovery code works once, also when two are entered at the same time.**
+  Two codes used concurrently were both accepted and one of them worked again
+  afterwards (7 stored instead of 6); the same code twice opened two sessions.
+  The matching hash is now removed under the configuration lock.
+- **Signing out ends a session that still has a request in flight.** A page
+  still loading at logout re-signed the session cookie with an age of zero, and
+  it worked again once the revocation record expired ten minutes later. The
+  session store now strips a revoked session's identity at every save.
+- **The web process can no longer keep `easywall-core panic` from being heard.**
+  The core read its socket with no deadline and no cap: one idle client held
+  `systemctl restart` until SIGKILL, and 32 clients sending 8 MiB each took the
+  heap from 4 to 286 MiB. Connections are now bounded (16 served, 48 waiting),
+  a request must arrive within 5 s, and a root peer — the console — skips the
+  queue.
+- **A login event can no longer write free text into the audit log.** An IPv6
+  zone survived the core's address parsing: `fe80::1%` followed by 100 000
+  characters made a 100 013-byte entry, and an escape sequence reached the file.
+  The zone is dropped.
+- **An `audit.log` from before 2.5.0 is no longer readable by the web user.**
+  The 0600 mode applied only when the file was created, so where no logrotate
+  recreates it — the container image — it stayed 0640 `root:easywall`. The core
+  tightens it at start.
+- **`apt purge easywall` removes the secrets.** It left `/etc/easywall`
+  (password hash, TOTP secret, session key, TLS key), the rules and the logs
+  behind, while the Debian guide said purge removes them. The easywall user and
+  group stay.
+
+### Fixed
+
+- **A development build no longer shows a false "update available" banner.** A
+  build from source carries the `git describe` string (`v2.29.1-dirty`,
+  `v2.29.1-5-gABC`); the update check read that suffix as a pre-release and, on
+  every dashboard load, offered an "update" back to the release the build is
+  already ahead of. Released binaries, built from a clean tag, were never
+  affected. `isNewer` now compares the release the build sits on.
+- **A second rule for a port now shows in the apply preview.** Adding an open
+  row for a port that already had a source-restricted one opened that port to
+  everyone — the kernel gets one accept per row — while `/apply` listed nothing
+  and the dashboard showed no unapplied change. The preview compared the first
+  row per port only; it now compares all of them.
+- **`easywall-core -config <path> panic` no longer starts a second daemon.** A
+  subcommand is only recognised as the first argument; written after a flag it
+  was silently ignored, and the daemon that started instead restored the rules
+  and took over the running core's socket. Anything left over after the flags is
+  now refused with the order that works.
+- **The bogon filter no longer closes a port to the private network you opened
+  it to.** A port open only to `10.9.0.0/24` stopped answering that network when
+  the filter was switched on. A port rule's sources are now exempt, for that
+  rule's protocol and port only.
+- **Behind a trusted proxy, the apply screen no longer guesses at your port.** It
+  tested easywall's own listen port while the browser reaches the proxy's —
+  with only 443 open it said "blocks", with only the listen port open it said
+  "reachable" to an operator being cut off. It now says it cannot tell.
+- **A failed-login attack from one IPv6 /64 notifies.** Each address had its own
+  count while the login limiter counts the /64: 20 failures from 20 addresses,
+  0 notifications. The notification now counts as the limiter does.
+- **In the demo, a visitor's telemetry answer no longer reaches `web.toml`.** It
+  was written to the real file and survived the restart that clears every other
+  change. A test now posts to every route in demo mode and compares the file.
+- **The first failed login from a new address is logged at once when the table
+  is full.** Past 1024 addresses it waited for the 60 s window to close.
+- **An unreadable panic marker is one journal line, not one per status poll.**
+- **Docker's native nftables backend is read.** The published-port warning looked
+  for table `docker`; Docker writes `ip docker-bridges`, so it never warned.
+- **A signed-out cookie no longer writes logout lines to the audit log.**
+  Replayed 300 times, it wrote 301.
+- **A wrong code on a passkey-only account is just a wrong code.** It logged an
+  ERROR advising to delete `passkeys.json` — the account's only factor.
+- **The old `/blacklist` and `/whitelist` addresses accept a 2 MiB list**, as
+  `/blocklist` and `/allowlist` do; they kept the 64 KiB site limit.
+- **The package depends on `ca-certificates`.** Installed with
+  `--no-install-recommends` it had no CA bundle, and every HTTPS request failed.
+- **A release whose tag disagrees with `debian/changelog`, `version.go` or this
+  file stops before anything is published.** It published the release and
+  `:latest`, then failed the `.deb`, leaving the download link a 404.
+- **The audit log can no longer fill the disk where logrotate is absent.** The
+  packaged install rotates it; the container image ships no logrotate, so the
+  privileged core appended to one file for ever. It now rewrites itself down to
+  its most recent entries past 16 MiB — a backstop that never fires where
+  logrotate keeps the file small.
+
+### Changed
+
+- **A restart enforces what was applied, not what was saved since.** A boot,
+  `easywall-core resume` and the Docker reconciler rebuilt the table from the
+  configuration file, so an option saved on `/options` and never applied went
+  live at the next restart, with no acceptance window. They now enforce the
+  last applied configuration; an edited `easywall.toml` stays pending until an
+  apply. **A host managed by editing the file and restarting needs an apply
+  now.**
+- **A key missing from `easywall.toml` is its shipped default, for every key.**
+  Only the numeric limits, `icmp_allow_echo_request` and `acceptance.duration`
+  were filled in; every other absent switch read as off. A hand-written or
+  templated file without `docker.enabled` cut containers off, and without the
+  ICMPv6 keys broke IPv6, while the schema said each defaults to on. Without
+  `acceptance.enabled` there was no rollback window; absent, it is now on. The
+  file the package installs names every key, so a packaged host sees no change.
+- **An invisible character is not the symbol a password needs.** A zero-width
+  space, soft hyphen or combining accent counted as the symbol and toward the
+  twelve characters; a symbol is now punctuation, a symbol or a space.
+- **A `notify_kind` outside `webhook`, `ntfy` or empty is refused at startup.**
+  Hand-written into `web.toml`, an unknown value reached the notifier, where
+  anything but `ntfy` was posted to `notify_url` as a webhook. The schema and the
+  interface already restricted it; the config loader now does too.
+
+### Documentation
+
+- The `update_check` schema description names `api.github.com`, the host the check
+  contacts — it said `github.com`. The distinction matters for an egress
+  allowlist.
+- README, landing page and SECURITY no longer say easywall never runs `nft`;
+  custom rules and their syntax check do.
+- `easywall-core(1)` documents `health` and `selftest`, the real exit codes,
+  `[usage]` on `SIGHUP` and the subcommand-first syntax.
+- The manual install creates the configuration once, with `--write-config`, and
+  names Node.js and `npm ci`, which `make build` needs.
+- `icmp_allow_router_advertisement` allows ICMPv6 types 133 and 134;
+  `EASYWALL_WEB_LANGUAGE` accepts every shipped locale; `GET/SAVE_SETTINGS`
+  carry routing too.
+- The README coverage badge reads `main`, not Codecov's stale default branch
+  (68 % → 90 %); Codecov now counts `cmd/` and the integration suite's
+  `internal/web`.
+
+## [2.29.1] — 2026-10-25
+
+**Built with Go 1.27.3.**
+
+### Security
+
+- **Built with Go 1.27.3**, which distrusts compromised intermediate
+  certificates in `crypto/x509` (GO-2026-6809, CVE-2026-111943). Every HTTPS
+  request easywall makes verifies with it: feeds, the country database, the
+  update check, notifications.
+
+### Changed
+
+- `go-chi/chi` 5.5.0, `mermaid` 12.2.0. The `katex` override is gone: mermaid
+  now asks for a safe range itself.
+
+## [2.29.0] — 2026-10-15
+
+**Which lists, and which country.**
+
+### Added
+
+- **/blocked filters by country, over the whole log** — a *Country* select, and
+  *Only this country* in the name popover. The count covers the whole log, not
+  the page. `GET_PACKET_LOG` takes `before`.
+- **Two blocklist.de feeds** — *SSH* (recommended) and *IMAP, POP3* (optional).
+
+### Changed
+
+- **blocklist.de (all) is now deliberate-only (✗)** — it lists search crawlers,
+  uptime monitors and Cloudflare. Installations that have it on keep it on.
+- **A list refused as a shrink for a day and three fetches in a row is taken**,
+  and audited as `feed_shrink_accepted`.
+
+### Fixed
+
+- **Off, apply, on, apply takes a list refused as a shrink** — switching it on
+  now fetches it at once. Before, the second apply reloaded the old copy.
+
+### Documentation
+
+- The feed catalogue was re-measured 2026-10-15.
+- The roadmap moves down one: the metrics endpoint is now 2.30.
+
+## [2.28.0] — 2026-10-15
+
+**An update asks once.**
+
+### Added
+
+- **The dashboard asks whether this installation may be counted** — once after
+  each minor or major update, and only while counting is off. A card at the top,
+  not a page in the way: *Yes, count it*, *No, thanks* and *Don't ask again*. It
+  shows the request it would send. It never appears when
+  `EASYWALL_WEB_TELEMETRY` is set, because the deployment decided, nor in demo
+  mode. The answer for this version is kept in
+  `<data_dir>/web/telemetry_prompt.json`; the first-run wizard and the switch
+  under **System** count as answers too.
+
+### Documentation
+
+- Configuration, environment variables and both privacy pages say when the
+  question comes back and how to stop it.
+- The roadmap moves down one: the metrics endpoint is now 2.29.
+
+## [2.27.1] — 2026-10-15
+
+**Flags, and the name where a thumb can read it.**
+
+### Changed
+
+- **/blocked shows each country with its flag.** On a desktop the flag sits beside
+  the code, and a click or tap on the code opens the country's name; on a phone
+  the row reads the whole name, *Russia (RU)*. The Countries card on Blocklist
+  carries the flag too. The flags are
+  [flag-icons](https://github.com/lipis/flag-icons) 7.5.0 (MIT), shipped as
+  `web/static/flags/` — about 1.5 MB in the package; a page loads only the flags
+  of the countries it shows.
+- The row action reads **Block country** in every row; screen readers hear
+  *Block country: Russia*.
+
+### Documentation
+
+- A block page for refused visitors is listed as deliberately excluded, with the
+  reason: easywall drops the packet in the kernel, and for HTTPS such a page
+  would need the site's own certificate.
+- Field check of 2.27.0: the +85 MB reading was the login's argon2id peak
+  (VmHWM); easywall-web settles about 7 MB above 2.26.0.
+
+## [2.27.0] — 2026-10-14
+
+**Where it comes from.**
+
+### Added
+
+- **A Country column on Blocked.** Each address shows the country it is
+  registered in, from
+  [ipverse/country-ip-blocks](https://github.com/ipverse/country-ip-blocks)
+  (CC0), loaded once a day by `easywall-web`.
+- **Block XX.** A row action that blocks the address's country in one step,
+  the same feed that **Blocklist** adds.
+- **A status line** on Blocked: when the lookup was last checked, and why it
+  failed if it did.
+
+### Changed
+
+- **A new outbound request, on by default.** Once a day to `github.com` and
+  `release-assets.githubusercontent.com`; the first fetch comes right after the
+  upgrade restart. Switch it off with `country_lookup = false` or
+  `EASYWALL_WEB_COUNTRY_LOOKUP=false`. **A host that set `update_check = false`
+  so that it never contacts GitHub must now also set this.** GitHub receives
+  the server's IP address and a User-Agent naming easywall and its version.
+- `easywall-web` takes about 10 MB more RSS, and the dataset is 1.7 MB in
+  `data_dir/web/countries.tar.gz`.
+- A host without outbound access retries with backoff from 1 h to 24 h, logs a
+  warning each time and shows the failure in the status line.
+- `easywall-web` now warns at start about `web.toml` keys it does not read, for
+  example a key placed after `[tls]`. The retired `csrf_key` is exempt.
+- Blocked asks the core for the rules once per request instead of up to three
+  times.
+
+### Fixed
+
+- `check:ui`'s `204` check is deterministic.
+
+## [2.26.0] — 2026-10-14
+
+**Countries.**
+
+### Added
+
+- **Block a country.** A new card on **Blocklist** lists the countries you
+  switched on and adds one from a select of all 238, named in the page's
+  language. Each country is a feed: checked after the allowlist and after
+  every other feed, refreshed daily, kept at its last copy when a refresh
+  fails, and named on **Blocked** as *Country: Germany*. The source is
+  [ipverse/country-ip-blocks](https://github.com/ipverse/country-ip-blocks)
+  (CC0), built daily from the five registries; an unchanged country costs a
+  `304`. At most 30 at a time — the thirty largest, at their real sizes, are
+  what the integration test loads (280 kernel rules, one transaction). See
+  [Countries](https://easywall-project.org/docs/features/countries/).
+- **Apply waits for a country's first copy.** A country switched on is fetched
+  in the background; until its copy is stored, **Apply** refuses and names it,
+  so an empty set is never confirmed and filled later without a window.
+
+### Changed
+
+- A country's IPv4 networks may be as broad as /4 — the United States holds
+  `16.0.0.0/6`, and a list's /8 limit would have refused its whole copy. IPv6
+  keeps /16 for everything.
+- A country is exempt from the 70 % shrink guard: its copy arrives as one JSON
+  document, so a truncated download cannot parse, and a real shrink — a block
+  transferred to another country — must load.
+- Saving the Feeds card keeps every country switched on.
+
+## [2.25.2] — 2026-10-14
+
+**The live tail sends what is new.**
+
+### Fixed
+
+- **/blocked resent its whole table every five seconds.** Each poll carried
+  every row, measured at 190 KB for 103 rows, uncompressed — about 137 MB an
+  hour for one open tab. The poll now carries the newest row's number; the
+  answer is the rows after it, or `204 No Content` when there are none.
+- **A paused tail looked like a broken one.** The tail skipped its poll while
+  the pointer rested on the table — on a table that fills the screen, nearly
+  always — and said nothing. The line beside the table now says whether it is
+  live, and if not, why.
+- **A core restarted without its spill file, or a log emptied under an open
+  page,** now replaces the page's rows instead of leaving stale ones.
+- `/blocked/rows` is sent with `Cache-Control: no-store`.
+
+### Added
+
+- **Pause and Resume** for the tail; resuming catches up.
+- **New rows are marked** with a rule on the left until the next ones arrive,
+  and a polite status region says how many came.
+
+### Documentation
+
+- `blocked-traffic.md`: the tail, its pause and its mark. `DESIGN.md`: the
+  mark. A field finding from root01xvp: a Firefox tail that stalled was HTTP/3
+  advertised to a UDP port with no listener, in front of easywall.
+
+## [2.25.1] — 2026-10-13
+
+**A bug bounty: what looked right and did nothing.**
+
+### Security
+
+- **A core that died inside the acceptance window came back enforcing the set
+  nobody confirmed — permanently, with no window.** Apply promotes the new set
+  to disk before the window opens, and only a window that ran to its end ever
+  took it back; a watchdog kill, the OOM killer, `kill -9` or a power cut
+  inside the 120 seconds skipped that. Measured in a network namespace: port 22
+  confirmed, a 443-only set applied, the core abandoned mid-window — the
+  restart enforced `tcp dport 443` and nothing for 22. A marker written before
+  the promote now makes the next start restore the last confirmed set and
+  record `apply_rolledback` / `core stopped`.
+- **The web process could engage and end panic mode.** `PANIC` and `RESUME`
+  were accepted from any client of the `root:easywall` socket and audited as
+  "console". The core now asks the kernel who is connected (`SO_PEERCRED`) and
+  refuses both from anyone but root. `easywall-core panic` and `resume` need
+  root, as `recovery.md` already said.
+- **The second-factor bound was 27 attempts in ten minutes, not the 15
+  `security.md` promises.** The login bucket refilled one round every two
+  minutes; it now refills one every ten. The test that "proved" 15 ran every
+  round in the same instant.
+- **One IPv6 /64 had unlimited sign-in attempts, and ten concurrent sign-ins
+  cost 660 MiB.** The budget is now per /64 (IPv4 per address), the limiter's
+  table is bounded and refuses new sources at the ceiling instead of evicting a
+  live budget, and argon2id hashes one password at a time; a sign-in that
+  cannot get the slot within 5 s is answered 503.
+- Go 1.27.2 and `golang.org/x/net` 0.60.0 (GO-2026-6617, HTTP/2 crash);
+  `dompurify` 3.4.17 and `katex` 0.18.11 in the documentation build.
+
+### Fixed
+
+- **Saving a long blocklist, allowlist or custom-rule list emptied it and said
+  "saved".** A form over 64 KiB could not be parsed, the handler read an empty
+  field, validated it and stored nothing. Reached by saving an imported list
+  unchanged — measured: 6,000 entries → 0. Every form the server cannot read
+  is now refused (413 / 400) before a handler runs, and the list editors accept
+  2 MiB, enough for anything `/import` takes.
+- **Choosing a file under *Import rules* did nothing.** The dashboard submitted
+  it with an inline `onchange`, which the Content-Security-Policy has blocked
+  since 2.0.0. A guard now refuses inline event handlers in templates.
+- **`notify_on_accepted` and `notify_on_rolled_back` never fired, and the
+  rolled-back state was visible for milliseconds.** The core reset its status
+  to idle as soon as apply returned; the 15-second notifier never saw the
+  outcome. The outcome now stands until the next apply. The web tests had
+  passed against a mock that kept the state the real core did not.
+- A window ended by panic mode or by stopping the core was audited as
+  "timeout"; it now says `panic mode` or `core stopped`. A click on *Confirm*
+  racing the deadline could report success for a window that rolled back.
+- **A failed package upgrade left the firewall disabled after the next
+  reboot,** and every upgrade re-enabled a web interface the operator had
+  switched off. `prerm` disabled the services on upgrade and `postinst` had no
+  `abort-upgrade`; the scripts now carry `#DEBHELPER#`. A package operation also
+  resets the units' start limit: an install, a failed upgrade and its retry
+  inside a minute were a fourth start, and systemd refused it.
+- **`easywall-web` would not start while the core was stopped**
+  (`226/NAMESPACE`), so the interface that reports "core unreachable" was the
+  one that was missing. `ReadWritePaths=-/run/easywall`.
+- A missing `acceptance.duration` stopped the core from starting; it is 120,
+  as documented, and 0 or a negative value is clamped like any other value out
+  of range.
+- `SIGHUP` did not change `[usage] interval`, and `interval = 0` at start
+  switched usage collection off until a restart.
+- A host whose inbound traffic is all forwarded to containers reported
+  `degraded` / `stateful_dead`.
+- A session expired ten minutes after sign-in when only pages were read;
+  it now ends ten minutes after last use, as `privacy.md` says. An open
+  acceptance window keeps it alive.
+- `easywall-core resume` said "the stored rules are back in force" when
+  nothing had been restored, and a resume with no panic mode engaged still
+  sent a *panic mode ended* notification.
+- `health_allow = []` lost to `EASYWALL_WEB_HEALTH_ALLOW`.
+- A comment-only change to a list showed *Unapplied changes* beside an empty
+  preview; a port moved between host and forwarded scope did the same.
+- A pasted 2FA code with a trailing space was refused during enrolment and
+  counted as a failure. The forwarding page's rule counter did not follow
+  added or removed rows. A list's leading blank line was lost on every save.
+
+### Documentation
+
+- **The blocklist is not consulted before every other rule.** Loopback, an
+  IPv6 `passthrough`, container networks and established connections come
+  first — under `ipv6.mode = "passthrough"` an IPv6 blocklist entry does
+  nothing. **The allowlist does not outrank the protection modules**: SSH
+  brute-force, SYN flood, port scan, invalid packets and the connection limit
+  drop before it. The UI copy and the pages now say so.
+- The JSON schemas gave `docker.enabled` a default of `false` and refused
+  `language = "fr"`; a guard now compares them with the shipped defaults and
+  catalogues. `web.toml` counted four outbound requests, the schema two — there
+  are five. The command line has `-healthcheck` and five subcommands.
+
+### CI
+
+- The required `gosec` check could not fail (`|| true`); the security tools are
+  pinned and visible to Renovate. The Debian job's version check could not
+  fail either. The 32 tests of the console subcommands ran in no workflow.
+
+## [2.25.0] — 2026-09-27
+
+**Ping gets an answer, if you want one.**
+
+### Added
+
+- **Answer pings** — one switch under Options, `[firewall] icmp_allow_echo_request`,
+  **on by default**: ICMP echo requests are answered in both families, behind
+  *ICMP flood*. A host whose `easywall.toml` predates the key reads it as on.
+  To let only your monitoring ping, switch it off and allowlist the monitoring
+  address — which opens every port to it, not only ping.
+
+### Changed
+
+- **IPv4 pings are answered after the upgrade.** Until now an IPv4 echo request
+  met the policy drop while an IPv6 one was answered, and neither had a switch.
+  Switching *Answer pings* off keeps IPv4 silent — and IPv6 too, unless
+  `ipv6.mode` is `passthrough`.
+- **Seven stateless ICMP accepts are gone:** ICMPv4 0, 3, 11, 12 and ICMPv6 1–4,
+  129. The return-traffic accept before them already admits the reply to this
+  host's own ping and every error about a connection it tracks — unreachable,
+  fragmentation needed, time exceeded — so path-MTU discovery and traceroute
+  work as before. What those rules still let in on their own was unsolicited
+  echo replies and errors about connections that do not exist.
+- **A blocklisted or feed-listed source gets no ping reply**, in either family.
+  The echo accept sits after the blocklist, the allowlist and the feeds; ICMPv6
+  echo requests used to be accepted right after return traffic, ahead of every
+  list, so a blocklisted address could ping this host over IPv6.
+- The Blocked page's *IPv4 pings are not answered* is now *Pings are switched
+  off under Options*, for either family, with a link to the switch.
+
+## [2.24.1] — 2026-09-26
+
+**A loopback publish is not a warning.**
+
+A patch to 2.24.0, from its first production rollout.
+
+### Fixed
+
+- **Ports published on loopback were named as having no forwarded rule.**
+  `-p 127.0.0.1:8081:80` is reached from the host only, and the host's own
+  connection never crosses the forward chain. The published-port warning
+  (working on Docker's default backend for the first time since 2.24.0) listed
+  eight such nginx back ends on the reporting host, all answering. Ports
+  published on `127.0.0.0/8` or `::1` are no longer named.
+
+### Documentation
+
+- Ansible's `community.docker.docker_container` binds `"25:25"` to `0.0.0.0`
+  only; it needs `default_host_ip: ""` to publish on both families.
+
+## [2.24.0] — 2026-09-26
+
+**Containers answer over IPv6.**
+
+A port Docker publishes on an IPv6 bridge was reachable over IPv4 only, and
+nothing in the interface said so. A production host running mail over IPv6
+through Docker was waiting on this release; it now forwards the IPv6 side the
+same way it already forwards the IPv4 one.
+
+### Added
+
+- **A Docker bridge's IPv6 networks are detected and forwarded.** Each
+  bridge's ULA and global IPv6 subnets are found the same apply as its IPv4
+  one, and a forwarded port rule opens the port in both families. A bridge's
+  own `fe80::` link-local address is never treated as a container network.
+- **A Docker network the rules in force do not know is named.** After
+  `docker network create`, the dashboard and `easywall-core status` say the
+  network exists and is not covered yet, until the next apply.
+- **The published-port check reads `ip6` too.** A port published only on an
+  IPv6 Docker network is now named in the log like its IPv4 counterpart.
+
+### Changed
+
+- `ipv6.mode = "block"` removes IPv6 from the container networks the forward
+  chain is built over: no IPv6 twin, deny or exception renders for one. What
+  reaches a container after that follows `routing.mode` — the forward chain's
+  policy drop under `closed` or `networks` (unless `routing.networks` names a
+  network covering it), passed through to Docker's own `ip6tables` under
+  `open`.
+- Under `block`, a forwarded rule's own IPv6 sources no longer render either —
+  the same statement `block` already makes about the host.
+- A container-network list with no usable network at all no longer renders
+  forwarded accepts with no deny beside them.
+- On a host whose container networks are IPv6-only (`custom_networks` holding
+  only a ULA, say), the IPv4-pinned forwarded accept no longer renders either
+  — it used to render regardless, pinned to a family with nothing behind it.
+- Containers on an IPv6 bridge reach the host's own services over IPv6 as they
+  already do over IPv4.
+- A non-Docker `br-*` bridge — OpenWrt's `br-lan`, an OpenStack `br-ex` — with
+  a global or unique-local IPv6 prefix is trusted the same way its IPv4
+  network already is, once `docker.enabled = true`: accepted on the input
+  chain, exempted both ways on the forward chain. Parity with the documented
+  IPv4 behaviour, not a new decision.
+
+### Fixed
+
+- **The published-port warning named nothing on hosts where Docker uses its
+  default iptables backend, since 2.20.1.** `iptables-nft` writes DNAT as an
+  xtables target, which the check did not read.
+
+## [2.23.2] — 2026-09-25
+
+**Three pages that looked like another program.**
+
+2.22 and 2.23 each added a page section in a grammar of its own, and neither
+was reviewed in a browser before it shipped. This release redraws them in the
+interface's own: cards with a header, tables for lists, one Save per form.
+
+### Changed
+
+- **/blocklist's feeds are a table.** One row per list — verdict, state, last
+  refresh, entries, packets, switch — under a card header like the blocklist's
+  own. What a verdict rests on and the last error are in the row's Details;
+  warnings stay visible under the name. It was a four-column grid of cards,
+  each stretched to the tallest in its row. Own feeds are one row each.
+- **/options is one row per protection**, in a card per group: what it does,
+  its parameters, its switch in one column down the page. It was fourteen
+  cards in four columns, each with a parameter band under it.
+- **/blocked's filters sit inside the card**, under its title, like every other
+  table's controls. They sat on the card's top edge with no padding.
+- **Blocked and Audit Log have a group of their own**, *Activity*. Blocked was
+  the one link in the sidebar with no group.
+- /options says that fragment drop also breaks a VPN tunnel whose packets are
+  fragmented on the way, WireGuard among them — measured on a 2.23 production host.
+- The demo is entered with a button. Its login card has no password form, and
+  the credentials a public demo used to publish are not needed any more. The
+  route exists only with `demo_mode`; an installation still has no way in but
+  the password.
+
+## [2.23.1] — 2026-09-25
+
+**The kernel answers every rule.**
+
+A patch to 2.23.0, from its first production rollout. The limit is older than
+2.23; 2.23 lowered it to where a real host sits, so both are fixed here.
+
+### Fixed
+
+- **An apply with more than about a hundred kernel rules failed with "no
+  buffer space available"** — since at least 2.22: about 107 without feeds,
+  about 96 with four curated feeds. The kernel acknowledges every message of an apply and echoes
+  every rule back, after it has committed, and the core left the socket's
+  receive buffer at the stock 212 992 bytes. The core now sizes both socket
+  buffers for every write from what it sends. Without `CAP_NET_ADMIN` they
+  stop at `net.core.rmem_max` and `net.core.wmem_max`, and the error names
+  the one that stopped it.
+- **A failed apply no longer claims "nothing was written to the kernel" when
+  the kernel had committed it.** The rollback then resets the usage
+  baselines, as after any other write that reached the kernel.
+
+## [2.23.0] — 2026-09-25
+
+**Other people's lists.**
+
+Eight curated lists of attacking addresses, and up to three of your own, each
+switched on individually and all off by default. A feed is checked after your
+allowlist, so an address you allow stays reachable whatever a feed says. The
+lists' old names give way to blocklist and allowlist.
+
+### Changed — read this before upgrading
+
+- **Breaking: the blocklist's log prefix is `easywall blocklist: `.** It was
+  `easywall blacklist: `. Anything that greps the kernel log or
+  `packets.log` for the old prefix, or filters `jq` on `rule == "blacklist"`,
+  finds nothing new. A persisted `packets.log` written by 2.22 is read back
+  under the new name and rewritten that way at start.
+- **Blacklist is now blocklist, whitelist is now allowlist** — in the
+  interface, the documentation, the socket protocol's `rule_type`, and every
+  file easywall writes. `rules.json` and an export from 2.22 are read in
+  either spelling and written in the new one; a document naming one list
+  both ways is refused rather than guessed.
+- **`/blacklist` and `/whitelist` answer 301** to `/blocklist` and
+  `/allowlist`. A form posted to an old address is still saved, so a tab
+  left open across the upgrade loses nothing. A saved `/blocked?rule=`
+  filter with the old name is moved on to the new one.
+- **`log_blacklist_connections` and `log_blacklist_connections_limit` still
+  work** in `easywall.toml`, with one warning line at start naming the new
+  keys, `log_blocklist_connections` and `log_blocklist_connections_limit`.
+  The schema and the documentation name only the new ones, and the next save
+  from the interface writes them.
+- **Export the rules before upgrading if you might go back.** 2.22 reads a
+  `rules.json` written by 2.23 as an empty blocklist and allowlist, and an
+  `easywall.toml` saved by 2.23 as the blocklist log switched off.
+- **A `rules.json` that names one list under both spellings is refused, and
+  the core then reads no rules from it** — boot restores nothing and the
+  audit log says `boot_enforce_failed`, naming both keys. Keep one spelling,
+  the new one, and run `easywall-core resume`. Only a hand-edited file can
+  get there; nothing easywall writes does.
+
+### Added
+
+- **Eight feeds** — Spamhaus DROP, DShield, blocklist.de, CINS Army,
+  Emerging Threats compromised, IPsum, Hagezi threat intelligence IPs and
+  the Tor exit list — in a Feeds card on `/blocklist`, each with what it
+  blocks, how likely it is to refuse a legitimate client, a verdict (✓ • ✗),
+  and links to its source and its terms. A ✗ feed is staged only with a box
+  ticked that names whom it locks out. Switching a feed on or off is staged
+  and applied like any rule; a refresh loads without an acceptance window.
+  The page to start from is *Block known attackers with feeds*.
+- **Up to three own feeds** by URL: plain text, `https://`, or `http://` to a
+  loopback address, with optional Basic credentials, fetched once a day —
+  CrowdSec's *Raw IP List* integration among them. The password never reaches
+  the core, a log line or an export.
+- **The core checks every list it is sent.** Private and reserved ranges are
+  dropped; a list with more than 100 000 entries or a network broader than /8
+  or /16 is refused whole, and so is one under 70 % of the copy it replaces
+  while that feed is live. The last good copy stays active.
+- **`UPDATE_FEED` and `GET_FEEDS`**, the socket protocol's two new commands
+  (25 in all). Only the web process downloads; the core opens no connection.
+- **The lockout check knows about feeds.** `/apply` names the feed that
+  holds your own address, and says so when whether one does is not yet known.
+- **`/blocked` names the feed** that dropped a packet.
+- **`log_feed_connections`** and `log_feed_connections_limit` (1–10000,
+  default 60), the kernel log prefix `easywall feed: <id> `.
+
+### Changed
+
+- **The lists are called blocklist and allowlist** everywhere, as above.
+  The old routes redirect, and the old TOML keys are still read with a
+  warning.
+- **An apply is one kernel transaction.** The table is never without its
+  chains, not even for the moment a large feed takes to load, and a refused
+  apply leaves the old rules live instead of an empty table.
+- **The socket limit is 8 MiB each way**, from 1 MiB — enough for a full
+  feed of 100 000 IPv6 addresses.
+- **An apply can be refused for a moment** while a feed refresh holds the
+  apply slot — under a second, even at the largest list the core accepts.
+  The page says another change is being written; try again. A boot restore,
+  the Docker reconcile and `easywall-core resume` wait up to 5 seconds for
+  the slot instead.
+- **`fr` names the lists *liste de blocage* and *liste d'autorisation*.**
+  Every new key in this release went into `en` and `de` only: `en` holds 866
+  keys, `fr` answers 455 of them (53 %), a gap of 411.
+
+### Fixed
+
+- The repository's guard against tracked personal addresses was red from this
+  release's first commit: the research notes quoted a list maintainer's
+  address. They now name the support channel instead.
+
+## [2.22.0] — 2026-09-24
+
+**It is yours, and it says why.**
+
+Two audits, shipped together as one release. wdk-ansible's review of the
+Docker path found that whoever finished `/firstrun` first owned the
+firewall — Docker and Debian alike — and, while measuring the fix, that four
+protection switches did not do what their names said. A separate question
+about `/options` — *users do not know what they are doing and cannot read up
+on it* — found the fourteen switches already had a one-line description and
+none of them said what breaks, who wants it, or where to read more. Neither
+defect was caused by 2.21; both predate it, and both are fixed here rather
+than carried forward.
+
+### Security
+
+- **Whoever finished `/firstrun` first owned the firewall — Docker and
+  Debian alike.** `web.toml` binds `0.0.0.0`, and nothing gated the wizard
+  beyond `IsFirstRun`. easywall-web now generates a 160-bit setup token at
+  start, only while no account exists, holds it in memory, and prints it
+  once as a `slog.Warn` line — `docker compose logs`, the journal. Step 1 of
+  `/firstrun` refuses without it, checked with `subtle.ConstantTimeCompare`
+  before the password is hashed. A restart prints a new token, which is also
+  the recovery for a lost line; nothing touches disk.
+- **An anonymous `POST /firstrun` cost a 64 MiB Argon2id hash before any
+  proof of host access.** The token check now runs first, so a request with
+  no token, or the wrong one, never reaches the hash.
+- **The web user could make the root core write anywhere.** `/var/lib/easywall`
+  was `root:easywall 0770` with no sticky bit: the web process could point
+  `last_apply` at any file for root to write, replace the rules restored at
+  boot, or plant a `panic` marker that keeps the firewall down at every
+  start. The directory is root's now (`0750`); the web process keeps its own
+  state — passkeys, the TOTP replay store — in `data_dir/web` (`0700`, owned
+  by the web user), and both install paths migrate the old layout
+  automatically, without following a symlink or a hardlink into it.
+
+### Added
+
+- **`easywall-web -healthcheck`.** Loads the configuration without writing
+  anything, derives the health target from `bind_addr` — including a zoned
+  IPv6 bind — and exits 0 on a 200. The container's `HEALTHCHECK` and
+  `docker-compose.yml` use it now instead of asking a hardcoded
+  `127.0.0.1`, which a specific `bind_addr` refuses. The own-address rule
+  that lets a peer at this host's own address reach itself now recognises a
+  zoned bind too.
+- **Every switch on `/options` says what it breaks.** Each of the fourteen
+  module cards keeps its one-line description — rewritten to lead with the
+  consequence, e.g. *Drop multicast* now opens with what stops working — and
+  gains a closed `<details>`: protects against, can break, turn it on if,
+  and a link to its section of `filters.md`. A card above the grid names the
+  switches a public server, a home network behind NAT, and a container host
+  each want. The dead key `options_readonly` — it said options need a core
+  restart, false since options save live — is removed from every locale.
+- **The packet log records an ICMP packet's type and code.** `GET_PACKET_LOG`
+  entries carry them additively, so a blocked ICMP row can finally say what
+  kind of packet it was, rather than just *ICMP*.
+- **A default-drop row on `/blocked` now says why.** *port 993/tcp is not
+  open*; *993/tcp is open only for 10.0.0.0/8*; *IPv4 pings are not
+  answered*; *ICMP type 8 is not accepted* — derived from the rules as they
+  stand now, not stored per packet, and each reason has both locale keys. A
+  module row's chip — *Port scan*, *SSH brute force* — now links to that
+  option's card on `/options`.
+
+### Changed
+
+- **`docker.enabled = true` is the default in the shipped `easywall.toml` —
+  new files only.** Without it, the forward chain's policy drop left a
+  compose host's containers without a network at the first apply, before
+  the acceptance window could even show it. A file carried over from 2.21
+  or earlier keeps whatever it already says; nothing is overwritten.
+- **The compose mount moved from `./config` to `./easywall-config`.** The old
+  mount put the account into a git-tracked directory: afterwards the files
+  carried the password hash and the TOTP secret, were root-owned, and a
+  `git pull` or `git checkout .` failed or deleted the account. The
+  entrypoint now seeds `./easywall-config` (gitignored) from the image's own
+  defaults. Upgrading a git checkout from 2.21 or earlier needs this once,
+  before pulling:
+
+  ```bash
+  docker compose down
+  sudo mv config easywall-config && sudo rm -f easywall-config/embed.go
+  git checkout -- config && git pull
+  docker compose up -d
+  ```
+
+  An existing `easywall.toml` is moved as-is — whatever it already says for
+  `docker.enabled` is kept, not replaced by the new default.
+- **`fr`'s coverage gap grew by the keys this release added.** Every new key
+  in this release went into `en` and `de` only, which is the project's rule:
+  `fr` falls back to English rather than gaining a stale, half-translated
+  set. `en` now holds 756 keys; `fr` answers 443 of them (58%), a gap of 313.
+
+### Fixed
+
+- **A signed-out htmx request swapped `/login` into `/blocked`'s table.**
+  `RequireAuth` and `RequireSecondFactor` answered every refused request
+  with a 303, which an XHR follows. An htmx request now gets 401 with
+  `HX-Redirect` instead.
+- **Fragment drop, ICMP flood and TCP RST flood acted on almost no
+  traffic.** Fragment drop sat in the input chain, which never sees a
+  fragment — the kernel reassembles before `LOCAL_IN`, and conntrack does it
+  earlier still; a 3000-byte ping over a 1280 MTU passed with the switch on.
+  It now runs in its own prerouting chain, ahead of reassembly, for IPv4
+  fragments addressed to this host. ICMP flood and TCP RST flood sat behind
+  the established-connection accept: every ping after a source's first is
+  established, and so is a reset for a live connection — 20 of 20 pings
+  passed a limit of one a second, and an IPv6 ping was accepted before the
+  meter ran at all. Both meters now run ahead of the accept and count what
+  they were always meant to. **What this can break:** fragment drop can now
+  drop a UDP reply too large for one packet, most visibly a DNS answer with
+  DNSSEC — it stays off by default. The blacklist log also no longer skips
+  network entries.
+- **The lockout check ignored a port rule that only filters forwarded
+  traffic.** `Reachable` counted every TCP rule, but the input chain holds
+  host-scoped rules only, so a forward-only rule for the web port read as
+  reachable on `/apply` when it was not.
+- **An IPv4-mapped network (`::ffff:10.0.0.0/104`) failed every apply with
+  `EINVAL`.** It passed validation, and then a blacklist, a whitelist or a
+  bogon exception holding it failed every apply, while a port rule's source
+  silently skipped it. `shared.ParseNetwork` now reads it as the IPv4
+  network it names (`10.0.0.0/8`); nothing is refused, and a non-mapped
+  entry builds the same bytes as before.
+- **`debian/control` did not depend on `adduser`, which `postinst` calls.**
+  It does now.
+- The Docker install page named neither `docker.enabled` nor its new
+  default.
+- Password reset and troubleshooting covered systemd only, not Docker.
+- The claim that easywall "never trusts `X-Forwarded-For`" is corrected —
+  superseded in 2.13.
+- Remote-access guidance is added; `ssh -L`'s silent failure under
+  `AllowTcpForwarding no` is named.
+- `tls.hostname` is documented, and `tls.acme` is no longer offered for an
+  image that refuses it.
+- `nfnetlink_log`'s autoload from a `NET_ADMIN` container is now mentioned.
+- `health.md` and the Dockerfile comment no longer describe a stale compose
+  health check.
+- The self-hosted demo recipe no longer relies on the first-visitor claim,
+  and `features/docker.md` no longer says detection is not continuous.
+
+## [2.21.1] — 2026-09-23
+
+**What it offers, it can do.**
+
+A patch to 2.21.0, from walking `/blocked` in Chrome after the release. The
+`/blocked` findings were caused by 2.21.0; the last three are older, found on
+the way, and fixed rather than carried forward.
+
+### Fixed
+
+- **A row offered actions that could not have let its packet through.**
+  Whitelisting the source of a packet the blacklist or a protection module
+  dropped does nothing — the input chain runs *modules → blacklist →
+  whitelist → ports → final drop* — and "Open 3389" on a port-scan row invited
+  the scanner. Each row now offers only what the chain order lets it change:
+  whitelist, blacklist and open-the-port on a default drop; whitelist and
+  blacklist on the bogon filter and on a custom rule; blacklist alone on a
+  protection module; a link to the blacklist page, and nothing else, on the
+  blacklist itself.
+- **The live tail moved rows under the pointer and dropped keyboard focus.** A
+  click aimed at a row action could land on the row that slid into its place a
+  poll later, and a focused button was gone from the DOM twelve seconds after
+  it was focused. The tail now skips its poll while the pointer or keyboard
+  focus is inside the table, says so in the toolbar, and catches up at the next
+  poll, within five seconds of you leaving it.
+- **Row actions rested at 55% opacity — text needs 4.5:1, opacity cannot give
+  it that.** Measured contrast was ≈4.2:1, below WCAG AA. The de-emphasis is
+  now a muted ink colour at full opacity, with full ink back on row hover and
+  focus; `DESIGN.md`'s rule for `.row-action` is amended to say so.
+- **German said *Whitelist*/*Blacklist* on `/blocked` and the apply screen,
+  *Erlaubnisliste*/*Sperrliste* everywhere else.** Every remaining
+  `Whitelist`/`Blacklist` in `locales/de.json` is now `Erlaubnisliste`/
+  `Sperrliste`, matching the rest of the interface.
+- **"Log blocked" and "Log blacklist" still said *writes … to the system
+  log*.** False since 2.21.0 moved that traffic to the Blocked page; both
+  option descriptions now say where the entries actually show up.
+- **The filter form put empty fields in the URL, and an unreadable filter
+  cleared what you had typed.** `?src=&dst=&port=3389&proto=&rule=portscan&in=`
+  was the canonical link `/blocked` handed out for a three-field filter, and a
+  typo in any field lost the whole form instead of showing what could not be
+  read. A readable filter now redirects once to its canonical, minimal query;
+  an unreadable one keeps every field visible and marks the one at fault.
+- **The header's staged count and the apply screen's count could disagree.**
+  The header counted rule changes only; `/apply` counts rules and
+  configuration together. Both now read the same total from the same
+  preview.
+- **A card on a phone broke its addresses mid-number.** At 390px
+  `192.0.2.140` read `192.0.2` / `.140` and a port split in two, because each
+  link of the route was its own flex item; in German, *Sperrliste bearbeiten*
+  ran into *Details*. The route wraps between addresses now, and the buttons
+  stack over *Details* as they do in the table.
+- **The demo's refused packets came from networks its own lists already
+  cover.** Every blacklist click in the demo answered "already there" instead
+  of showing a rule take effect. Demo packet sources no longer overlap the
+  demo's seeded blacklist or whitelist.
+- **Docker's log directory could vanish silently.** A container recreated
+  without `/var/log/easywall` mounted got a fresh, empty anonymous volume;
+  `docker.md` now says which three paths must persist, and easywall-core
+  warns at start when the audit log is missing or empty while rules are
+  configured and nothing has rotated it away.
+- **The status could say the rules were live with no acceptance window
+  open.** `Status()` read the window before asking the kernel, and the kernel
+  query waits on the lock an apply holds for its whole write — so a status
+  taken during an apply could pair *idle* from before the window opened with
+  a table from after the write, and the dashboard showed unconfirmed rules
+  with no countdown. In since 2.14; one integration test caught it about once
+  in fifteen CI runs and its comment called that unavoidable. Reproduced 33
+  times in 2,000 runs, and 0 with the kernel read first.
+- **The German IPv6 warning closed its quotation with an ASCII `"` instead of
+  `“`.**
+
+## [2.21.0] — 2026-09-23
+
+**You can see what it refuses.**
+
+Blocked traffic becomes a page: every packet the ten log switches refuse,
+newest first, filterable, with whitelist, blacklist and open-the-port one
+click away from the row that refused it.
+
+### Added
+
+- **The Blocked page.** Filter by source, destination, port, protocol, rule or
+  interface; a live tail; a drill-down for TCP flags, connection state, TTL and
+  packet mark.
+- **Three row actions — whitelist, blacklist, open the port — and the guard
+  behind them.** They stage; they never apply, and never arm the acceptance
+  timer. Every one asks the same reachability check the apply screen runs
+  before it stores anything, so blacklisting the address you are signed in
+  from — or, behind a reverse proxy, the proxy's address — is refused with the
+  reason, before anything is staged.
+- **`[packet_log]`.** `nflog_group` (default `12227`), `entries` (default
+  `20 000`, the ring size) and `persist`, off by default.
+- **`GET_PACKET_LOG`**, the socket protocol's twenty-third command.
+
+### Changed — read this before upgrading
+
+- **`journalctl -k | grep easywall` returns nothing** on a host where
+  easywall-core binds its NFLOG group. The ten log switches send each packet
+  to the core over NFLOG now, not into the kernel ring buffer. Look on the
+  Blocked page instead, or set `[packet_log] persist = true` and
+  `tail -f /var/log/easywall/packets.log | jq .`.
+- **ulogd2 already on group `12227`** collides: the core logs the failure,
+  the Blocked page says so, and every log rule falls back to the kernel log
+  so an apply still succeeds. Give ulogd2 a different group, or set
+  `nflog_group` to a free one.
+
+### Security
+
+- `packets.log` is not written at all unless `persist = true`. When it is,
+  it is `0600 root`, rewrites itself to the ring once it holds more than twice
+  `entries` lines, and is never added to logrotate.
+- Nothing in this release leaves the host: the web process asks
+  easywall-core over the existing Unix socket, the way it already asks for
+  the audit log.
+
+## [2.20.1] — 2026-09-15
+
+**The window that was not there.**
+
+Two defects found by rolling 2.20.0 onto a real host, both by reading rather than
+by an outage. Neither is reachable without opting into something: one needs a
+configuration where `enabled` is absent or explicitly false, the other needs
+`docker.published_ports = "filtered"`.
+
+### Added
+
+- **Every apply under `filtered` now names each published container port that no
+  forwarded rule covers.** The ports are read from Docker's own DNAT rules in the
+  kernel — no Docker socket, no client library, and a host whose Docker has
+  stopped with its rules still loaded is named the same way. A rule that names
+  sources does not count as a cover and is named too: what the deny closes is the
+  world *plus* every other bridge, and no source list is ever tested against that
+  whole set. A remapped publish names both numbers — `-p 8080:80` reads as *8080
+  published on 0.0.0.0 reaches the container on 80*, because the forward chain
+  runs after Docker's DNAT and the rule that covers it must name 80, not 8080.
+  Naming the other bridge networks restores the cross-bridge container
+  and is the right rule where only containers should reach a port; it does not
+  restore the world, whose packets to a `0.0.0.0`-published port are DNAT'd into
+  a bridge and meet the deny with the same shape. The remedy the line offers says
+  both, so an operator whose rule legitimately names two bridge networks is not
+  told to open the port to the world or switch the feature off.
+  Once per apply, every time, with no folding of repeats — a
+  suppressed one would be silent on exactly the apply whose log an operator is
+  reading, and any memory of what it said last would live in a process a restart
+  replaces. IPv4 only, like the bridge detection it takes its networks from; an
+  IPv6 published port is neither detected nor named, which is 2.28's to close.
+- **`acceptance_enabled` in the status reply, and a line in `easywall-core status`.** `acceptance: idle` is two states
+  in one word — no window open at this moment, and no window that will ever open —
+  and a script polled it ten times and reported a true statement about a cause it
+  could not see. It is read from the same configuration the apply path reads, so
+  the two cannot disagree, and the demo mock follows its own `[acceptance]`
+  section rather than advertising a window it will not open. `easywall-core
+  status` prints it as its own continuation line under `acceptance:`, so a
+  check matching that line exactly keeps working and a check reading the whole
+  output can finally tell the two states apart.
+
+### Fixed
+
+- **A configuration naming only `duration` had no acceptance window at all, and
+  nothing said so.** `AcceptanceConfig.Enabled` is a plain `bool`: absent reads as
+  false, with no default and no warning, while `Duration` beside it in the same
+  struct is refused at `<= 0` and clamped out of range **out loud**. A file that
+  configures a window and a file that configures the length of one which never
+  opens therefore read alike. The reporting host ran its first apply with no way
+  back — the case 2.20 exists to make safe. The daemon now warns once at start
+  when the window is off, in the operator's terms: applies take effect
+  immediately and nothing will undo them. Absent stays off, deliberately.
+  Defaulting it to true would begin blocking applies on every installation whose
+  file omits the key, and automation that applies and moves on would be rolled
+  back for sitting through a window it does not know to confirm. That needs its
+  own release and its own acceptance round.
+- **The start-up warning on a never-configured host promised an undo it would not
+  perform.** `RestoreCurrent` prints, at every start of an installation nothing
+  has ever been applied on, that the first apply "has the acceptance window to
+  undo it" — gated on `everConfigured` alone and never on `Acceptance.Enabled`.
+  The first half of that sentence is true either way; the promise is now printed
+  only where a window exists. It had been printed at every start, for two days,
+  on a host that never had one.
+- **`filtered` dropped container-to-container traffic across two bridges, and the
+  comment justifying the rule ordering said it could not.** The per-bridge deny is
+  `ip daddr <bridge> ip saddr != <bridge> drop`, and "container-to-container has
+  both ends inside, so neither matches" is true within **one** bridge. A container
+  in bridge B reaching a service published on bridge A's gateway is DNAT'd into A,
+  so it arrives with its destination in A and its source outside A — the same
+  shape as a packet from the world, because by then that is what it is to this
+  rule. The exceptions that would have accepted it are rendered after the deny and
+  never run. On the reporting host this killed every container's DNS while all
+  fifteen external probes stayed green: the resolver was published on
+  `172.17.0.1:53` rather than `0.0.0.0`, and the only thing that said so was the
+  drop rule's own packet counter. The behaviour is unchanged and correct — such a
+  port needs a forwarded rule like any other published port — so what is fixed is
+  the comment, and the silence around it.
+
+### Changed
+
+- **`health`'s selftest line names a capability rather than a history.** An empty
+  stamp with `CAP_SYS_ADMIN` absent is not "nobody has run it yet": the namespace
+  harness cannot be built without that capability, and the container image asks
+  for `CAP_NET_ADMIN` and nothing else, deliberately — so the stamp can never be
+  written there. "Never recorded" describes a chore an operator ought to clear;
+  "unavailable here" describes a capability and tells them to stop looking, the
+  same distinction `health` already draws between a disproved claim and an
+  unprovable one. The probe is a read of `CapEff` from `/proc/self/status` — a
+  file read, no fork, no clone, cheap enough for the 30-second Docker healthcheck
+  that calls `health` on every tick. A `CapEff` it cannot parse is treated as the
+  capability being present, which is what the line said before the probe existed.
+  `docker/entrypoint.sh` carried the old wording in a warning of its own and now
+  carries the new one.
+- **Five documentation pages for what the rollout found.** *Docker coexistence*
+  now says that a port published on a bridge gateway is reached through the
+  `forward` chain like any other, that a forwarded rule naming sources covers
+  only the sources it lists, and what the new warning prints. *Health check* gains the counter
+  technique that rollout invented: for a service whose correct response is
+  silence, no reply-based probe can tell *dropped* from *ignored*, so read the
+  rules' own packet counters across the attempt instead — and the container
+  selftest is described as unavailable by design rather than as never run.
+  *Recovery* says that `easywall-core status` exits `2` on an installation nobody
+  has applied to yet, which a setup script must not read as a failure. *System
+  settings* and *Configuration* stop calling the acceptance window on by default,
+  because an absent key is off.
+
+## [2.20.0] — 2026-09-15
+
+**When something happens, you hear about it.**
+
+A rollback at three in the morning was something you found out about by opening
+the dashboard. easywall now posts to a webhook or an ntfy topic when the firewall
+moves, and the core still never opens a connection outward.
+
+### Added
+
+- **Notifications, its own page in the interface.** One destination — a webhook
+  or an ntfy topic — and four triggers, each settable on its own and every one of
+  them off until switched on. The address is refused unless it starts with
+  `http://` or `https://`, and it lives in `web.toml` at `0600` beside
+  `session_key`, because an ntfy topic is readable by anyone who knows it.
+- **Six flat keys in `web.toml`**: `notify_kind`, `notify_url` and the four
+  `notify_on_*` switches. Not a `[notifications]` table — `mergeConfig`, the
+  in-place editor that preserves that file's three kilobytes of comments, skips
+  every table wholesale, so a table the interface must write is a table its only
+  writer cannot reach. `managedKeys`, `managedValues` and `sameManagedValues`
+  grew together: a key added to the first two and forgotten in the third leaves
+  the decode-and-verify guard passing without ever looking at the new value.
+- **A *Send a test* button.** An operator has to be able to prove a notification
+  arrives without waiting for a real rollback to produce one. The page also shows
+  when easywall last sent something, or what went wrong the last time it tried —
+  a notification that fails silently is worse than none, because it is believed.
+- **A failed-login threshold at the rate limiter's own ceiling.** Five failures
+  from one address inside five minutes, then that address is quiet for fifteen
+  minutes. The core's existing burst folding is about the *record*; this one is
+  about the phone, and the second hour of one attack is not news. The address
+  table is bounded at 1024 and evicts dead buckets at the ceiling rather than
+  going blind.
+- **A guard over the outbound-request list.**
+  `TestBothPagesCountTheSameOutboundRequests` compares the sentence "*N*, and
+  this is the whole list." on `security.md` and `configuration.md` — and the
+  table under each — against the files under `internal/` and `cmd/` that reach
+  out. The count lived in prose on two pages and in code on a third, bound by
+  nothing: `configuration.md` was updated with the notification keys, because
+  `TestEveryConfigKeyIsDocumented` reads that page and no other, and
+  `security.md` went on saying **Two** above a two-row table. The table is
+  checked separately from the number, because a correct count above a table
+  missing a row is what had shipped.
+
+### Changed
+
+- **The mechanism is not the one the roadmap named, and the roadmap says so.**
+  The 2.20 entry promised that "the web process polls the audit log and sends the
+  notification". `GET_LOG` returns the last 200 entries with no cursor, audit
+  timestamps have second granularity and no sequence number, and the web process
+  never opens that `0600` file anyway. A record read as a queue cannot say which
+  of two entries in one second it has already sent. The notifier reads
+  `GET_STATUS` every 15 seconds instead — one socket round trip on this host per
+  tick, nothing to the network — and raises its own failed-login events. The
+  status cache is 2 seconds and the tick is 15, so a claim in the spec that this
+  "adds no socket traffic of its own" was wrong and had reached the published
+  page before a review did the arithmetic. `accepted` and
+  `rolled_back` are terminal states that persist, so nothing races the
+  120-second window.
+- **Redirects are refused, and nothing is queued.** A destination that answers
+  with a redirect is never followed: whoever controls its DNS could otherwise
+  point your notifications at somebody else. A delivery that fails is tried once
+  more and then dropped, with a `WARN` in the journal. The audit log is the
+  record; a notification is a convenience, and the documentation says so rather
+  than leaving it to be discovered as a defect.
+- **The public demo sends nothing**, whatever is configured, and says so before
+  the test button is pressed.
+
+### Fixed
+
+- **The outbound-request list has been missing ACME since 2.18.** Both pages
+  said **two**. `autocert` fetches a certificate from the ACME directory on
+  first need and renews it on its own schedule, carrying the one name in
+  `tls.hostname`, an account key generated on the host, and `tls.acme_email`
+  where one is set. `security.md`'s ACME section described only the inbound
+  half — the authority connecting to port 80 to read a token back — and the
+  outbound half was on neither page. It is now a fourth row on both, and the
+  sentence under it no longer claims all four fail harmlessly on a host with no
+  route out: three do, and the certificate is what serves every page. Found by
+  the guard above on its first run, and fixed here rather than carried, because
+  this release's carried-forward list ends empty.
+- **Four controls showed focus with an outline and nothing else.** The checkbox,
+  the toggle, the radio and the rule editors' textareas drew a focus ring over an
+  unchanged control. `DESIGN.md` § Forms has required *a border change plus an
+  outline* since it was written, and its 2026-09-08 amendment measured why: a
+  ring alone composited to 1.31–1.34:1 against the surface it lands on, while
+  every control whose border moved already cleared 3:1. The outline is what the
+  eye finds; the border is what survives when the outline lands on a surface it
+  cannot separate from. The checkbox and the radio now move their border colour
+  on focus. The toggle and the textareas have no border to move — one is a pill
+  drawn as a background, the other is framed by the card around it — so both take
+  an inset ring at the control's own edge, which is the same mark and shifts no
+  layout. Pre-existing on `main` and proven so against the pre-branch base; fixed
+  here rather than carried, because this release's carried-forward list ends
+  empty.
+- **An unconfirmed first apply locked the host out.** On a fresh installation the
+  first-run wizard *stages* rules and never applies them, so the state captured
+  before the first apply is empty. When the acceptance window closed unconfirmed,
+  `rollback` enforced that empty set at policy drop instead of leaving the
+  machine not filtering — closing every port including SSH and the interface.
+  `everConfigured` existed and said exactly this in its own words, and had one
+  non-test call site: the boot path. The daemon refused to enforce an empty set
+  at boot and enforced one on rollback, in the same process, for the same reason
+  not to. The rollback now tears the table down and the audit entry says the
+  machine is not filtering, in the same words the boot path uses. An operator who
+  deliberately applied an empty set keeps enforcing it — that installation has a
+  last-apply marker. Proven against a real kernel through both entrances to
+  `rollback`, the cancelled window and the expired one, rather than against a
+  mock that would assert the call we chose to make.
+
+## [2.19.0] — 2026-09-12
+
+**What it passes on, it also filters.**
+
+A published container port is routed to the container, not addressed to the
+host, so it crosses the `forward` chain and never `input`. On a measured host
+that meant four of fourteen open ports reached easywall's rules and ten were
+filtered by somebody else, with the dashboard reporting *Active* and saying
+nothing about it. A port rule can now name that traffic.
+
+### Added
+
+- **A port rule carries a scope.** `host` — the default, and what every rule
+  written before this release means — is traffic addressed to this machine.
+  `forwarded` is traffic this machine passes on, which is what a published
+  container port is. `both` is the same port wherever it arrives. On the ports
+  page it is a **Scope** column beside SSH, and `rules.json` gains no key until
+  a rule is given a scope, so an existing file stays byte-identical.
+- **`docker.published_ports`**, `"open"` or `"filtered"`. `"open"` is what
+  easywall has always done: Docker decides who reaches a published port. Under
+  `"filtered"`, and only then, the forward chain gains a default-deny for
+  traffic whose destination is a container address and whose source is not —
+  and a `forwarded` port rule is what opens one. Without that deny the feature
+  would be decoration: `addForwardExceptions` accepts any packet with a source
+  *or* destination inside an allowed bridge CIDR, and after Docker's DNAT an
+  inbound packet to a published port already has one. A forwarded accept that
+  names no source is pinned to IPv4: the table is `inet`, so a rule testing only
+  a port matches both families, and the deny beside it is built from bridge
+  detection, which is IPv4-only. Unpinned it would open the port for forwarded
+  IPv6 to anything the host routes.
+- **The ports page says when a forwarded rule is inert.** A rule written for
+  the forward chain while `published_ports` is `"open"` is never consulted, and
+  a rule that enforces nothing must not look like one that does.
+- **A `selftest` case for the ordering.** Forwarded rules render before the
+  bridge exceptions; rendered after them they could never deny anything, which
+  is 2.17's defect class reproduced by the release meant to end it. It is
+  proven in a private netns rather than reasoned about, and again against a
+  real bridge in the integration suite.
+
+### Changed
+
+- **`published_ports = "filtered"` is deliberately not in the interface.** It
+  is the one switch that can take every container on a host off the network in
+  a single press, and the 120-second acceptance window cannot catch that: the
+  window proves the operator's own connection, and that arrives on the `input`
+  chain. It is edited in `easywall.toml`, documented on the Docker page, and
+  the ports page only warns.
+- **Two contradictions are refused rather than guessed at.** A
+  `published_ports` value that is neither `open` nor `filtered` stops the
+  daemon by name, on start and on `SIGHUP`, instead of quietly reading as open;
+  and `"filtered"` with `docker.enabled = false` is refused as the
+  contradiction it is.
+- **`"filtered"` with no container network detected renders nothing.** The
+  forward chain is left exactly as the previous release left it, with one
+  warning saying why. A deny with no exceptions beside it would close the
+  host's container traffic entirely.
+- **A `routing.networks` peer no longer reaches published container ports under
+  `"filtered"`.** The deny is evaluated before the CIDR exceptions, by design —
+  a peer allowed there still needs a forwarded port rule. Documented on the
+  Docker page, because an operator with `routing.networks` set meets it as an
+  outage.
+- **`check:ui`'s layout and overflow sweep now runs in German as well.** The
+  Scope column's German option truncated in a rendered select twice while every
+  gate stayed green.
+
+### Security
+
+- **`lodash-es` is pinned above its code-injection advisory.** mermaid 12 brought
+  `chevrotain` 11.1.2, which resolves `lodash-es` 4.17.23 — GHSA-r5fr-rjxr-66jc,
+  code injection through `_.template`, and GHSA-f23m-r3pf-42rh, prototype
+  pollution in `_.unset` and `_.omit`. An `overrides` entry takes 4.18.1, which
+  `dagre-d3-es` in the same tree already resolved to, so the version is one the
+  build was carrying anyway. **Build-time only**: neither the container nor the
+  `.deb` contains `node_modules`, and `htmx.min.js` is vendored — the one place
+  this code ran is rendering the documentation diagrams. Those render
+  byte-identically afterwards, which `check:diagrams` asserts by digest.
+
+## [2.18.0] — 2026-09-11
+
+**A password alone is not enough.**
+
+easywall has had a second factor since 2.8, and it has been a checkbox. An
+operator who reads nothing and presses the button ends up with a firewall
+interface on the network behind one argon2id hash. After this release a second
+factor is a precondition for using the interface, on every installation but the
+public demo.
+
+Making something mandatory is only defensible if the good version of it is
+available. So the release also brings the two things standing between an
+ordinary installation and a passkey: a certificate a browser believes, and
+WebAuthn itself.
+
+### The mandate
+
+- **The upgrade locks nobody out.** `RequireSecondFactor` runs after
+  `RequireAuth`, never instead of it. The password still grants a session, and
+  an operator with no factor is then sent to `/password` — where enrolment
+  already lived — rather than refused at the login form. Until a factor exists,
+  that page, the enrolment routes, `/logout` and `/static/` are all that
+  answer. An operator whose only route to their host is this interface must
+  never be shut out of it by an upgrade; that is the direction 2.7 exists to
+  prevent. There is no *remind me later*, because the version of this with one
+  is the version nobody ever passes through.
+- **Demo mode is the one exemption.** The demo account belongs to nobody, and
+  the point of the demo is that every control can be pressed.
+- **Everyone is signed out exactly once.** `credentialFingerprint` goes
+  v2 → v3: it now covers the enrolled passkeys too, without which removing a
+  lost device's passkey would leave every session it had already opened
+  running. So every session in flight across the upgrade ends. One sign-in
+  after upgrading is this change, not a fault — the same thing the v1 → v2
+  change did in 2.8.
+- **The last factor cannot be removed.** `handle2FADisable` used to succeed
+  unconditionally, which under a mandate is the back door beside the locked
+  front one. One predicate now answers for both removal routes, because a rule
+  written twice is a rule whose copies come to disagree. Recovery codes
+  deliberately do not count toward it: they are what is left when both factors
+  are gone, not a factor.
+- **The wizard has no skip.** `handleFirstRunSkip` is deleted and
+  `/firstrun/skip` answers 404 — an unlinked route is still a route. The escape
+  it leaves behind is recovery codes, not a bypass. A server clock too far out
+  for any code to verify used to cost the account entirely; the wizard now
+  writes the account with the secret already on screen, plus eight codes. Fix
+  the clock afterwards and the authenticator already paired keeps working.
+- **Recovery codes are minted at the first factor, whichever it is**, and only
+  the first. An account whose single factor is a passkey on a lost phone must
+  not be an account with no way back, and re-minting at the second would
+  invalidate a printout the operator already holds.
+- **A password needs twelve characters, a digit and a symbol.** Twelve has been
+  the rule since the wizard existed and it accepted twelve lower-case letters —
+  a rule about effort rather than about strength. A symbol is any rune that is
+  neither a letter nor a digit, rather than a list of accepted punctuation. A
+  list rejects `§`, `€` and an en dash, which are no weaker. It also rejects a
+  space, which would punish a passphrase for being one. Counted in runes, since
+  `len()` would take six umlauts for twelve characters. Not configurable — a
+  minimum somebody can lower is not a minimum.
+
+### The certificate
+
+- **ACME, at the cost of no new dependency.** `autocert` was already in the
+  module graph, because `x/crypto` is direct for argon2. `certManager` gains it
+  as a third source beside the self-signed pair it generates and the pair an
+  operator supplies; `ensure()` and `maintain()` stay empty for it, because a
+  certificate a certificate authority issued is not easywall's to renew.
+- **HTTP-01 only.** TLS-ALPN-01 must be served on 443, which easywall does not
+  listen on and which is usually taken on a host with a domain pointed at it.
+  DNS-01 wants the DNS provider's API credentials in `web.toml`, and a token
+  that can take over the domain is not going in a config file. One challenge
+  type, one port.
+- **The challenge listener stays up**, not only during issuance — autocert
+  renews at a time it chooses, and a listener raised for the first issuance is
+  down for every renewal after it. Everything other than
+  `/.well-known/acme-challenge/` gets a 404, deliberately not autocert's own
+  handler, whose redirect points at `https://host/` on 443 where easywall is
+  not.
+- **Port 80 has to be open in easywall's own rules, and easywall will not open
+  it.** A firewall program that opens a port on its own initiative contradicts
+  the whole design. It looks instead, and says: `/system` reads the current
+  rule set and reports open, restricted, not covered, or unknown when the core
+  cannot be asked. Four states and not two, because a range can cover 80
+  without saying "80", and a covering rule's sources can still keep a
+  certificate authority out.
+- **easywall does not accept a certificate authority's terms for anybody.**
+  `acme = true` without `acme_agree_tos = true` is refused at startup, with the
+  setting named in the message. `acme` together with `cert`/`key` is refused in
+  the same shape `cert` without `key` already was: two answers to one question
+  is a bug waiting to be found in production.
+- **`AmbientCapabilities=CAP_NET_BIND_SERVICE`** on `easywall-web.service`,
+  granted by systemd at exec rather than acquired by the process, so it
+  composes with `NoNewPrivileges=yes`. It is a genuinely new option for a
+  compromised web process — any free port below 1024, for squatting or
+  phishing — and `threat-model.md` now says so. It opens no path to netlink.
+
+### Passkeys
+
+- **A passkey is the second step and never the first.** The ceremony sits at
+  `/login/verify` as an alternative to the code field, not at `/login`, so a
+  stolen authenticator is not a login to a firewall. A failed assertion pays
+  into the same attempt budget a wrong code does.
+- **Two conditions, and both must hold.** WebAuthn requires a registrable
+  domain name as its Relying Party ID and rejects a bare IP address. That is
+  `hostname` in `[tls]`, the same value ACME uses — two settings that must
+  agree are one setting that will not. And since Chrome 110, WebAuthn is
+  refused on any origin with a certificate error. That is every default
+  installation, because easywall generates its own self-signed pair. This is
+  why ACME travels in this release rather than a later one.
+- **The two screens answer an unmet condition differently, on purpose.** At
+  `/login/verify` the button is absent: a sign-in screen offering a control
+  that cannot work is a dead end for somebody who only wants in. On
+  `/password` the card is rendered with its button disabled, and names which
+  of the three things is in the way — no hostname, a certificate no browser
+  trusts, or the demo — because that is the page an operator goes to in order
+  to change it, and "unavailable" would not tell them what.
+- **Several passkeys, each with a name and an enrolment date**, held in
+  `passkeys.json` under `data_dir` rather than in `web.toml`: the signature
+  counter is written on every login, and a config file is something a human
+  edits.
+- **A cloned authenticator is refused.** go-webauthn reports `CloneWarning`
+  when an assertion's signature counter did not advance past what the
+  credential last reported. It was persisted and never read, so a cloned device
+  or a replayed response verified and was granted a session. It is now a
+  failed attempt and an audit event of its own, `passkey_clone_suspected`,
+  distinct from a plain verification failure. Authenticators that report a
+  counter of zero forever, which is most platform and synced passkeys, can
+  never trip it, so the fix costs the common case nothing. Four events are new
+  in all: `passkey_used`, `passkey_enrolled`, `passkey_removed` and that one.
+- **The same authenticator cannot be enrolled twice.** Registration was begun
+  with no exclusion list, so one physical key could become two named entries.
+  The mandate, and the rule that the last factor cannot be removed, would both
+  have rested on a number that overstated the real redundancy.
+
+### Fixed
+
+- **An account whose only factor was a passkey was signed in by the password
+  alone.** `handleLoginPOST` decided whether a second step existed by reading
+  the TOTP secret, which a passkey-only account does not have. It asks the
+  factor count now, the same predicate the gate uses.
+- **The documentation landing page rendered as unstyled prose at full page
+  width.** `.docs-landstrip`, `.docs-cardgrid` and `.docs-card` are in
+  `docs/index.md` and were in neither stylesheet. It is the first page a
+  stranger sees, and it survived two releases because
+  `TestTemplateClassesExistInStylesheet` read `web/templates/` and `app.js`
+  only. The stylesheet is the small half; widening the guard to `docs/` is the
+  half that stops the next one.
+- **`/system` had two buttons named `Save system settings`.** Each says which
+  section it saves, and the guard reads the rendered page rather than the
+  template, so a label moved into a partial is still caught.
+
+### Found by review, and fixed here
+
+Four parallel reviewers were pointed at this release. Two of the five findings
+predate it; they are fixed anyway, because both are about the second factor and
+this is the release that makes one mandatory.
+
+- **The attempt budget was not enforced.** `pendingLogin.Attempts` lived only in
+  the intermediate cookie, so three attempts bound a browser that sent back what
+  the server handed it — and nobody else. Measured: 200 guesses from one
+  password round. The count is now the server's, keyed by a random identifier
+  the cookie carries, and the passkey door shares it by construction rather than
+  by intent. A restart grants a fresh budget: forgetting costs an attacker one
+  more password round, and refusing would lock an operator out after a service
+  restart.
+- **Signing out could be undone.** Every save of a session re-signs the cookie
+  with a fresh timestamp, and three paths saved one they had not authenticated —
+  two flash helpers and `render` itself, which saves when it clears a flash. One
+  wrong password every nine minutes kept a revoked cookie alive until the
+  revocation record expired. `sessionForWrite` strips the identity first. The
+  threat model claimed this whole failure was closed in an earlier release; only
+  half of it was, and it now says so.
+- **An unreadable `passkeys.json` removed the mandate.** A corrupt store read as
+  "no passkeys", so a passkey-only account was signed in by the password alone —
+  a restored host without its `data_dir` was enough. A store that cannot be read
+  now counts as a factor, because the truth is unknown and the recovery codes
+  still work. An unparseable file is renamed aside rather than overwritten.
+- **A passkey ceremony is one-shot.** The cookie clear instructs the browser;
+  the server now remembers the spent challenge. The signature counter was no
+  backstop: go-webauthn exempts an authenticator reporting zero, which is most
+  platform passkeys, so for those the clone check had never fired.
+- **Enrolling a passkey asks for the password.** It was the one credential write
+  on that page that did not, so a stolen session could enrol a durable factor —
+  and the re-stamp that follows would have ended the real operator's session.
+
+### The proof
+
+- **The gate is walked, not listed.** `TestTheGateCannotBeWalkedPast`
+  enumerates every route chi actually registers inside
+  `RequireAuth`+`RequireSecondFactor`, 40 of them, plus `POST /logout` — and
+  fails if any one of the 41 answers without a factor. A test over a list
+  protects the list. The floor is measured, not copied: the plan had said 15,
+  and a floor written at 37 before the passkey routes existed went on passing
+  after three more were added, which is the shape this floor exists to catch.
+- **A certificate arrives from a real ACME server over a real challenge.** The
+  configuration tests prove that no certificate ever arrives; the failures that
+  matter are all at the wire. Pebble 2.7.0 and `pebble-challtestsrv` run as
+  containers inside the test's own network namespace, driving the real
+  `Start()` — which is how a nil `*tls.ClientHelloInfo` handed to autocert by
+  the certificate preflight was found before release rather than after.
+- **The passkey tests drive a real ceremony** with a virtual authenticator,
+  rather than asserting the shape of the options passed to the library.
+- **The gate is driven in a browser, not only asserted in Go.** `check:ui`
+  signs in against an instance with no factor, checks that `/dashboard`,
+  `/ports`, `/settings` and `/apply` all answer from `/password`, enrols, and
+  checks that they stop. It needs an instance of its own, because demo mode is
+  the gate's one exemption and the demo the rest of that script drives can
+  never show it.
+- **One test passed for the wrong reason, and the fix found a second thing.**
+  A recovery-code test asserted only that a session cookie came back, which the
+  flash cookie satisfied on its own. Pointing it at the shared helper turned it
+  red against correct code: that branch saves the session twice, and the
+  harness read the first `Set-Cookie` where a browser's jar keeps the last. The
+  operator was signed in the whole time; only the test disagreed.
+
+## [2.17.0] — 2026-09-09
+
+**It proves what it says.**
+
+For five releases `ct state established,related accept` matched no packet. All
+three conntrack masks were written big-endian while the kernel compares a native
+`u32`, so the mask it saw was `0x02000000` where `0x00000002` was meant. The
+stateful half of the input chain enforced nothing. Neither did the
+invalid-packet drop or the SSH brute-force meter, both of which reported
+themselves enabled. Every surface easywall has said the firewall was active.
+
+Nothing in this repository could see it — the unit test covering the rule had
+written the defect down as expected output. It was found because an operator's
+VPS went unreachable after `docker compose up -d`, and they pasted the ruleset
+into Discord.
+
+This release is the machinery that would have caught it, at three depths, plus
+the health check the project never had. After it easywall does not assert that
+it is working. It measures it, and says so in a form Docker, systemd and a
+monitoring system can each read.
+
+### Fixed
+
+- **All three conntrack masks are native-endian.** The table read correctly in
+  `nft list ruleset` the whole time, because byte order is invisible in the
+  rendered form. That is why five releases of reading the rules found nothing.
+- **The established-accept rule was invisible to every counter easywall reads.**
+  It carried no `expr.Counter` and no id comment, and `RuleCounters` skips any
+  rule without one. It now carries both under the reserved id `_established`,
+  whose counter is the one signal that can catch this defect class again.
+- **A finding named the wrong rule.** `Finding.Index` was a plain zero for both
+  per-chain checks, so a jump at input rule 3 was written into the audit log as
+  "input rule 0" — sending whoever read it to the wrong builder. Two chains
+  jumping to one missing target also produced a single finding, naming whichever
+  was added last.
+
+### Added
+
+- **`easywall-core health`.** Three lines and an exit code: `0` for `ok`, `1` for
+  `degraded`, `2` for `fail`. Seven reasons, because a state with no cause is
+  not actionable at three in the morning. It exits `2` under panic mode where
+  `easywall-core status` exits `0`, and the divergence is deliberate — a console
+  asking after *intent* is right to be quiet, and a monitoring system is asking
+  something else. That closes an entry `carried-forward` has held since 2.7.
+- **`GET /healthz`**, the one route on the web process that answers without a
+  session, because an orchestrator holds none. `200` for `ok` and `degraded`,
+  `503` for `fail` and for a core that does not answer, `404` for a caller not
+  on `health_allow`. Loopback only until an operator widens it, matched against
+  the TCP peer and never against a forwarding header. The body is deliberately
+  thin: the state, the reason and the proof's identity. No rule detail, no
+  counters, and **no kernel release** — the dashboard names the host's kernel
+  over the authenticated path and this route never does. A proof nothing has
+  recorded renders `"selftest": {}` rather than empty strings, because an empty
+  field where a value belongs is a claim and absence is not.
+- **Layer B: every expression is checked before it reaches netlink.** A
+  byte-reversed conntrack mask, a bit the kernel does not define, a jump to a
+  chain nobody creates, an accepting chain where a `return` was meant. It needs
+  no kernel, so it runs under `make test` — and it never refuses to write,
+  because a check reading false on a configured host would quietly stop
+  enforcing rules somebody wrote. Findings surface as `degraded` instead.
+- **Layer C: four claims, proven with a real packet.** A reply on an established
+  connection passes, an open port accepts, a closed port does not, and a
+  blacklist outranks an open port. Measured over a veth pair in a throwaway
+  network namespace built with netlink alone — no `unshare`, no `ip`, no
+  subprocess anywhere in the privileged path. The pair is `ewst-r` and
+  `ewst-p` in `10.77.9.0/24`, both fixed, and the range and the names are now
+  written where an operator reads them rather than only in the source.
+- **`easywall-selftest.service`**, which runs that proof once per version and
+  kernel. It is the only place `CAP_SYS_ADMIN` appears in this repository:
+  `CLONE_NEWNET` needs it, and widening the long-lived root daemon to buy a
+  check that runs once per upgrade was the trade this release declined.
+- **The image gets its first `HEALTHCHECK`**, a year after `docker-compose.yml`
+  got one. A plain `docker run` was checked by nothing at all.
+- **`Type=notify` and `WatchdogSec=60s`** on `easywall-core.service`. Under
+  `Type=simple` the unit was `active (running)` the instant `exec` returned —
+  before the socket existed that the web unit's `After=` waits for.
+- **The dashboard says whether the firewall is doing what it says**, with the
+  reason in words rather than a state id, and a self-test line beside it.
+
+### Changed
+
+- **`docker-compose.yml` no longer defines its own health check.** Compose
+  inherits the image's when the file declares none, so the copy was not merely
+  redundant — it was the only thing left that could drift. Two definitions of
+  one artefact is how a package came to contain no binaries.
+- **The Docker page is written for a remote host.** Its first instruction was
+  `https://localhost:12227`, which only ever works on the machine easywall is
+  developed on, and it is why both of 2.15.1's defects went unseen.
+- **A fresh container reads `unhealthy` until the first apply**, because it
+  genuinely is not filtering. Honest, and new: the old check looked at the
+  core's socket. One consequence — a `depends_on: condition: service_healthy`
+  on easywall will wait for ever until something has been applied.
+- **`supervisorctl` works inside the image.** It answered *".ini file does not
+  include supervisorctl section"* and exited 2, so every documented way of
+  stopping one of the two processes printed an error and did nothing.
+- **`DESIGN.md` gains a measure rule** — a per-element cap stated in `ch`, with
+  52 / 60 / 68 as the range. Measured in three locales rather than derived from
+  a font metric.
+
+### The proof
+
+- **Nine guards in this release were green for the wrong reason, and six had one
+  cause:** a comment named the string a `strings.Contains` searched for. The
+  seventh was inside the helper written to close the sixth, and survived a
+  suffix rename because the helper was itself a substring search.
+  `invariants.md` carries it as a rule now: in a repository whose comments name
+  everything they protect, a substring guard over a file that contains comments
+  is unreliable by construction.
+- **A mutation that hangs is worse than one that fails.** Twice, a deleted
+  branch made a test block until the timeout with no output — a hang in CI reads
+  as nothing at all. `t.Cleanup` runs LIFO, and `t.Fatalf` calls
+  `runtime.Goexit`.
+- **A parent test reported `PASS` over three skipped children.**
+  `EASYWALL_REQUIRE_SELFTEST` turns an absent precondition into a `t.Fatal` in
+  CI, because a polite skip and a pass look identical in a log.
+- **Three things in the tooling reported success while doing nothing**, which is
+  the release's own subject one layer down: `supervisorctl` did not work in the
+  image, `podman build` exits `0` while producing `HealthCheck: null`, and
+  `make docker` built nothing because the target shared its name with the
+  `docker/` directory and was missing from `.PHONY`. All three were found by
+  trying to measure rather than to assert.
+- **The container's health check is measured, not read.** CI runs it, stops the
+  web process, deletes the nftables table and seeds a failed self-test stamp,
+  then reads the status Docker itself computed. A `grep` over the `Dockerfile`
+  would have caught none of it.
+
+## [2.16.0] — 2026-09-08
+
+**The interface looks like a firewall.**
+
+Colour stops decorating and starts meaning something. After this release the only
+hue anywhere in the application is `state-ok`, `state-warn` and `state-crit` — a
+screen with no colour on it is a screen with nothing to report. Everything the
+ice-blue accent used to mark is carried by fill, edge and weight instead.
+
+### Changed
+
+- **Five accent tokens out, five in, one for one.** `action-fill` / `action-ink`
+  for the one primary action on a page, `select-fill` / `select-edge` for what is
+  active, `focus-ring` for where you are. The declaration and every consumer
+  moved in one commit, because a removed custom property renders as
+  `transparent` rather than as an error — a half-done swap is an invisible one.
+- **The protection toggles get clearer, not dimmer.** This was the objection
+  `DESIGN.md` raises against itself: the options page carries eleven of them, and
+  *"a page where only the enabled toggles are visible is worse than no page at
+  all"*. An on-toggle was accent-filled at 11.40:1 in dark and **4.73:1** in
+  light; ink-filled it is 16.72:1 and 18.88:1. In light mode the *on* state
+  became four times clearer.
+- **The page title takes a display voice**: JetBrains Mono 300, 30px stepping to
+  34px above 900px. `DESIGN.md`'s rule was *Inter for language, mono for network
+  data*; it is amended openly rather than deviated from — Inter for what is read,
+  mono for what is identified, and the name of the page you are standing on is
+  identified. 30 is a ceiling reached by measurement: the longest unbreakable
+  title is 19 characters, `Systemeinstellungen`, which at 0.6em advance is 11.4em
+  against roughly 358px inside the padding at 390px.
+- **The dashboard has two ranks.** Three of the six tiles were ways into the host
+  and three changed what the rules are; one grid said they were the same thing.
+  Rank two is a list, because three numbers are not three states. `Manage →` is
+  gone six times — the tile is already an `<a>`, and an arrow announcing that a
+  link is a link is decoration. The unused-port finding moves out of the note's
+  12px onto its own line under a hairline; it is the most useful sentence on the
+  page and the reason 2.15 happened.
+- **The sidebar groups get a divider and an indent**, the device the
+  documentation sidebar was given and the application was not. `carried-forward`
+  held this across three design reviews. The first labelled group correctly gets
+  neither: it follows the ungrouped *Dashboard* link, not another group, and a
+  rule there divides nothing.
+- **The language select stops being the one native control in the interface** —
+  `appearance: none`, a chevron drawn from two borders so it takes `currentColor`
+  and needs no second asset, and a `surface-raised` fill. On the login card a
+  `canvas` fill sits 1.03–1.06:1 from the card behind it, which left the control
+  recognisable only by its native arrow.
+- **The documentation site follows**, with a parallel replacement of its own four
+  differently-named tokens. Links there carry underline and weight rather than
+  hue, and `h1` takes the mono voice while `h2` and `h3` inside an article stay
+  Inter — a long-form page set in mono headings throughout reads as a table. The
+  landing hero's tint becomes a neutral wash, which is the one place a reader who
+  never signs in sees this release.
+
+### Fixed
+
+- **The keyboard focus indicator failed WCAG 1.4.11 on 66 controls per theme.**
+  The outline was `rgba(143,211,251,0.13)` — 11.4:1 as a colour and **1.31:1**
+  once composited over the card it sits on. No number in a CSS file says that.
+  The failing set was one shape, a ring with no border change: `.toggle` and
+  `.checkbox`, which `DESIGN.md`'s own notes predicted and nobody had confirmed
+  rendered, plus `.theme-toggle` on all thirteen pages, `.link` on eleven, the
+  three editor textareas and `.f-ssh`. Every control whose border moved on focus
+  already cleared 3:1. Three more controls — the sidebar links, the sign-out
+  button and the tabs — had no author focus rule at all and fell back to the
+  browser's own ring; they now follow the system.
+- **`.table-wrap` scrolled 10px sideways in card mode**, at every width the
+  container query switches at, since the card layout was written. A horizontal
+  margin on a `width: 100%` block asks its container for room it does not have,
+  and only one side displaces — which is why it was 10 and not 20. The inset
+  moved to the container's own padding.
+- **`.col-port` was 120px against a documented `8000:9000` needing 122.** The
+  decision `carried-forward` said `DESIGN.md` did not answer was already answered
+  four declarations below: `.col-flex` is `width: auto` and absorbs the
+  remainder, so there was never a zero-sum choice — only a rule nobody had
+  written down. It is written down now.
+- **The topbar version chip rendered `v2.14.0-44-g5…`** for every build off a
+  tag, because the Makefile hands the linker `git describe` and the chip is
+  capped at 18ch. An ellipsis in the chrome reads as a fault in the software. The
+  chip shows the release; the full string moves to its `title`.
+- **The copy that described the accent went with it** — `options_subtitle` in all
+  three locales said an "accent edge" marks a module that is on, and three
+  published documentation pages stated design rules this release replaces.
+
+### The proof
+
+Three guards, each written before the fix and each verified by mutation rather
+than by reading:
+
+- **No accent token survives** in either source stylesheet or either committed
+  build output, and no retired literal hue either — a grep over token *names*
+  walks straight past a hard-coded `rgba()`. Verified the way a "must not exist"
+  guard has to be: by proving it goes green when the defect is absent, not only
+  red while it is present.
+- **Focus is tabbed to, composited and required to clear 3:1** on all thirteen
+  pages in both themes. 109 controls measured per theme.
+- **Overflow is measured per container**, not only per page. The page-level check
+  could not see `.table-wrap` by construction.
+
+`check:ui` passes at five widths in both themes. All 36 screenshots re-taken.
+
+## [2.15.1] — 2026-09-07
+
+**Two ways a new installation could lock you out of its own host.**
+
+Reported from Discord: a VPS unreachable immediately after
+`docker compose up -d`, and still cutting SSH on every later `docker` start.
+The pasted ruleset carried the evidence for both causes —
+`tcp dport 22 ct state 0x8000000 jump sshbrute`, a conntrack state no packet
+ever has.
+
+### Fixed
+
+- **The conntrack state masks were byte-reversed, so three rules matched
+  nothing.** The kernel writes `ct state` into a register as a native `u32`;
+  all three masks in `internal/core/nftables.go` were written as
+  `[]byte{0x00, 0x00, 0x00, 0x06}` instead of `{0x06, 0x00, 0x00, 0x00}`, and
+  the kernel rendered them back as `ct state 0x2000000,0x4000000` — bits no
+  conntrack state sets. The worst of the three is
+  `ct state established,related accept`, the entire stateful half of the input
+  chain: without it a reply packet has no rule to match, so **an installation
+  with a live table had no working outbound connectivity at all** — no DNS, no
+  `apt update`, no version check — and applying the table dropped any SSH
+  session already open, because the only rules still matching were the
+  stateless `dport N accept` ones. The other two failed open: the
+  invalid-packet drop and the SSH brute-force meter both reported themselves
+  enabled and enforced nothing. Measured in a veth pair against an HTTP server:
+  `counter packets 0` and a failed request on the reversed rule, `packets 6`
+  and HTTP 200 on the corrected one, with a no-ruleset control returning 200.
+- **A test had written the defect down as the expected output.**
+  `nftables_semantics_test.go` asserted
+  `dport 2222 ct state 0x8000000 jump sshbrute` under a comment explaining that
+  "nft prints the mask rather than the name" — and both halves were wrong. `nft`
+  names every state it recognises, including for a bitwise-and plus a
+  not-equal-zero test, because that is how it compiles `ct state new` itself; it
+  printed raw hex here precisely because the mask was reversed. The assertion
+  was written from observed output rather than from intent, which is what let
+  this ship. It now asserts `ct state new`, and a new guard,
+  `TestIntegration_NoCtStateRendersAsARawMask`, fails on **any** hex-rendered ct
+  state in the table — the class, not the three instances.
+- **A host where nothing has ever been applied is no longer made to enforce an
+  empty rule set.** `RulesStore` initialises `rules.json` with `emptyState()`
+  and `Daemon.Start` restored it unconditionally, so the input chain came up at
+  `policy drop` with no port open: SSH closed, and the web interface whose
+  first-run wizard is the only thing that would have opened SSH closed with it.
+  `docker compose up -d` and `dpkg -i` both start the core before the operator
+  can open a single port. `RestoreCurrent`'s own contract rests on `Current`
+  being "a rule set that has already survived an acceptance window", which is
+  not true of one nobody has ever applied; `Firewall.everConfigured` now makes
+  that contract hold. A non-empty `Current` **or** a last-apply marker counts as
+  configured, so an operator who deliberately applied an empty set keeps it, and
+  an installation upgrading from an earlier release keeps filtering. Otherwise
+  the machine is left exactly as easywall found it and filtering starts at the
+  first deliberate apply — the one that has the acceptance window to undo it.
+  Recorded as a new audit action, `boot_not_configured`, amber.
+
+### Why it was not caught
+
+`docs/installation/docker.md` says to open `https://localhost:12227`, and
+loopback is accepted — so the documented first step works on the machine the
+software is developed on and fails on every remote host. Every count-based
+integration test stayed green throughout, because the rules were present in the
+table; they simply never fired.
+
+## [2.15.0] — 2026-09-07
+
+**You can see it working.**
+
+An open port nobody uses is the most common avoidable exposure on a hobby
+server, and until now nothing in easywall could point at one. Every port rule
+carries a stable id and a kernel counter keyed to it, so the port pages can say
+when that port last carried a packet — and the dashboard can say how many have
+carried nothing in a month.
+
+### Added
+
+- **A *Last used* column on both port tabs.** `never`, `3 days ago`, `just now`,
+  or `—` when nothing is known. `never` and `—` are different claims: the first
+  is a measurement, and it is the finding worth acting on.
+- **A second line on the dashboard's TCP tile** when it applies: *2 unused for
+  30+ days*. No new tile, and no colour — `DESIGN.md` reserves colour for
+  firewall state.
+- **Every port rule has an id**, twelve hex characters, assigned once and never
+  rewritten, and it is what the counters are keyed by. Editing a rule's sources
+  or description keeps its history. Editing its *port number* keeps it too —
+  the counter follows the rule and not the port, so a row renumbered from `22`
+  to `9999` still shows the old port's dates. Delete the row and add the new
+  port to start clean. 2.18's per-entry metadata will key by the id as well.
+- **`GET_USAGE`**, the twenty-first protocol command. Read-only, answered out of
+  a file: collecting inside it would queue behind the nft mutex, which an apply
+  holds for six times as long as the client waits.
+- **`[usage] interval`**, seconds between counter reads, default 300. `0` stops
+  the ticker and not the counting — an apply still collects, because that call
+  exists to keep the flush from destroying a number.
+
+### Fixed
+
+Ten entries carried forward from earlier releases, closed in the same pass.
+
+- **`Panic` and `Resume` were racing on the marker.** A `Resume` landing between
+  `Panic`'s marker write and its teardown left no marker and an empty table: a
+  machine unfiltered, with nothing on it recording that anybody chose that.
+- **The rollback stat'd the panic marker three times** and could get three
+  different answers. The state its gate reads is now passed on rather than read
+  again.
+- **Four ways out of `apply` wrote nothing to the audit log.** The backup, the
+  promote, the re-read after it and a window that could not open all returned
+  into a journal nobody reads, on a machine whose interface said nothing about
+  why the firewall had not changed.
+- **A window that fails to open now rolls the rules file back.** `PromoteStaged`
+  has already run at that point, so `Current` held a set nobody confirmed — and
+  the next boot or `resume` installs `Current` with no window at all, because
+  `Current` is assumed to have survived one.
+- **The kernel-write guard could not see a third file.** It enumerated
+  `firewall.go` and `restore.go`; it globs the package now, so a fourth writer of
+  the table cannot be added invisibly.
+- **`setBootBridges` had no test.** Every reconciler test wrote the field
+  directly, so deleting the call from `RestoreCurrent` left the suite green.
+- **A restore caused by a Docker bridge appearing** no longer records the detail
+  "daemon start".
+- **The reconciler no longer polls under panic mode**, where it logged "putting
+  the rules back" immediately before the restore logged its refusal.
+- **`locales/de.json`'s `Fortsetzen`** was a hapax; every other panic string says
+  *Notfallmodus*.
+- **The changelog's claim about the command count** said all three places now say
+  seventeen. The test assertion says *at least fifteen*, deliberately, and the
+  entry now says why.
+
+And one more, shipped in 2.14 and found here:
+
+- **A request the core had already accepted could be abandoned when the daemon
+  stopped.** `systemctl restart easywall-core` could walk away from a command it
+  was in the middle of answering, rather than finishing it first. A request
+  accepted before the shutdown begins is now always answered; one that arrives
+  after it is closed straight away, which is what the interface already reported
+  as an unreachable core.
+
+### Known limits
+
+- A flush easywall did not perform — `nft flush ruleset` typed by hand — loses
+  the interval since the last collect. Every write easywall *does* perform books
+  the counters first: an apply, an acceptance-window rollback, a boot or
+  `resume` restore, and a `panic` teardown. The counter restarting below its
+  baseline is detected either way and the new count booked in full; what
+  happened before an unannounced flush is gone. The reconciler already owns that
+  class of event.
+- The stored packet and byte totals can run slightly high, once, if a scheduled
+  collection lands in the instant between an apply's kernel write and its
+  baseline reset. Nothing reaches the screen from it: the reply carries only the
+  last-used date, and that date is already correct. Closing it would put a new
+  lock across the apply path for a nicety counter.
+- Custom rules carry no counter. They are raw nftables statements and cannot be
+  tagged without changing what was written.
+- A connection the SSH brute-force limiter drops never reaches the port's accept
+  rule and is not counted. The column says *last used*, not *last attempted*.
+
+## [2.14.0] — 2026-09-02
+
+**The window shows that it is running.**
+
+Every apply reverts itself after 120 seconds unless it is confirmed — and for
+four releases the screen said so with a static clock glyph and the word *Open*.
+Two screenshots nine seconds apart were pixel-identical. The countdown now runs,
+at 40px, on the apply screen and as a chip on every other page, and *Roll back
+now* sits beside *Confirm* rather than being described in a sentence.
+
+### Added
+
+- The acceptance window carries a deadline, so the number on the screen and the
+  timer that fires are one value.
+- `CANCEL_ACCEPTANCE`, the twentieth protocol command, reaches the rollback that
+  has existed since 2.7 and was never routable.
+
+### Changed
+
+- The apply screen lists what is live during the window, instead of only
+  counting it.
+- One `GET_STATUS` per render is cached for ~2 s, so a busy core no longer costs
+  every page its banner — or its countdown.
+- **A failed apply's audit log now shows that it started.** With the acceptance
+  window enabled, a failing `nft.Apply` or a panic-marker hit writes
+  `apply_started` before `apply_failed` or `apply_refused_panic`; previously
+  only the failure event appeared, because `apply_started` sat below the kernel
+  write. `apply_started` is still written exactly once per apply — the new
+  order is the truthful one, since an apply that failed did in fact start.
+- **The documentation sidebar groups its pages.** One flat list of twenty-seven
+  links became five sections — Installation, Rules, System, How it works,
+  Project — of which only the one holding the page being read is open. *Rules*
+  and *System* are the application's own sidebar dividers, in its order, so a
+  page found in easywall is documented under the label the product put it under.
+  A group is a `<details>`, so the toggle, the keyboard handling and the
+  disclosure semantics are the element's; which one is open is derived from the
+  current page, and nothing is stored. The sidebar had needed scrolling to reach
+  its last eight entries on a 1000px-tall window, and every one of them in the
+  drawer on a phone
+
+### Fixed
+
+- A SIGTERM landing between an apply starting and its window opening was
+  discarded, and shutdown then waited out the full window — past systemd's
+  `TimeoutStopSec`, after which `SIGKILL` left the unconfirmed rules live.
+- The window now opens before the rules reach the kernel, as `Acceptance.Start`'s
+  own contract had always required. It used to open after two file writes,
+  during which the kernel held unconfirmed rules and the interface showed no
+  window at all.
+- **The *Add from catalogue* button carried a solid black square instead of an
+  icon.** Its SVG draws the outer rounded rectangle and the three inner lines as
+  subpaths of one path, and under SVG's default nonzero fill rule the lines wind
+  the same way as the rectangle and are filled along with it — so the whole glyph
+  filled in, black on the light theme and white on the dark one. It had been
+  there since the catalogue shipped in 2.11 and reached `docs/`, where
+  `ports-light.png` and `ports-dark.png` showed the block as though it were the
+  design. `fill-rule="evenodd"` makes the overlaps holes, which is what the lines
+  are, and both screenshots are re-taken. It is the only one of the interface's
+  ninety inline icons with the fault
+- **Every screenshot in the documentation showed the narrow layout, and half of
+  them a sidebar that stopped mid-image.** The published set was taken in a
+  1440x900 window. `.page-grid` drops its 320px context column below 1570px, so
+  every figure showed the collapsed single-column fallback with the aside cards
+  under the table instead of beside it; and `.sidebar` is `position: fixed` at
+  `100vh`, which in a full-page capture stays laid out against the window it was
+  rendered in — the language switch, the theme toggle and *Logout* floated in
+  the middle of a column that then went blank, on 22 of the 34 files. Both had
+  been true since 2.11. The set is taken at 1600 now, in a window grown to the
+  document, and all 34 files are re-taken
+- **The version badge in the sidebar clipped anything longer than six
+  characters.** `.brand-version` was capped at 9ch, which fits `2.13.0` and
+  nothing else: the Dockerfile and the Makefile are handed `git describe`, so
+  every container image showed `v2.13…` instead of its own version — and
+  `2.13.10` clips just the same, which would have reached every installation at
+  the first patch release past `.9`. The cap is 18ch, the longest string a build
+  here can carry, and it is measured in the browser rather than asserted against
+  the stylesheet: whether text fits a box is not something a number in a CSS
+  file can say
+
+## [2.13.0] — 2026-08-28
+
+**Behind a proxy, easywall knows who you are.**
+
+### Added
+
+- **`trusted_proxies`, and `EASYWALL_WEB_TRUSTED_PROXIES` beside it.** A list of
+  addresses and networks whose `X-Forwarded-For` header easywall believes. When
+  the TCP peer is on that list — and only then — the resolved client becomes the
+  address in the audit log, the address the lockout verdict is computed for, and
+  the key the login limiter counts against. Empty by default, and an empty list
+  behaves exactly as 2.12 did. A **list** and never a boolean: "trust the
+  header" with no way to say whose is GHSA-3fxj-6jh8-hvhx,
+  GHSA-rjr7-jggh-pgcp and GHSA-9g5q-2w5x-hmxf, and no configuration of easywall
+  can express it. Listing a network wider than the proxies it holds hands
+  address spoofing to anything that can reach the port from inside it — the
+  [Configuration](https://easywall-project.org/docs/configuration/) page says so
+  in those words
+- **Five proofs against a real peer address.** The resolution is measured over a
+  veth pair, where the peer comes from the kernel rather than from a struct a
+  test filled in, and each was watched failing with the feature reverted before
+  it was counted as written
+
+### Changed
+
+- **The login limiter now counts per resolved client.** Behind a reverse proxy
+  it counted per proxy, which is one budget for everybody: five attempts per ten
+  minutes shared by every operator, exhausted by one attacker. **This changes
+  behaviour for anyone already running behind a proxy** — and only once
+  `trusted_proxies` names that proxy. Until it does, nothing changes
+- **The `via-proxy` marker now means the resolved address is a stand-in, not a
+  confirmed client.** True whenever resolution falls back to the peer — an
+  untrusted peer sending a forwarding header, same as before, or a trusted one
+  whose header named nobody — and false only when the walk actually named a
+  client
+- **The demo records no login addresses.** Its audit log shows that somebody
+  signed in and not from where — the field is omitted, not filled with a
+  placeholder
+
+## [2.12.0] — 2026-08-28
+
+**The configuration comes from outside, and the page says so.**
+
+### Added
+
+- **`EASYWALL_WEB_TELEMETRY`** switches the installation count on from the
+  environment. It exists because the public demo is configured entirely that way
+  and should be counted like anything else — which also means the number means
+  *installations including the demo*. Consent semantics are unchanged: unset
+  still means no, and an answer given in the interface beats the variable. The
+  request the reporter sends was issued against the live endpoint on
+  2026-08-28, answered `204`, and was found in the counter's own log on the
+  receiving host — the path is proven to the far end, not just to the wire
+- **Every setting whose key an environment variable names says so on the page.**
+  The control keeps working; beneath it the interface says either *set by the
+  environment* or *the environment says X — overridden here*, and in the second
+  case offers **Reset to the environment value**. Reset removes the stored line
+  rather than writing the default, because for a flag whose absence is a state
+  those are different files
+- **A precedence section and a diagram** on the [Environment
+  Variables](https://easywall-project.org/docs/environment/) page, and a
+  *Control* column saying which variables the interface also offers
+
+### Changed
+
+- **A stored value now beats the environment variable naming the same key.**
+  Until 2.12 the environment overlaid the parsed file, so a value set in the
+  interface — or written into `web.toml` by hand — came back changed after a
+  restart, with nothing anywhere saying why. The order is now stored value,
+  then environment variable, then built-in default, and it is the same order for
+  all thirteen variables. **This is a behaviour change for existing Docker
+  installations:** a variable that used to win now loses to a value stored in the
+  file, and the reset control on the page is the way back.
+
+  *Stored* means the file's value differs from the built-in default, never that
+  the key is present in the file. `-write-config` emits every default and that
+  file is what the container image ships; the other reading would have disabled
+  every variable in the product on exactly the installations that use them
+- **`config/web.toml` no longer pre-answers the counting question.** The
+  `telemetry = false` line is now a commented example. Absent means nobody has
+  answered, which is a different state from *no* — and under the new precedence a
+  pre-answered default would have let the environment overrule an operator who
+  genuinely declined
+- **The Options, Network and System pages save when you press Save.** They posted
+  over HTMX on every `change` *and* carried a Save button, so the button reported
+  a write that had already happened. The button stays; the automatic write goes
+
+### Fixed
+
+- **The counting toggle on the System page can be saved without JavaScript.** Its
+  form carried no submit button at all — `hx-trigger` was the only thing that
+  ever submitted it — so a script-free operator could move a consent switch and
+  never store the answer
+
+## [2.11.0] — 2026-08-27
+
+**A rule names a service and who may reach it.**
+
+### Added
+
+- **A port rule can name who may reach it.** `Sources` is a comma-separated list
+  of addresses and networks on every TCP and UDP rule; empty still means
+  everyone, which is what every rule written before 2.11 means. Each usable
+  entry becomes its own nft rule, matched before the port is tested, and a
+  source list holding nothing usable — all comments, all blank — opens the port
+  to nobody rather than to the world. The reachability verdict on `/apply` gained
+  a matching reason, `port_source_mismatch`, so a restriction that would lock out
+  the connection you are reading the page on is called out by name instead of
+  folding into the generic "blocked"
+- **A catalogue of 29 services fills in a rule in one click.** `Add from
+  catalogue` on `/ports` appends the ports a service listens on — Pi-hole, Home
+  Assistant, WireGuard and 26 others — with a suggested source restriction
+  already filled in (private networks, or explicitly anywhere), everything left
+  editable and nothing applied until you apply it. The service name rides along
+  as a label only: a catalogue entry corrected or removed in a later release
+  leaves an already-saved rule exactly as it was
+- **A new aside on `/ports`** explains what an empty **Sources** field means and
+  why the catalogue's *private networks* suggestion may not be enough on its
+  own over IPv6
+
+### Fixed
+
+- **The SSH brute-force chain no longer outranks the blacklist.** It jumped to
+  `sshbrute` before the blacklist was consulted and ended in `accept`, so a
+  blacklisted address could still open an SSH connection as long as it stayed
+  under the rate limit — the module built to slow down an attacker was, for a
+  listed one, a bypass of the list whose whole job is to refuse them. The chain
+  now `return`s: traffic under the rate limit falls back into the input chain
+  and meets the blacklist, then the whitelist, then the port rule, exactly as
+  if the module were not there. Proven against a real kernel: the chain's
+  final verdict is now `return`, and the sshbrute jump is confirmed to
+  precede the blacklist drops in the input chain — both assertions fail
+  when the fix is reverted
+
+### Changed
+
+- **A host with SSH brute-force protection on, and no rule opening port 22,
+  no longer has port 22 open.** The chain's `accept` was doing that by itself:
+  any installation with the module switched on and nothing marked SSH had 22
+  accepted regardless of what the port rules said. Now that the chain returns
+  instead of accepting, that host is filtered like any other — if you were
+  relying on the module alone to keep SSH reachable, add an explicit rule for
+  it (and tick **SSH protection** on it) before you apply this release. An
+  under-rate SSH connection now also traverses the module rules that follow
+  the jump — connection limit, RST flood, broadcast/multicast/anycast drops —
+  which the old `accept` short-circuited; harmless at defaults, but a real
+  behaviour change
+
+## [2.10.0] — 2026-08-27
+
+**What changes is on the screen.**
+
+### Added
+
+- **A search on the documentation site.** The sidebar carries a trigger that
+  shows its own shortcut — `Ctrl K`, or `⌘ K` on Apple — and results open in an
+  overlay, so the page list stays where it was. Pagefind indexes the HTML
+  `jekyll build` already writes, so every table cell is searchable without one
+  anchor being added by hand: a config key, an environment variable or an audit
+  action is found in the row that defines it, and following a result marks the
+  term on the page it lands on. The engine and its interface are ~176 KB
+  together and a reference page is read far more often than it is searched, so
+  nothing is fetched until the overlay is opened. Without JavaScript no trigger
+  is shown rather than one that cannot work — the sidebar navigation stays the
+  complete scriptless path to every page. The index is built in CI by a
+  composite action both `docs.yml` jobs call, scoped by three flags that each
+  prevent something that was observed: `--glob` keeps the marketing landing page
+  and the 23 redirect stubs out (it had ranked for `argon2id` and `port
+  forwarding`), `--root-selector` keeps the topbar from being indexed on all 26
+  pages at once, and `--force-language en` states the language once — it had been
+  inferred as two, and a search in one index could not see the other. One
+  limitation is by design: Pagefind ANDs every query term, so `open a port` finds
+  the ports page while `how do I open a port` finds nothing — no weighting was
+  added and no page was reworded to work around it
+- **What changes is on the screen, before the apply.** `/apply` lists every
+  difference between the staged rules and the running ones — ports, addresses,
+  forwards, custom rules, each set compared the way the kernel reads it, so a
+  reordered port list is not a change and a moved custom rule is — and beside it
+  the configuration drift, which nothing could see before: firewall options and
+  network settings are written straight into the daemon's config and take effect
+  at the next apply, so they were in no pending calculation at all. The page with
+  the button said "there is nothing to apply" while the options page said
+  "apply rules to activate changes", and the false one was the page with the
+  button. Above the list, one line names the address the request came from and the
+  port the interface answers on, and says whether a new connection from there is
+  still accepted once the staged set is live: **reachable**, **blocks new
+  connections** — which turns the primary button into *Apply anyway*, never a
+  disabled control — or **cannot tell**, which names its reason. Every uncertain
+  case is *cannot tell*: the bogon filter matches on the arrival interface, which
+  the web process cannot know; an auto-detected Docker bridge network is settled
+  in the core at apply time and is equally unknowable, while a network named in
+  the Docker settings is not and gets a plain **reachable**; custom rules are raw
+  nftables appended after everything else. A wrong "blocks new connections" would
+  cost the trust the true one needs. The verdict is deliberately about a **new**
+  connection, because flushing the table does not touch conntrack: the browser
+  connection you are reading it on stays established through an apply that admits
+  nobody, so confirming from it would confirm a lockout. The diff carries no
+  colour at all — `+`, `-` and `~` in the mono column — because green and red mean
+  firewall state, and a new blacklist entry is not good news. One new command,
+  `GET_APPLIED_CONFIG`, and one new file the core writes wherever `nft.Apply`
+  succeeds; an installation upgrading without one is told so in a sentence rather
+  than shown a drift nobody made
+
+### Changed
+
+- **French is no longer marked unreviewed.** It shipped in 2.9.0 with
+  `reviewed: false`, and the switcher and the coverage report both said so. The
+  flag is now `true`, so `Français` reads plainly in the language menu on every
+  page including the sign-in one. The mechanism itself is untouched and still
+  applies to any language sent in from outside: `reviewed` means a human who
+  speaks it has read the catalogue, which is what makes offering a draft
+  possible without claiming more for it than is true.
+
+### Fixed
+
+- **On a phone, nothing inside the open documentation drawer could be tapped.**
+  `.sidebar-backdrop` and `.sidebar` are `position: fixed` siblings, so their
+  `z-index` alone decides which one receives a touch — and since 2026-05-03 the
+  backdrop (150) had painted above the opened drawer (100). Every tap on a
+  navigation link landed on the backdrop and only closed the drawer, on every
+  documentation page, for three months. The open drawer is now 160: above the
+  backdrop, still below the topbar's 200 so its own toggle stays reachable. It
+  was found by clicking the new search field at 390px and being told the
+  backdrop was the element receiving the pointer event; a guard now reads the
+  two numbers out of the built stylesheet, because hit-testing on a phone is
+  invisible to every build in this repository
+- **The forwarding rows are back in line.** `display: flex` on a `<td>` stops the
+  element being a table cell: the browser wraps it in an anonymous cell and its
+  box leaves the row, so at 1600px in both themes the separator under the first
+  two columns sat ~10px below the one under the third. Below the 720px reflow
+  breakpoint every cell is a block anyway, which is why it survived a release.
+  The flex row is now a `<div>` inside the cell, and `ui-check.mjs` measures all
+  four cells against one top edge
+- **A login recorded through a proxy says that it was.** Behind a reverse proxy
+  every login in the audit log shows the same address — the proxy's — recorded
+  faithfully as the TCP peer, because easywall refuses `X-Forwarded-For` and will
+  go on refusing it. What was missing was the second half: nothing told the reader
+  that the number is not the client's. Entries now carry a `via-proxy` token in
+  the log file, so `grep via-proxy` finds every one, and a neutral **via proxy**
+  chip in the interface. The flag comes from the *presence* of a forwarding
+  header and never its value, so a client that forges one can move its own verdict
+  to "cannot tell" and achieve nothing else
+
+## [2.9.0] — 2026-08-21
+
+**The interface speaks French, and both binaries read their environment.**
+
+### Added
+
+- **`EASYWALL_CORE_*` and `EASYWALL_WEB_*` — twelve variables, and the first
+  environment either binary has ever read.** `os.Getenv` appeared nowhere in
+  the non-test source before this: both processes took only `-config`, so a
+  container had no way to set a socket path, a data directory or the address
+  to bind without writing `easywall.toml` and `web.toml` onto a volume ahead
+  of the first boot. Three variables now cover what `easywall-core` needs to
+  place its socket and its state (`SOCKET_PATH`, `DATA_DIR`, `LOG_DIR`); nine
+  cover what `easywall-web` needs for the same, plus TLS, a fallback locale,
+  the update check and the public demo (`BIND_ADDR`, `SOCKET_PATH`,
+  `SSL_DIR`, `DATA_DIR`, `TLS_CERT`, `TLS_KEY`, `LANGUAGE`, `UPDATE_CHECK`,
+  `DEMO_MODE`). The overlay runs inside `LoadConfig`, ahead of the
+  `Validate()` call `main` already makes next, so a malformed value from the
+  environment is rejected exactly as a malformed one from the file always has
+  been. The list stops at deployment on purpose: the environment configures
+  *where* easywall runs, the interface configures *what the firewall does*,
+  and a variable that crossed that line would let an operator press Save on
+  the Options page, be told it was saved, and find the old value back after
+  the container's next restart re-read a value fixed at `docker run` — the
+  page would be lying about what it just did. So every rule field and limit,
+  `acceptance.duration`, `[ipv6]`, `[docker]`, `[routing]` and `telemetry`
+  are absent, and the credentials and the session key are absent on top of
+  that for a second, independent reason: an environment variable is visible
+  in `docker inspect` and in `/proc/<pid>/environ`, where `web.toml` at
+  `0600` is not. Nothing the overlay supplies can leak into that file later
+  either — `encode()`'s fallback path used to marshal the live config whole,
+  environment values included, whenever the comment-preserving merge
+  declined, so it now renders the pre-overlay parse `LoadConfig` captured and
+  takes only the six keys the interface itself owns from the live struct.
+  `TestNoEnvVarTargetsARuleField` and `TestNoEnvVarTargetsAManagedKey` derive
+  their forbidden set from the payload types the interface's Save handlers
+  send and from `managedKeys`, rather than restating either list by hand, so
+  the two sides cannot quietly drift apart. Documented in full, exclusions
+  and all, on `docs/_docs/environment.md`
+
+- **The interface speaks French, and the next language need not come from us.**
+  `locales/fr.json` — 463 strings, the whole interface — ships marked as
+  **unreviewed**, because nobody who speaks French has read it yet: the
+  language switcher says so beside the endonym, and so does the coverage
+  report. That state had to exist before a contributed translation could,
+  since "present, but not checked by a human" is the normal condition of a
+  translation somebody sends in. Parity is now a rule for `en` and `de` alone
+  (`StrictLangs`); every other language may have gaps, and a missing key
+  renders the English string, which go-i18n already did per message ID —
+  `langCandidates` has always ended with the configured default and then `en`.
+  What is new is the accounting, because that fallback is precisely what makes
+  a gap invisible: the page looks finished, which is right for the operator in
+  front of it and wrong for everybody else. `LocaleCoverage` measures every
+  catalogue against English and refuses to round up — 99% while anything is
+  missing, never 100 — and it declines to count two things that would let the
+  number be raised without translating anything: an empty string, and a value
+  byte-identical to the English one. French reports 97%: the thirteen keys
+  counted missing are the ones French spells exactly as English does, which is
+  the direction worth being wrong in. `docs-tech/i18n-review.md` collects the
+  thirty-odd sentences where a wrong word changes what the firewall promises —
+  which list is consulted first, what the acceptance window undertakes, what
+  panic mode does and does not end — under one rule: a translator may rephrase
+  freely, but may not change what the sentence *claims*. An acceptance window
+  that "keeps" a change in one language and "undoes" it in another describes a
+  different product depending on which language you read, and a guard test
+  fails if the page names an id `en.json` no longer has
+
+### Changed
+
+- **The language switcher is a `<select>` with a submit button, not two
+  chips.** Two chip buttons fit two languages in a 240px sidebar and do not
+  fit eleven. It still works with JavaScript switched off, which is not
+  negotiable for this control in particular: an operator who cannot read the
+  interface should not also need JavaScript to fix that. The button is hidden
+  by a `data-js` attribute set in the nonced head script rather than from
+  `app.js`, which loads at the end of `<body>` and would let the button
+  render, be seen, and then vanish
+
+- **`CONTRIBUTING.md`'s "Adding a Language" said what was never true.** It
+  promised that `TestLocaleFilesAreAtParity` and
+  `TestTemplatesOnlyUseTranslatedKeys` "will tell you about anything you
+  missed" — both are scoped to `StrictLangs`, so a contributor working on any
+  language but German would have been told nothing at all. It now describes
+  what is actually enforced, that a partial translation is welcome, and how
+  `status.json` records whether a human has read it. Six documents claimed the
+  interface speaks English and German, the landing page among them; two guards
+  now keep the list in step with `locales/`
+
+### Fixed
+
+- **A malformed `locales/status.json` refused to start `easywall-web`.** A
+  file describing which translations have been reviewed is metadata about the
+  documentation; a syntax error in it stopping the firewall's interface from
+  booting is the wrong failure by a wide margin. It is now logged and treated
+  as "nothing is reviewed", which is the understating direction
+
+- **A wrapped tile label on the dashboard pushed its own number 20px below its
+  neighbours.** Each of the six tiles stacked its own contents, so the row
+  went ragged as soon as one label needed two lines — which no language had
+  needed until "Règles personnalisées" appeared where English says "Custom
+  rules". The tiles now take their four rows from the grid above them, so
+  label, value, note and link line up across the row however long any one
+  label is. Reserving a second label line would have been the other fix and
+  charges every language 18px of empty tile whether anything wraps or not;
+  this charges none, because a row is as tall as its tallest label
+
+[2.14.0]: https://github.com/jp1337/easywall/compare/v2.13.0...v2.14.0
+[2.13.0]: https://github.com/jp1337/easywall/compare/v2.12.0...v2.13.0
+[2.12.0]: https://github.com/jp1337/easywall/compare/v2.11.0...v2.12.0
+[2.11.0]: https://github.com/jp1337/easywall/compare/v2.10.0...v2.11.0
+[2.10.0]: https://github.com/jp1337/easywall/compare/v2.9.0...v2.10.0
+[2.9.0]: https://github.com/jp1337/easywall/compare/v2.8.0...v2.9.0
+
+## [2.8.0] — 2026-08-20
+
+**A stolen password alone no longer opens the firewall.**
+
+### Added
+
+- **A stolen password alone no longer opens the firewall.** RFC 6238 TOTP for the
+  single account, verified against the RFC's own published test vectors, plus
+  eight one-time recovery codes stored argon2-hashed rather than in the clear.
+  Setup lives on **Password → Second factor**: enter the current password, scan
+  a QR code or type the key by hand, then enter the six-digit code the app
+  shows — nothing is written until that third step succeeds. `/login/verify`
+  is now the second step of signing in whenever a factor is enrolled: the
+  password step ends in a redirect bound to an intermediate cookie,
+  `easywall_pending`, rather than a session, and issues no session at all
+  until the code is right too. That second step has its own bound rather than
+  its own rate limiter —
+  three code attempts per intermediate cookie, and a new cookie costs a
+  password round already limited to five per ten minutes per address, so
+  fifteen code attempts per ten minutes per address against a target that
+  rotates every thirty seconds —
+  `TestLoginVerify_TheSixteenthCodeAttemptDoesNotGetThrough` runs that
+  arithmetic rather than stating it. The way back if both the phone and the
+  recovery codes are lost is documented before this release ships rather than
+  after, the rule 2.7's removal of the accidental reboot escape hatch
+  established: clear `totp_secret` and `recovery_codes` in `web.toml` on the
+  host, the same file the password already lives in — there is no reset link,
+  because this interface sends no mail and reaches no outside service
+- `LOG_EVENT` is the eighteenth command the socket protocol declares, and the
+  first one the web process sends rather than receives. Nine login events —
+  signed in, sign-in failed, second factor failed, a recovery code used,
+  sign-in attempts blocked, signed out, and the second factor switched on, off
+  or regenerated — reach the audit log from a fixed enum rather than free text,
+  the same shape `AllCommandTypes` already enforced for the fifteen commands
+  before it. Three of the nine are events a stranger can trigger without any
+  credential at all — a failed password, a failed code, a rate-limited
+  address — and those are debounced in the core: a burst from one address
+  writes one line immediately and a summary sixty seconds later, because
+  `GET_LOG` shows only the last 200 lines and forty addresses knocking for an
+  hour would otherwise push an `apply_rolledback` out of view entirely. None of
+  the nine carries colour — colour means the firewall moved, and a sign-in
+  does not move it
+- **The first-run wizard offers a second factor too, unticked by default.**
+  Ticking "Set up a second factor now" replaces Finish's immediate account
+  creation with the same setup step **Password → Second factor** shows later —
+  the QR code, the typed key, the server's own clock — and the account is
+  written only once a code confirms it, together with the eight recovery
+  codes. Skipping that step is a first-class answer, not a failure:
+  `POST /firstrun/skip` creates the account with a password alone regardless
+  of what the code field held, because easywall runs on single-board
+  computers with no RTC, which come up at the epoch until NTP lands, and TOTP
+  cannot verify against a clock like that — an optional feature must never
+  become a way of bricking the wizard on a machine already reachable from the
+  network, which is what `TestFirstRun2FA_SkipCreatesTheAccountWithoutAFactor`
+  runs rather than states. A staging failure after confirming does not cost
+  the operator their one look at the recovery codes either — they are shown
+  regardless, with the same notice used elsewhere that the initial choices
+  could not be staged and have to be set by hand
+
+### Fixed
+
+- **An unauthenticated request could erase the visible audit log.** `POST
+  /logout` is in the public route group with no rate limiter, and
+  `handleLogout` recorded a `logout` audit event unconditionally, even for a
+  request carrying no session at all — a bare `curl -X POST /logout` in a
+  loop, with no cookie, wrote one line per request. `GET_LOG` returns only the
+  last 200 lines, so that erased the whole visible history in well under two
+  seconds. `recordLoginEvent` now sits inside the same `id != ""` guard that
+  already gated `revokeSession`, so a request with no session behind it
+  records nothing, and `logout` joins the core's debounced events so a
+  replayed session cookie posted in a loop still folds into one line and a
+  summary rather than one line per request
+- **Renovate found every Go toolchain pin and updated none of them.** The
+  single-source arrangement 2.6.0 introduced went in with the toolchain already
+  written correctly everywhere, so nothing ever exercised it; the first real
+  bump moved `go.mod` and the `Dockerfile` and left all seven derived pins
+  behind, with no warning anywhere — the dependency dashboard listed the regex
+  dependencies, none carried a `skipReason`, and the candidate set was simply
+  empty. Two causes. The custom managers used `versioning: npm` on pins that
+  carry two components, and neither `1.26` nor the extracted `1.27` is a valid
+  semver version, so npm versioning read the current value as a range nothing
+  satisfied; they use `docker` versioning now, which treats a truncated version
+  as a version. And one file pattern still named `docs/installation/manual.md`,
+  the path that page had before the Jekyll restructure moved it under
+  `docs/_docs/` — what sits there now is a four-line `redirect_to` stub with no
+  version in it, so Renovate read the file, found nothing, and reported nothing.
+  `TestEveryRenovateFilePatternReachesAPin` is that second cause generalised: a
+  manager that reaches nothing is indistinguishable from one that works, and the
+  test that already validated Renovate's regexes could not see it, because it
+  checks the values a pattern captures and a dead pattern captures none. An
+  eighth pin turned up while fixing it, on the documentation landing page one
+  card below the badge that *was* managed; it has a manager and a test now. The
+  toolchain moves to 1.27.0 with this release
+- **The interface said `v2`.** `web/templates/base.html` carried that literal in
+  the sidebar — not the version, the major — and it would have read `v2` in 2.5
+  and would still read it in 2.19. Both existing paths by which
+  `shared.CurrentVersion` already reached the templates showed it nowhere: the
+  `Asset` field feeds a cache-busting query string, not the sidebar, and
+  `dashboard.html`'s `.Version.Latest` names the *new* release, only ever
+  rendered when an update is available. Whoever was current saw nothing at
+  all; whoever was not learned where to go but not where they were starting
+  from. `PageData` now carries a `Version` field deliberately separate from
+  `Asset` — coupling the two would make a future cache-busting scheme built on
+  a build hash silently start rendering "easywall v3f9a1c" — and
+  `TestNoTemplateCarriesAVersionLiteral` scans every shipped template for a
+  version literal so a fourth copy cannot come back the same way
+- **The public demo could be locked.** `POST /password` called
+  `SaveCredentials` for real, and had no demo-mode test anywhere in a handler —
+  so a visitor to the published demo could overwrite the demo password and
+  shut out everyone else, including whoever publishes it, until the process was
+  restarted. The four `/password/2fa/*` routes added by this release had the
+  identical exposure through `SaveTOTP` and `SaveRecoveryCodes`. Every
+  credential-writing route now checks `s.client.IsDemo()` before it writes
+  anything, and `TestDemoModeRefusesToWriteCredentials` enumerates the whole
+  list by hand — deliberately not a pattern match — so the next route that
+  writes a credential has to be added to it to pass review. Whether the
+  deployed public demo's `web.toml` was ever actually writable by the process
+  could not be confirmed from here; recorded as an open question in
+  `docs-tech/threat-model.md`
+
+### Changed
+
+- Every session in flight ends once on upgrade: `credentialFingerprint` now
+  covers the TOTP state as well as the password hash, so enrolling or disabling
+  a second factor ends every other session exactly as a password change
+  already does, and its domain separator moved from `v1` to `v2` to force that
+  same ending across the upgrade itself — a session issued under the old
+  fingerprint scheme is, correctly, not one the new scheme recognises
+
+[2.8.0]: https://github.com/jp1337/easywall/compare/v2.7.0...v2.8.0
+
+## [2.7.0] — 2026-08-18
+
+**The firewall survives a reboot.**
+
+### Fixed
+
+- **The firewall survives a reboot.** `nft.Apply` was reachable from exactly two places in the whole codebase — `internal/core/firewall.go`'s apply, and its rollback — and nothing else ever called it. Not `NewFirewall`, not `Daemon.Start`, not `cmd/easywall-core/main.go`. nftables itself forgets everything on a restart, so every reboot left the machine unfiltered until somebody opened the web interface and pressed Apply — on a product whose first sentence is a safety promise. `Status()` already asked the kernel rather than assuming, so the dashboard would have said so correctly, but only to somebody who was looking. Nothing in the published documentation mentioned it, and the original Python easywall had the identical gap, reported and never fixed as issue #22. The core now puts the stored `Current` rule set into the kernel before its socket accepts a single connection — with **no acceptance window**. That is not a breach of the window's own promise: `Current` is, by definition, a rule set that has already survived one, on the way in through an apply that was confirmed. A window here could not do anything useful even offered: nobody is present at boot to confirm it, so it would expire, and the rollback it triggered would install `Backup` — which nobody confirmed either, with no further window behind it to catch that. Docker complicates the timing: `easywall-core.service` starts after `network.target`, and Docker is not part of it, so the coexistence rules the restore builds can come out without a bridge that has not appeared yet. A background reconciler retries for a bounded window afterward rather than a systemd drop-in ordering after `docker.service` — that dependency would be hard and unconditional on a unit most installations do not have, and gating it on `docker.enabled` is not possible because that flag lives in a TOML file systemd cannot read; a unit that refuses to start because Docker is absent would be a worse bug than the one being fixed
+- **Every timestamp in the interface was in the wrong zone, and a documented fix for it could not have worked.** The audit log and the dashboard store every time as RFC 3339 UTC and convert it for display — and the conversion built its comparison in the *stored* zone rather than the viewer's, so "how long ago" and the short/long date-format boundary were both computed against the wrong clock. A change made at 23:30 UTC (01:30 the next day in `Europe/Berlin`) could be attributed to the wrong calendar day as well as the wrong hour. `features/audit-log.md` told operators experiencing this to run `timedatectl set-timezone …` and restart `easywall-web` — which does nothing for a defect in the comparison itself; Go's `time.Local` is resolved once at process start with no reload path anywhere in `internal/web` or `cmd/easywall-web`, so that advice was only ever coincidentally right about needing a restart, for the wrong reason. It went unnoticed this long because the demo seeds its own history in local time already, which happens to hide the exact mismatch a real deployment shows. Fixed at the source: the comparison now runs in the same zone the converted value is displayed in, verified against the literal boundary case `2020-06-15T23:30:00Z` → `16 Jun 2020 01:30` with `time.Local` pinned to `Europe/Berlin`. **Nothing stored on disk changes** — the audit log is still RFC 3339 UTC, byte for byte, so there is no migration to run and nothing to look for. The container image was also missing `tzdata` on its runtime stage entirely, which would have made setting `TZ` there silently do nothing rather than fail loudly; added to the Alpine runtime stage, not the builder, where it was never needed
+
+### Added
+
+- **`easywall-core panic` / `resume` / `status`** — a console-only way back into a machine your own rules have shut you out of, now that a reboot no longer provides one by accident. `panic` flushes `table inet easywall` immediately; `resume` ends that and restores `Current`, the same restore the daemon runs at boot. Panic mode is recorded in `/var/lib/easywall/panic` — a marker with nothing to read inside it, named so it is recognisable sitting in a directory listing beside `rules.json`, root-owned and `0600` because the web process only ever learns about it over the socket, in the status reply, and never opens the path itself. The marker's presence deliberately survives a restart: otherwise the very next reboot would put back the rules panic mode exists to remove, turning the fix for one lockout into the next one. The interface shows a loud banner while it is engaged, and that banner has **no button** — ending panic mode is console-only, without exception, because a control reachable from the network would let that process re-arm a firewall a human just disarmed at the machine on purpose, using nothing more than a stolen session
+- `PANIC` and `RESUME` are the sixteenth and seventeenth commands the socket protocol declares. Three places said fifteen — `docs-tech/protocol.md`, `docs/architecture.md`, and the count assertion in `daemon_dispatch_test.go`. The two documents now say seventeen; the assertion says *at least fifteen*, deliberately, because the bidirectional source checks are the real guard and a hand-maintained number beside them is one more thing to keep in step. All three are tied to one list rather than to three independent counts: `shared.AllCommandTypes` is the protocol's own declared roster, and four separate guards now hang off it — the dispatch table has a handler for every entry, the demo client answers every entry, both `docs/architecture.md` and `docs-tech/protocol.md` document every entry, and a fourth check reads `protocol.go`'s own source and fails if the list and the constants it is supposed to mirror ever disagree in either direction
+- Seven new audit actions: `boot_enforced` and `boot_enforce_failed` for the startup restore, `panic_engaged` and `panic_resumed` for the two subcommands, and `apply_refused_panic`, `rollback_skipped` and `resume_restore_skipped` for the three ways an attempt can collide with panic mode and leave the running firewall as it found it. All seven are coloured, labelled and documented in `audit-log.md`
+- A man page, `easywall-core(1)` — the three subcommands with their exit codes, the files panic mode touches, `SIGHUP`'s reload scope, and the shutdown timing a restore or a rollback can now stretch to
+- `features/recovery.md`, documented before this release ships rather than after — the replacement for the escape route being removed has to exist in the reader's hands before the door closes, not afterwards
+
+### Changed
+
+- **One mutex now guards every method on `NftablesManager`.** Panic was the first writer that did not go through the apply slot every other caller was funnelled through, and the manager held one shared `*nftables.Conn` with nothing serialising access to it. `Flush` ships every caller's buffered netlink messages at once and empties the queue regardless of who queued them, so an apply and a panic in flight at the same moment could see one call's messages folded into the other's flush — a rollback reporting success having programmed nothing, or the reverse. Verified against a real kernel under `-tags integration`: a concurrent apply and reset leave the table in a coherent state rather than an interleaved one
+- **Panic now outranks an in-flight apply, and the acceptance rollback stops at the kernel while panic mode is engaged.** Ending an open acceptance window used to be assumed safe to do from inside `Panic` — but cancelling a window does not stop its rollback, it *starts* it, and that rollback would otherwise land after the teardown and quietly re-arm the very table `panic` just tore down, in the worst case up to an hour later on the shipped default. The marker is now written and the audit entry recorded before the window is cancelled, and `rollback` checks the marker before it writes the kernel. The *file* half of that rollback still runs, and has to: `RulesStore.Rollback` only sets `Current` back to `Backup`, it never speaks to the kernel, and skipping it left `Current` holding the unconfirmed set the operator had just been cut off by — equal to `Staged`, so the dashboard reported nothing outstanding, and reinstalled with no acceptance window by the next `resume`, because `RestoreCurrent`'s whole justification is that `Current` has already survived one
+- **The panic marker is re-read after every write to the table, not only before one.** Checking first is necessary and not sufficient: between an apply's marker check and its `nft.Apply` sit two rules-file reads, two atomic rewrites and a full `Snapshot()` — tens to hundreds of milliseconds on a Raspberry Pi — and cross-process no mutex helps at all, because `easywall-core panic` tears the table down itself whenever the socket refuses, and two windows have a live daemon writing the kernel with no socket present: startup, where the boot restore deliberately runs before `net.Listen`, and shutdown, where `Stop` closes and unlinks the listener before it cancels the acceptance window. The loser of that race was a machine filtering with the marker on disk, reported by both `easywall-core status` and the web banner as "deliberately not enforcing", and logged as `panic_engaged` followed by `boot_enforced` — "the stored rules are in force again" as the last word on an unfiltered machine. The daemon now re-reads the marker once the write has returned and takes the table down again if it has appeared — on all three writers of the table (the apply, the boot restore and the acceptance rollback) and on the paths that report failure as well as the ones that report success, because `nft.Apply` returns an error from the custom-rules subprocess and the final-log flush, both of which run after the ruleset is committed. A teardown that cannot be carried out is recorded as `boot_enforce_failed`, the same crit action the restore path already uses for it: a machine filtering behind a marker that says it is not must not be coloured neutral because of which code path reached it
+- **The panic marker is flushed to disk before `panic` reports success.** It was written through a temporary file and a rename with no `fsync` anywhere, under a console message promising the machine "stays that way across a restart". On ext4 defaults the rename can sit in the page cache, so `panic` followed by the hard power-cycle a locked-out operator actually performs could come up filtered again, behind the rules they ran `panic` to escape
+- **An unreadable panic marker no longer withdraws the acceptance rollback.** `PanicEngaged` treats "cannot tell" as "engaged", which is right where the alternative is filtering a machine somebody deliberately unfiltered — and wrong at `rollback`, where it silently turned a firewall that always lets you back in into one that does not, and blamed a decision at the console. A three-way reader sits beside it; the rollback proceeds when the state is unknown, and the fault is reported once at startup as `boot_enforce_failed` with the marker path and the errno
+- **An apply started while the marker exists is refused synchronously**, in the dispatch case itself rather than inside the goroutine the daemon had already answered `{"status":"started"}` from — so the refusal reaches the caller that asked for it instead of a false "started" for work that was never going to happen
+
+[2.7.0]: https://github.com/jp1337/easywall/compare/v2.6.0...v2.7.0
+
+## [2.6.0] — 2026-08-16
+
+**`--write-config`, the flag the documentation had been promising.**
+
+### Added
+
+- **`--write-config`, the flag the documentation had been promising.** `configuration.md` told operators to run `easywall-core --write-config <path>` for a commented default, and neither binary had ever had that flag: the published command exited 2 with "flag provided but not defined". Both binaries have it now, and they carry the file rather than looking for one — `config/embed.go` is the one `go:embed` in the tree, so the two commented TOMLs the Debian package installs, the container copies in and this flag writes out are the same single files, with no second copy to drift. It writes `0600`, **refuses to overwrite**, and does not create the parent directory: both documented paths hold a working firewall's settings once easywall is running, `web.toml` also holds the session key and the password hash, and whoever creates `/etc/easywall` has to decide its ownership deliberately. Tests take the round trip the flag actually performs — embed, write, load, validate — because a template that writes out and then fails to load is worse than none. The manual-install page now uses it instead of a hand-written heredoc that omitted three keys, and the `sed` it prints for the session key was run before it was published: the first version silently produced a 113-character key, because the placeholder contains a digit the character class did not match
+- **Technical documentation, kept out of the published site.** `CLAUDE.md` and six pages under `docs-tech/` — the six workflows and what each actually proves, the packaging traps, Renovate's configuration rule by rule, every guard test with the incident that produced it, the socket protocol, and the threat model in depth. It lives outside `docs/`, which is the entire Jekyll source, so it cannot be published even if someone forgets an exclusion; `TestTheTechnicalDocsAreNotPublished` holds both halves of that. The split is deliberate: the site is for whoever runs easywall, this is for whoever maintains it, and mixing them made the user pages carry internals nobody running a firewall needs to read
+- **Four pages the interface had but the documentation did not.** `/firstrun`, `/apply` and `/dashboard` were undocumented, and `/apply` is the feature easywall exists for — its screenshots had been sitting in `docs/assets/img/screens/` referenced by nothing at all. The first-run page is the larger gap: it is what every installation shows first, it decides the SSH port, IPv6 and whether the host is counted, and it deliberately stages everything but the account, which reads as a bug when nothing explains it. New: *First Run* (with new screenshots of the wizard and the sign-in page, both themes), *Applying Rules*, *Dashboard*, and a *Roadmap* page the README now points at instead of carrying. `TestEveryPageIsDocumented` derives its list from the router, so the next route added has to name the page that describes it
+- **A Debian package for arm64.** The container has been published for `linux/amd64` and `linux/arm64` since it existed and the release carries a tarball for both, but the `.deb` was amd64 only — so a Raspberry Pi or an arm64 VPS, the hosts a small firewall interface is most at home on, had no `dpkg` path at all. Both packages are now built on a runner of their own architecture rather than cross-compiled, which is what lets CI install each one, start both services on it, connect to the socket as the web user and read `--version` back. Nothing in `debian/` changed: `Architecture: any` plus a plain `go build` means the runner decides what comes out. Before uploading, the release checks that the package's `Architecture` field *and* the ELF machine type of the binary inside it match the leg that built it — a package named `arm64` carrying amd64 binaries is the one mistake a file name cannot show. `TestEveryImageArchitectureAlsoGetsAPackage` compares the image platforms in `.goreleaser.yaml` against the package matrix, so the two lists cannot drift apart again
+
+### Fixed
+
+- **An unattended package upgrade could leave easywall unconfigured, with the old processes still serving.** `/etc/easywall/easywall.toml` was installed under its own name, so debhelper made it a dpkg conffile — and easywall rewrites that file every time a setting is saved, which dpkg reads as "modified by you or by a script". When a release also changed the shipped default, which has happened, the upgrade asked about it. Measured in a `debian:trixie` container, 2.5.1 → 2.5.2 with one setting saved beforehand and a plain `apt-get install -y`:
+
+  ```
+  Configuration file '/etc/easywall/easywall.toml'
+   ==> Modified (by you or by a script) since installation.
+   end of file on stdin at conffile prompt
+  dpkg-query: install ok unpacked 2.5.2       ← not "installed"
+  ```
+
+  `unpacked` means dpkg stopped at the prompt and **postinst never ran**: the new binaries were on disk and the services were never restarted. Any upgrade path that does not pass `--force-confold` takes it, and a package may not assume the administrator's does. It ships as `easywall.toml.template` now and postinst copies it into place when there is none — the arrangement `web.toml` has always had, for exactly this reason. Verified across the change in the same container: upgrading from a 2.5.1 that *did* carry the conffile leaves the operator's file untouched at `root:root 0600` with their settings intact, says nothing, and ends `install ok installed`; a fresh install produces the same layout the Build workflow asserts. `TestNeitherConfigIsShippedAsAConffile` keeps both files out of the conffile list
+- **An import that succeeded was reported as failed.** The web process used one five-second deadline for all fifteen socket commands, and `IMPORT_RULES` runs every custom rule past `nft --check` before storing anything — which the core bounds at thirty seconds. Measured through a real socket with an nft that takes eight:
+
+  ```
+  POST /import      -> HTTP 303 after 5.007s
+  web log           -> import rules error: read response: i/o timeout
+  the operator sees -> the import failed
+  the audit log     -> rules_imported
+  staged custom     -> [] before, ["tcp dport 8443 accept"] after
+  ```
+
+  So the staged rule set had been replaced and the interface said it had not — and the obvious next move after "import failed" is to try again, or to apply, on top of a set that is not the one on screen. The deadline is per command now (`shared.CommandTimeout`), derived from the same `NftTimeout` the core enforces, so the client cannot give up on work the core will finish; a status poll keeps the short one. The same harness now reports *Rules imported successfully*
+- **One number on the options page could turn the firewall into a total block.** The nine numeric limits had three different sets of bounds and none of them was in force: the page offered `max="9999"` on all of them, the JSON Schema said 100, 1000, 10000 or 100000 for five and nothing for four, and the daemon checked only that an enabled module's limit was *positive*. An HTML attribute is a hint to a browser and a schema is a hint to an editor; neither reaches a `curl`, a hand-edited `easywall.toml`, or the documented `SIGHUP` path. And the values land in 32-bit nftables fields, so too large did not fail — it wrapped. Measured against a real kernel, with nothing logged in any of the three cases:
+
+  ```
+  connection_limit_max = 5000000000  ->  ct count over 705032704
+  connection_limit_max = 4294967296  ->  ct count over 0          ← drops every connection
+  syn_flood_limit      = 3000000000  ->  limit rate over 3000000000/second burst 1705032704
+  ```
+
+  `ct count over 0` matches every connection from every source and drops it. There is now one table, `shared.FirewallLimits`, carrying the key, the range and the default for all nine — including `ssh_brute_force_log_limit` and `icmp_flood_log_limit`, the two the old table never listed and nothing validated at all. Out of range in the file is clamped and said out loud; out of range from the interface is refused with the key named, which is the split `acceptance.duration` already used and the promise `configuration.md` already made. The page and the schema are now derived from that table by a test, so the three cannot drift again. The options page also stopped quietly substituting the default for a value it could not parse and reporting *Options saved.*
+- **The post-incident nftables snapshot described chains that do not exist.** `Snapshot` matched chains to tables by name and ignored the family, so every table was credited with the chains of every same-named table in another family, and the rule counts beside them were read from the wrong table. A `table ip easywall` beside easywall's own `table inet easywall` — what a hand-written ruleset next to easywall looks like — produced:
+
+  ```
+  ip   easywall: input(1), decoy(1), input(1)   ← two chains reported as three
+  inet easywall: input(1), decoy(0), input(1)   ← one chain reported as three
+  ```
+
+  The `decoy(0)` is the worse half: the lookup failed and the count stayed at its zero value, so a chain that is not in that table was reported as one that exists and is empty. This file is written to `log_dir` on every apply and is what an operator opens after a lockout. Chains are matched on name *and* family now, an unreadable count is `null` with the error beside it rather than `0`, and the chain list is fetched once instead of once per table. `Enforcing()` was checked at the same time and was already correct — it uses the chain only for its name — which is now stated by a test rather than by luck
+- **Any page the operator had open could sign them out of the firewall's interface.** `/logout` was a `GET`, and Go's `CrossOriginProtection` — the CSRF defence every other state-changing route sits behind — checks `Origin` and `Sec-Fetch-Site` on **unsafe methods only**, because a safe method is not supposed to change anything. So one `<img src="https://the-host:12227/logout">` on an unrelated site ended the session and revoked the cookie. Measured against the running server:
+
+  ```
+  GET  /logout    Origin: https://evil.example, Sec-Fetch-Site: cross-site  → 303
+  GET  /dashboard with the same cookie                                      → 303  (signed out)
+  POST /settings  Origin: https://evil.example                              → 403  (the protection working)
+  ```
+
+  It is a `POST` now, and the sidebar control is a form styled to be indistinguishable from the links beside it — same icon, same spacing, same red hover, verified in a browser in both themes. Nuisance rather than escalation: it cost a re-login and nothing else. But it was the one route that changed state without the protection the others have, and the rule it breaks is worth stating — a route that changes state is never a `GET`
+- **A blank line between two networks on the Network page made the save fail, and blamed the core for it.** The two lists there — Docker's additional networks and the routable ones — were validated in three places that did not agree. The editor checked them with the blacklist's validator, which skips blanks and `#` comments and accepts a bare address; the core stored them with `net.ParseCIDR` over every element, blanks and comments included; the demo checked nothing at all. So a separator line, a note, or `192.168.1.5` was accepted by the page, refused by the core, and reported to the operator as *Failed to save changes. Check core connection.* — with a core that was answering perfectly. Measured through the real socket, on a config that had `mode = "closed"` before and after:
+
+  ```
+  routing_networks = "10.8.0.0/24\n\n10.9.0.0/24"
+    web:  save settings error error="core error: routing network \"\": not a CIDR network"
+    page: Failed to save changes. Check core connection.
+  ```
+
+  There is one definition now, `shared.ValidateNetworkList`, and the core, the page and the demo all use it: comments and blank lines are skipped, exactly as `addCIDRAccept` and `cidrMatch` in the core already skipped them when building rules, and an entry that is not a network is named on its own line instead of arriving as a sentence about the socket. Both help texts say that `#` is a comment, both schemas accept one so an editor does not underline a working file, and the message the page shows on a genuinely bad entry no longer promises line numbers on a page that has nowhere to put them
+- **A mistyped network in `easywall.toml` reached the kernel as no rule at all.** Nothing validated `docker.custom_networks` or `routing.networks` when they arrived in the file — only the Network page did, and only on the way in — while `features/system-settings.md` tells operators to edit the file and send `SIGHUP`. Measured against a real kernel with `routing.mode = "networks"` and `networks = ["10.8.0.0/24", "10.9.0.0-24"]`:
+
+  ```
+  daemon startup:  INFO easywall-core started / INFO daemon listening      ← no warning
+  nft list chain inet easywall forward:
+          type filter hook forward priority filter; policy drop;
+          ct state established,related accept
+          ip saddr 10.8.0.0/24 accept
+          ip daddr 10.8.0.0/24 accept                ← and nothing for 10.9.0.0
+  ```
+
+  The second network was listed by the operator as routable and destroyed by the drop policy, silently. `Config.Validate` checks both lists now, so the daemon stops with the entry named — which is what `configuration.md` has always said happens to a value that cannot be interpreted, and what an unknown `ipv6.mode` already did. A reload is refused the same way and leaves the running configuration alone
+- **The configuration reference gave the wrong permissions for `web.toml`.** It said `root:easywall 0640`; `debian/postinst` sets `easywall:easywall 0600`, and the Build workflow asserts exactly that on a freshly installed package. Anyone following the page would have taken the file away from the process that has to rewrite it
+- **The manual-install page created a data directory the daemon cannot write.** `install -d -m 0750 -o easywall -g easywall /var/lib/easywall` — the same layout that made a packaged installation useless before 2.5.0, for the same reason: the unit reduces the core to `CAP_NET_ADMIN`, which also removes `CAP_DAC_OVERRIDE`, so root cannot enter a directory it does not own and `rules.json` is never written. Now `0770 root:easywall`, matching the package
+- **The audit log's `user` column was documented twice, and once wrongly.** One line called it "the account that made the change" while another on the same page said every entry is attributed to `web` — and the JSON examples on two pages showed `"user":"admin"`. The code writes the literal `web` at every call site, because the socket protocol carries no identity. The column names the process, not the person, and the pages say so once
+- **The security page still credited Dependabot.** It listed "Dependabot, secret scanning, dependency review" against dependency hijacking a week after the migration to Renovate removed `dependabot.yml`
+- **A padded Docker network in `easywall.toml` got a forward exception and no input accept.** `shared.ValidateNetworkList` trims before parsing, and `cidrMatch` — the forward chain's own parser — trims too, so `docker.custom_networks = ["  10.8.0.0/24  "]` passed validation and reached the forward chain; `addCIDRAccept`, the input chain's parser, did not trim, and `net.ParseCIDR` rejects leading and trailing whitespace, so the same list got no rule there at all. The daemon started, logged nothing, and disagreed with itself about what the operator had listed — reachable only through a hand-edited config file and `SIGHUP`, since the interface trims every line before it ever reaches the socket. `addCIDRAccept` trims now, the same as its two siblings
+- **The HTTP server could cut a reply the core was still writing.** `easywall-web`'s `WriteTimeout` was a flat 30 seconds, and `shared.CommandTimeout` gives `IMPORT_RULES` and `VALIDATE_CUSTOM` — the two commands a handler waits on synchronously — 35: `NftTimeout` plus a margin. An import where the core spent its full `nft --check` budget got cut off by the HTTP server five seconds before the socket client would have given up on its own, so the operator saw a dropped connection for work that had already finished. `WriteTimeout` is derived from `shared.CommandTimeout` now instead of carrying its own literal, so the two cannot drift apart again; `ReadTimeout` and `IdleTimeout` were checked and have no equivalent problem — neither one is what a handler blocks on while waiting for the core
+
+### Changed
+
+- **`npm run check:ui` could not be run twice in ten minutes, and blamed the interface when it failed.** It signed in once per browser context — three times a run — against a login endpoint rate-limited to five attempts per ten minutes per address, so the second run died on its sixth attempt with `could not sign in: still at .../login` while the server logged `login rate limit exceeded`. CI never saw it, because every run gets a fresh runner; it was a trap for whoever ran the checks locally while working on something. One sign-in is now reused by every context, and a 429 says so by name instead of looking like a broken login form. While it was open: the run now drives **1600, 900 and 390 px** in both themes rather than 1600 alone, which is the "both themes, three widths" rule the repository has stated all along and checked a third of — 78 page loads, all clean
+- **The start rate limit moved to the section systemd documents it in.** `StartLimitInterval=`/`StartLimitBurst=` sat in `[Service]`, where systemd has kept them working as a compatibility alias since v229 — measured on systemd 259, the unit really did report `StartLimitIntervalUSec=1min` and `StartLimitBurst=3`, so this was doing its job. It is written where it belongs anyway: a compatibility alias is a thing that can be removed, and the failure mode when it is would be silent — the unit would fall back to the manager defaults of five starts in ten seconds, and a crash-looping firewall daemon would keep restarting instead of stopping
+- **The documentation diagrams were laid out in whatever font the rendering machine happened to have.** The themes ask for `Inter, system-ui, sans-serif` and nothing ever loaded Inter into the render page, while `docs/assets/fonts/inter-var.woff2` — the face the documentation site itself serves — sat in the repository unused. mermaid sizes every box from the text inside it, so the font decides the layout: re-rendering on a host without Inter installed moved six of the fourteen committed files, with the same mermaid and the same sources, and `check:diagrams` called them current because the digest covered the `.mmd` and the mermaid version and not the font. The shipped woff2 is now embedded in the render page and waited for before anything is measured, and its hash is part of the digest, so swapping the file makes every diagram stale. All fourteen are re-rendered; the diagrams are now set in the same face as the prose around them.
+
+  One thing that came out of chasing it is worth writing down rather than rediscovering: **`build:diagrams` is not byte-reproducible even on one machine.** Six files differ between two consecutive runs, always in the `label-container outer-path` of a rounded container, whose intermediate cubic control points mermaid distributes along each straight edge at run-dependent positions. It is invisible, and that is measured — 4532 of those control points were checked across two runs for their perpendicular distance from the straight line between their own segment's endpoints, and the largest was 0.000000 px. The note is in `render-diagrams.mjs` beside the stamp
+- **Three things that were true and had nothing holding them true.** The Debian package version had no guard at all — `docs/_config.yml` has one, the Go toolchain has one, and the number `dpkg-parsechangelog` supplies for both the package *and* the `-ldflags` version was checked only by the release workflow, at the upload step, after GoReleaser had already published the images and the archives. The documentation deploy asserted "the site is not empty" on the pull-request build and not on the job that ships. And the diagram renderer carried the design tokens as two literal blocks under a "keep them in step with `web/src/docs.css`" comment, where a changed token would have left fourteen committed pictures in the previous palette with `check:diagrams` still reporting them current, because the freshness digest covers the `.mmd` source, the mermaid version and the font, and not the colours. All three now fail when they stop being true
+- **Two comments that described code that had changed.** `.golangci.yml` justified the `G302` exclusion with "socket (0660) and audit log (0640) are intentional" a release after the audit log's group bit was deliberately removed and it became `0600` — with a paragraph in `WriteAuditLog` explaining why. The exclusion is the socket's alone now. And `Acceptance.Start` promised "returns an error if an acceptance is already in progress", which it never does: starting inside an open window is a no-op, and the guard against a second apply is `beginApply`, which claims the slot synchronously and refuses with `ErrApplyInProgress`. The comment made the error check at the one call site read as the guard it is not
+- **The documentation is split in two, and every page was gone over.** All 22 existing pages were checked claim by claim against `internal/`, `config/`, `debian/`, `systemd/` and the workflows — the five defects above came out of that — and then compressed: the `[firewall]` reference went from 30 single-key rows to twelve module rows, the fifteen "this was broken before 2.5.0" boxes to a uniform short form, and the three verbatim copies of "nothing happens until you apply" to one page and two links. Prose that had become a table cell went back to being prose where a phone made that obvious; the rendering was checked at 1600/900/390 px in both themes rather than inferred from the Markdown
+- **Behind a reverse proxy, the login rate limit is shared by everyone, and nothing said so.** easywall deliberately does not trust `X-Forwarded-For` — a client that can set its own source address walks past the limiter, which is what three GitHub advisories are about — so every request appears to come from the proxy and one attacker exhausts the five-attempts-per-ten-minutes budget for all users. Documented on the security and first-run pages; an opt-in list of trusted proxy addresses is on the roadmap
+- **The funding file carried a payment link built from the maintainer's real name.** In a public repository, rendered by GitHub as a Sponsor button on every page of it, in a file nobody rereads after writing it once — the same shape as the private address that used to sit in `debian/control`. Removed, and `TestNoPersonalPaymentLinksAreTracked` now checks every tracked file for a payment handle that is not the project's public one
+- **Two CI changes that were only ever written down in a workflow comment.** `npm ci` and the stylesheet build are gone from the three packaging jobs — `web/static/style.css` is committed and the `assets` job already fails if it does not match its source, so those jobs were rebuilding a guaranteed-current file and would have needed `@tailwindcss/oxide` for arm64 to do it. And a pull-request run now cancels the run a newer push has superseded; deliberately not on `main`, where a cancelled run could skip publishing an edge image
+- **Nothing was watching the Go toolchain, and it had drifted apart in five places.** `go.mod` said `go 1.25.0`, ten `go-version:` pins across four workflows said `1.25`, the `Dockerfile` said `golang:1.26-alpine`, `debian/control` asked for `golang-go (>= 1.21)` and the documentation told contributors to install `1.25+`. So the published container was compiled by a Go version no test ever ran against. The cause was mechanical rather than careless: Dependabot understands a Docker tag and none of the other four — the Go directive ([#9527](https://github.com/dependabot/dependabot-core/issues/9527)) and the toolchain directive ([#13520](https://github.com/dependabot/dependabot-core/issues/13520)) are open, untriaged feature requests, and there is no regex manager for a workflow input. The one place it could reach walked off on its own. Dependency updates move to **Renovate**, which covers all five, and `go.mod` gains a `toolchain` line as the single source: `actions/setup-go` reads it in preference to the `go` directive, so every workflow now says `go-version-file: go.mod` and no version is written down twice. Renovate keeps that line current by default and moves the Dockerfile tag, `debian/control` and the four prose pins with it in one pull request. `TestGoToolchainIsTheSameEverywhere` fails if any of them disagree — watched red for each one in turn. The toolchain is now 1.26.5, the current stable release
+- **`debian/control` asked for a Go it does not need and could not build with.** `golang-go (>= 1.21)` since the 2.0.0 rewrite, while `internal/web/server.go` calls `http.NewCrossOriginProtection` — a Go 1.25 API. It now names the version the `toolchain` line pins. Debian trixie ships Go 1.24, so building the package there needs golang from backports; the manual-install page says so
+- The `go` directive stays at 1.25.0 on purpose and Renovate is configured not to touch it. It states the oldest Go this code compiles with, which is a claim about the source and not about the machine that builds it; Go's own guidance is to leave it alone until an API forces it
+
+[2.6.0]: https://github.com/jp1337/easywall/compare/v2.5.1...v2.6.0
+
+## [2.5.1] — 2026-08-12
+
+**The documented Debian install command was a 404.**
+
+### Fixed
+
+- **The documented Debian install command has always been a 404.** `installation/debian.md` tells operators to `wget .../releases/latest/download/easywall_amd64.deb`, and no release has ever carried a `.deb` — v2.5.0, v2.4.2, v2.4.1, v2.4.0 and v2.3.0 all hold two tarballs and a checksum file. The package was built by the Build workflow and kept as a CI artefact, which expires after seven days and cannot be fetched without a GitHub login. So the install path for the platform easywall targets first has never worked, on top of the package containing no binaries when it was built at all. The release now builds it with `dpkg-buildpackage` — the same `debian/` definition the Build workflow installs and checks on every pull request, deliberately not a second description in `.goreleaser.yaml` — verifies the artefact contains both binaries and carries the tag's version, and uploads it as `easywall_amd64.deb`. The v2.5.0 release was given its package after the fact. The page's claim that arm64 packages are "on the same release page" was untrue as well and now points at the tarball, because no cross-build of the package is exercised anywhere
+- **The maintainer's private address was in the packaging.** `debian/control` and two `debian/changelog` sign-offs carried a personal Gmail address, in a public repository, since the 2.0.0 rewrite in April. Replaced with a GitHub noreply address, which does the same job and is public by construction. A test walks every tracked file and fails on any address that is not a noreply or a reserved documentation domain, so the next changelog entry copied from the one above it cannot bring it back
+
+## [2.5.0] — 2026-08-11
+
+**Every switch on the options page reaches the firewall.**
+
+### Fixed
+
+- **The coverage badge has never included the integration suite, and it is not measuring what the contributing guide asks for.** Codecov reports 68.81% for main; `go tool cover` reports 81.3% for the same commit. Both are right about different things — codecov counts **lines**, `go tool cover` counts **statements**. Recomputing main's own profile as lines gives 71.69%, the same order as codecov's figure; with the integration profile merged in, this tree measures **91.52% of lines and 90.6% of statements**. So the number on the README understates the tested surface by roughly twenty points, and the rule in `CONTRIBUTING.md` — "coverage must not drop below 80%" — never said which of the three it meant. The integration half is the part that goes missing: codecov's flag list for this repository is **empty**, which is what "that upload has never arrived" looks like from outside, and the release that added the upload said it was fixing exactly this. The two steps were also arranged so nobody could notice: `fail_ci_if_error: true` on the action, `continue-on-error: true` on the job. A `codecov.yml` now declares both flags with carryforward, both uploads carry one, and a step that *can* fail checks each profile exists, is non-empty and is readable by the user that uploads it — the integration one is written by `sudo` and inherits root's umask. The project gate is "does not drop" rather than an absolute 80% until the integration flag is confirmed arriving; an absolute gate today would fail every pull request for a reason no pull request caused
+- **The demo has not been updating, and every push to main reported as cancelled.** `deploy-demo` runs on `runs-on: [self-hosted, intranet]`, and the repository has **no self-hosted runners registered at all** — `actions/runners` returns `total_count: 0`. A job whose labels nobody answers does not fail; it queues for the 24 hours GitHub allows and the run ends up cancelled. Build and merge were green throughout and the images reached GHCR, so the only symptom was a red workflow nobody could act on. The cost is larger than it looks: Watchtower on the demo host runs with `WATCHTOWER_HTTP_API_UPDATE` and **no schedule**, on purpose, so that pinned containers are never touched — which makes this POST not a way to update the demo sooner but the only thing that updates it at all. The public demo has been serving whatever `:edge` it was last handed by hand. The job is now behind a `DEPLOY_DEMO` repository variable, the same escape-hatch idiom `QUAY_SKIP` already uses, and carries a ten-minute timeout for when it is switched on: a nudge to a host behind a VPN either lands in a minute or is not going to
+- **The documentation moved to `easywall-project.org`.** `baseurl` is gone with the path prefix, and every absolute link now names the new address: both JSON Schema `$id`s, `taplo.toml`, the shipped configs, the header easywall writes into `web.toml`, the `Homepage` in `debian/control`, `Documentation=` in both systemd units and the `org.opencontainers.image.url`/`documentation` labels on the container image. The last five were missed on the first pass, because the search that found the others was filtered by file extension and those files have none or an unusual one — a whole-tree grep found them. The changelog entry recording where the site used to live is left alone; that is history, not a link. Verified by building the site with the new configuration: 19 pages, the `CNAME` in the output, 0 broken internal links, 0 remaining `/easywall/` prefixes and 0 missing assets
+- **The `gh-pages` branch is gone.** It held a MkDocs build from April, from before the Jekyll rewrite; GitHub Pages has served the Actions artefact since (`build_type: workflow`), and nothing in the repository referenced the branch. Deleted at `c5e838d28ea98f76f98c6a5d676014751f467db6`
+- **A release candidate would have moved `:latest`.** `release.yml` triggers on `v*.*.*`, and that glob matches `v2.6.0-rc1` as happily as `v2.6.0`; the image tag list said `latest` unconditionally. Tagging a candidate would therefore have handed it to everyone pulling the tag `installation/docker.md` calls the production one, and GitHub would have called it the newest release as well. Nothing about it is visible until someone cuts a candidate, which is why it survived. `latest` is now conditional on there being no prerelease part, and a candidate repeats its own version tag rather than rendering an empty one — an empty tag is not a thing to discover during a release. The build is deliberately not duplicated into a second entry: two blocks that have to stay identical apart from the tag is how a `latest` image comes to be built from a different file list than the version it claims to be. `release.prerelease: auto` covers the GitHub side. Verified with `goreleaser check`, and the tag template rendered against GoReleaser's own fields: `v2.6.0` → `latest`, `v2.6.0-rc1` → `v2.6.0-rc1`
+- **`gosec` was not scanning the integration code, and adding the build tag alone would not have fixed it.** Everything behind the `integration` tag is a `_test.go` file, and gosec skips test files unless asked — so `-tags integration` on its own scans exactly what no flags scan. Measured both ways: 41 files, 9,808 lines, 23 issues, identical. With `-tests -tags integration` it is 148 files and 36,865 lines, and the integration harness — which shells out to `ip`, `nsenter` and `ping` — is finally in scope. The cost is stated rather than hidden: the SARIF goes from 23 findings to 145, and all 99 additions are in test files, mostly file permissions and file inclusion in `t.TempDir()`. A rule filter is the answer if that buries the ones that matter; dropping the tag again is not. A test now reads the command line — not the comment above it, which is what it measured first
+- **CodeQL was analysing a build it could not see.** `codeql-action/init` puts a wrapper `go` on `PATH` so it can trace the build; `actions/setup-go` ran after it, prepended the real toolchain, and the wrapper was never called. CodeQL says so on every run — *"Go was installed after the `codeql-action/init` Action was run. Expected `which go` to return `/home/runner/work/_temp/codeql-action-go-tracing/bin/go`, but got `/opt/hostedtoolcache/go/1.25.12/x64/bin/go`"* — as a **warning**, so the job stayed green while the security scan was pointed somewhere other than the build. Init-first is the natural order to write, which is how it got this way; a test now reads the workflow and fails if the two ever swap back. Not reproducible outside GitHub's runner — the evidence is CodeQL's own message from the workflow run
+- **No released image carried the provenance the documentation told operators to check.** `installation/docker.md` says "every image carries the source commit in an OCI label" and gives a command to read it back. GoReleaser's image builds set no labels at all, and the `Dockerfile` had none either, so `:latest` and every `:vX.Y.Z` carried nothing; only `:edge` had them, from `docker/metadata-action`. The command was wrong as well, in a way that would have hidden the first problem: it read `.Manifest.Annotations`, and a label goes into the image *config*. Measured by building with `--label org.opencontainers.image.revision=abc123` and reading the pushed OCI layout — the manifest's annotations held `image.base.name` and `image.created`, and `abc123` was in `config.Labels`. The labels are set in the `Dockerfile` now, which is the one file all three build paths share, fed by a `REVISION` build argument from GoReleaser and from the edge workflow. Verified by building the real image with `REVISION=deadbeef1234` and reading it back with the command the page now prints
+- **easywall stopped every Docker container reaching the network, and every packet the host would have routed.** The `forward` chain is a base chain at the forward hook with `policy drop`, and it had no rules in it at all. That is not neutrality about routed traffic: a base chain whose rules give no verdict falls through to its policy, and a drop there is final — it overrides an accept another table's forward chain has already made. Container traffic is routed, not addressed to the host, so all of it went that way: out of the bridge and through this chain on the way to the world, and back through it for a published port, which Docker translates before easywall sees it. All three arrangements in `docker.md` were dead, including the two whose point is that containers keep working. Measured with a router between two network namespaces and a second table accepting everything at the same hook, its counter confirming the accept had already matched: no firewall — reachable; another table accepting all forwarded traffic — reachable; easywall's empty forward chain added — dropped. It survived because the check on this chain asserted its policy, which was the one part that was right, and because nothing routes on a test host. The networks named under Docker coexistence now cross the chain in both directions — a source inside one, or a destination inside one — with return traffic accepted first, since Docker has un-NATed a reply by the time this chain sees it. Docker's own `DOCKER-USER` still gets its say: an accept here ends this chain, not the hook. With coexistence off nothing is added and the chain still drops, which is right for a host that does not route — and is now written down, on `filters.md`, where the fact that easywall closes the forward hook had never appeared. The regression test routes a real packet between two namespaces rather than reading a rule
+- **`docker compose up -d` produced a container that served nothing, and called itself healthy.** It is the first command in the installation guide, and it bind-mounts `./config` over `/etc/easywall` — which replaces every permission the image sets. The files arrive owned by whoever cloned the repository, in a directory the container's `easywall` user cannot write, with no `ssl/` in it. easywall-web has to write `web.toml` to store the session key it generates, and to create its certificate in `ssl_dir`; it could do neither and exited before binding: `no usable session_key, and the generated one could not be saved to /etc/easywall/web.toml (permission denied)`, then `exited: easywall-web (exit status 1; not expected)` once a second, for ever, while `docker ps` said `Up` and `curl https://localhost:12227/` said connection refused. The healthcheck could not see it, because it tested the core's socket and nothing else. An entrypoint now puts the mounted directory into the shape the Debian package installs — `web.toml` and `ssl/` to `easywall`, `easywall.toml` to `root`, both `0600` — and installs the shipped defaults if the mount is empty. The healthcheck asks the interface for a page as well as the core for its socket. Verified by building the image and running it with the compose mount before and after: `connection refused` → `HTTP 303` and a certificate generated
+- **Clicking Apply twice queued the second one, and it re-applied the rules the first had just rolled back.** `Apply` serialised on a mutex it holds for the whole acceptance window, so the second `APPLY_RULES` did not fail — it waited in that lock until the window closed, then ran on its own. The interface answered "started" to both, because the daemon spawned the goroutine before anything was checked. Measured against a kernel at a 2-second window: `acceptance timed out — rolling back rules` immediately followed by `starting rule apply`. In the case the window exists for, that is the promise running backwards — your rules cut your connection, you wait out the window to get back in, and the moment you are back an apply nobody re-requested cuts you off again for a second window. The other half is shutdown: `Stop` cancels the window that is open, not the ones queued behind it, so four APPLY commands made it wait three further full windows — 6.1 s at a 2 s window, six minutes at the shipped 120 s default, past systemd's 90 s `TimeoutStopSec`, after which `SIGKILL` leaves the unconfirmed rules live and no rollback runs at all. A second apply is now refused with an answer the interface can show, and the demo refuses it the same way instead of silently restarting the window. The Start button is hidden while a window is open, which is why this went unseen; a second tab, a double submit before the redirect lands, and the back button all still reach the endpoint, and the privileged side does not get to depend on the browser hiding a control
+- **"Drop broadcast" dropped nothing, and dropped the wrong thing instead.** The rule was written with packet type `0x03` under a comment reading `NFT_PKTTYPE_BROADCAST`. `0x03` is `PACKET_OTHERHOST`. So switching the option on let every broadcast through untouched and instead dropped traffic addressed to a different host — which an interface does not receive at all unless it is in promiscuous mode, making the rule both wrong and, on a normal host, a no-op in each direction. Read back from a real kernel before the fix: `meta pkttype other drop`. `nft` is the authority on the number and was asked directly — `nft --debug=netlink` on rules nft built itself gives broadcast `0x00000001`, multicast `0x00000002`, other `0x00000003`; multicast and anycast were already right, broadcast alone was not. It shipped because the test asserted the rule **count**: a count cannot see what a rule matches, so any single rule satisfied it. Verified by reinstating the bug — the new check fails and names the rule the kernel is holding, the old count check still passes
+- **A mistyped password hash in `web.toml` answered the login page with a 500 and a stack trace.** `decodeArgon2Hash` checked the shape of the stored hash and nothing about the numbers in it, and `argon2.IDKey` does not tolerate degenerate parameters — it panics. Measured against the running server with the trailing segment of the hash missing, which is what a value truncated while being pasted in looks like: `POST /login` → `HTTP 500`, `panic: invalid memory address or nil pointer dereference` in `blake2b.(*digest).Write`. `p=0` and `t=0` panic with their own messages. `middleware.Recoverer` turned each into a 500 and a stack trace in the journal. This is worse than a malformed config usually is, because `security.md` offers no password recovery beyond "editing `web.toml` on the host is the only way back" — so the person who mangles that line is already locked out, and a 500 is the least useful answer available. An unusable hash is now refused with a description of what is wrong with it, logged once at ERROR with what to do about it: `POST /login` → `HTTP 303`, and `the stored password hash cannot be used … argon2id hash has an empty key; the value looks truncated`
+- **A forwarding port pasted from a spreadsheet was stored as port 1, and the page said "Changes saved."** The incoming and destination ports are `<input type="number">`, and the editor read them back with `parseInt(el.value, 10)` — which does not agree with the field about what the field holds. A spreadsheet writes 10000 as `1E+04`; the number field accepts that as valid, and `parseInt` stops at the `1`. Measured in Chrome against the running interface: typed `1E+04`, hidden payload `source_port: 1`, flash "Changes saved.", stored rule `tcp 1 → 9999` — a privileged port nobody asked for, with nothing on screen to say so. The editor now reads `valueAsNumber`, the browser's own parse, so the same input stores 10000; anything that is not a whole number becomes 0, which the server refuses by name rather than the editor guessing which port was meant
+- **The served copy of htmx had no freshness check.** `web/static/htmx.min.js` is a hand-copied artefact of the dependency pinned in `package.json`, and the CI job that keeps generated files current covered the two stylesheets and the seven diagrams but not this one. A version bump — Dependabot's included — updates the lockfile and leaves the served copy on the old release, with nothing to notice: the interface simply runs a version of htmx the project no longer claims to ship. The job now copies the pinned file over the committed one and fails on any difference. Verified both ways: green on the current tree, and it fires when the repository's copy is made stale
+- **The published JSON Schema called a working `web.toml` invalid.** `taplo.toml` points editors at `docs/schemas/web.schema.json`, and it was stricter than the daemon in three places. It required `session_key`, which `ensureSessionKey` generates when absent — `installation/manual.md` tells operators to leave it out for exactly that reason. It set `minLength: 64` where the daemon accepts 32, so a key between the two is stored, used, and underlined in red. And it required `socket_path` unconditionally, although `Config.Validate` does not ask for one in demo mode — which made the complete demo config printed in `installation/demo.md` invalid against the schema published beside it. Checked with a JSON Schema validator before the change: `config/web.toml`, the file the Debian package installs as its template and the container image copies to `/etc/easywall/web.toml`, was reported invalid (`'CHANGE_ME_…' is too short`). `socket_path` is now conditional on `demo_mode`, the length limit matches the constant the daemon enforces, and a test compares the two so they cannot drift apart again. A schema stricter than the program protects nobody; it teaches operators to stop pointing their editor at it
+- **An upgrade left the browser running the previous release's JavaScript.** The stylesheet URL carries `?v=<version>` so that an upgrade invalidates the cached copy; `app.js` and `htmx.min.js` carried nothing. Neither is served with any caching header either, so freshness fell to the browser's heuristic — roughly a tenth of the file's age, and `dpkg` preserves the build mtime, which puts a packaged installation weeks into that window. Measured in Chrome against two builds with the assets aged the way a package ships them: after upgrading 2.5.0 to 2.6.0 the browser fetched the new `style.css` and kept the old `app.js`. New markup and new CSS then ran against the previous release's script, which is a harder failure to recognise than a stale stylesheet — nothing looks broken, the editors just stop behaving. Both scripts now carry the version, and `/static/` states its terms: a year and immutable for a URL that names a release, revalidate-always for one that does not
+- **The `@source` fix was made and never built.** Both committed stylesheets were still the unrestricted build: `web/static/style.css` at 49,151 bytes and `docs/assets/css/style.css` at 32,564, against 45,954 and 28,213 from the pinned Tailwind — the very numbers this changelog already reported as the result. The proof it was the old build is in the file: the application's stylesheet carried `.\[program\:easywall-core\]`, a selector that can only have come from scanning `docker/supervisord.conf`. Nobody noticed because the freshness check that catches exactly this was added in the same release and had not yet run on the repository it was added to. Rebuilt. The rebuild is a strict subset — every class the templates and `app.js` name is present in both — and the interface was driven through all thirteen pages in both themes afterwards
+- **Both stylesheets shipped the other side's utility classes.** `@source` reads like it restricts what Tailwind scans; in v4 it *adds* to a scan that already covers the whole working directory. So the application's stylesheet was compiled from `DESIGN.md`, `CONTRIBUTING.md` and the documentation pages as well as its own templates, and the documentation's from the application's templates and `app.js` — each carrying several kilobytes of rules for classes it can never use. `docs.css` said in a comment that it prevented exactly this. With the scan actually restricted: 49,151 → 45,954 bytes for the application, 32,586 → 28,213 for the documentation site, and twelve pages in both themes render pixel-identical before and after
+- **Nothing checked that a generated file was current.** The two stylesheets and all seven diagrams are built by Node and committed so a release does not need the toolchain. `npm run check:diagrams` was written for precisely this and `CONTRIBUTING.md` names it as the guard — and no workflow ever ran it, nor rebuilt the stylesheets to compare. The documentation stylesheet had already drifted from its source. CI now rebuilds both and fails on any difference, and runs the diagram check
+- **easywall-web started, reported itself healthy, and could not serve a single page.** Templates and locales are resolved against the working directory, so a unit with the wrong `WorkingDirectory=` — or an install that skipped the asset tree — produced a service systemd called active, a port that answered, and `503 Web interface not ready (templates missing — run Phase 4)` on every request, with one `WARN` line at startup as the only clue. `Start` already refuses to bind without a TLS certificate on the grounds that a port answering badly reads as a broken network rather than a missing file; it now applies the same rule to templates, and names the directory and the working directory it looked in
+
+- **A packaged installation could not work at all: the web interface never reached the core.** `easywall-core.service` reduces the daemon to `CapabilityBoundingSet=CAP_NET_ADMIN`, and for a `User=root` service that cuts the effective set down to exactly that — no `CAP_CHOWN`, no `CAP_DAC_OVERRIDE`, both of which root normally leans on without anyone noticing. Two things broke at once. The daemon could not hand the control socket to the `easywall` group, so it stayed `root:root 0660` and `easywall-web`, which runs as `easywall`, was refused on `connect` — every page reported the core as unreachable. And `/var/lib/easywall` belonged to the web user, so the daemon could not enter it: `rules.json` was never created and every request failed on a permission error raised deep inside the call. The daemon logged one warning about the socket and then announced "daemon listening" as though all of it had worked. CI built the package and started `easywall-web` alone, so nothing exercised the pair. The unit now runs the daemon in the `easywall` group — the owner of a file may give it to a group it belongs to, no capability required — and the data directory is `root:easywall 0770`, which both processes reach on their own merits. Reproduced against the real capability set in a container and now covered in CI, which starts both services and connects to the socket as the web user
+- **A session cookie was accepted for thirty days, and logging out wore off after ten minutes.** `NewCookieStore` sets the codec's maximum age from its own default; assigning a fresh `Options` struct afterwards changes the `Max-Age` the browser sees and not the age the server enforces. The browser therefore dropped the cookie after ten minutes while the value stayed valid for thirty days — and `security.md` states 600 seconds three times over. The consequence was worse than the arithmetic: a logged-out session is remembered as revoked for one session lifetime and then forgotten, on the stated ground that the cookie has expired by then. It had not, so replaying the same cookie eleven minutes after signing out signed you straight back in to a firewall's administration interface, with no restart and nothing to see. Measured before the fix: `/dashboard` answered 200 with a cookie 29 days old, and 200 again after the logout record had been swept. `store.MaxAge` sets both halves and there is now one constructor that does it
+- **The version was never compiled into any binary.** `CurrentVersion` was a constant, and the linker's `-X` writes to variables and reports nothing when handed a constant — so the `-ldflags` in the Makefile, `.goreleaser.yaml`, the Dockerfile, `debian/rules` and two workflows all succeeded and changed nothing. Every released binary carried the literal from the source whatever tag it was built from: the dashboard offered an update to a release that was already installed, the installation count reported every host on one version — the single question that feature exists to answer — and the stylesheet URL never changed across an upgrade, though it is versioned precisely so that it does. Both binaries now accept `--version`, and CI compares it against the version it built
+- **The Debian package was still versioned 2.0.0.** `debian/rules` takes the package version from `debian/changelog`, which no release had touched since the Go rewrite, so every `.deb` built from any later tree called itself 2.0.0 and `apt upgrade` never had anything to offer
+- **"Log blocked connections" logged traffic that was let through.** The log rule was written before the netlink flush and custom rules are appended by the `nft` CLI afterwards, so it landed in front of them: a packet a custom rule accepted was written to the kernel log as `easywall drop:` and then accepted. `filters.md` calls this "everything the final policy drops", and it is the prefix operators grep to find out what is being refused. The log rule now goes in last, in its own flush
+- **The dashboard tiles counted comments as rules.** The blacklist, whitelist and custom lists keep `#` comments and the blank lines between groups, and every other counter in the interface skips them — the dashboard took a plain length instead, so the same list read "12 entries" on the front page and "7" on its own. The demo ships lists full of comments, so it was visible to anyone who looked
+- **Checking custom rules had no bound on the work it asked for.** Every statement got its own `nft` subprocess and its own 30-second timeout, with no cap on the count: measured at ~15 ms each, the 3,200 lines a 64 KB form body can carry asked the *root daemon* for roughly 50 seconds of serial forking, per request, and nothing cancelled it when the web process gave up after five — from an endpoint that fires on every pause in typing. A valid rule set is now checked in a single `nft` run (100 statements went from 1.5 s to 15 ms), the per-statement pass runs only to attribute a failure to a line, the whole check shares one deadline, and more than 256 statements is refused
+- **A rule you started typing disappeared when you pressed Save.** Both table editors dropped any row without a port before submitting the form, so adding a row, writing the description first and saving discarded the text with no message and no trace: the counter above the table said nine rules, the table showed nine, and eight were sent. Measured in a browser. The same applied to a forwarding rule missing either port. A row nobody typed in is still dropped — that is noise, not data — but a row you touched now goes to the server, which refuses the set, says which field is missing, and re-renders the page with your rows still in it
+- **A rejected address list threw away everything you had typed**, under a message reading "the line numbers are listed above the editor" that pointed at an empty panel: the editor redirected, which repopulated the textarea from the stored list. Paste forty addresses with one typo among them and all forty were gone, with no indication of which one was wrong. Both editors now come back with the text and the line numbers. The live check beside the textarea also fired on `keyup` only, so a value that arrived any other way — a right-click paste, a drag, autofill — was never checked; it listens for `input` now
+- **The demo recorded an apply as accepted before anyone had confirmed it**, and stamped the dashboard's last-apply time with it. An apply left to expire therefore produced "Rules accepted" immediately followed by "Rules rolled back" for the same apply — a pair the real core cannot produce — and reported a successful apply that had just been undone. `audit-log.md` teaches operators to read exactly those two lines, and the demo is what people judge easywall by before installing it
+- **Switching on the bogon filter silently switched off the whitelist and Docker coexistence.** That module drops RFC 1918 source addresses, and both the whitelist and the Docker bridge allowance are lists of RFC 1918 networks — and it runs first, so the packet was already gone by the time either rule was reached. Measured against a kernel: the drop for `172.16.0.0/12` at position 17, the accept for `172.17.0.0/16` at 23. Whitelisting the address you administer from was the case it hurt most, since that is the entry meant to stop you losing access and `blacklist.md` recommends adding it before anything else. The drops now live in their own chain with the whitelist and the bridge networks in front of them as exceptions, so an allowed source leaves the chain and carries on. The rest of the range is still dropped: whitelisting `192.168.1.0/24` does not release `192.168.0.0/16`. The order the rest of the chain runs in is unchanged — a protection module should see a packet before an accept rule does; what was wrong was narrower than that
+- **The shipped `docker-compose.yml` granted `SYS_MODULE`.** From a container that already shares the host's network namespace, the capability to load kernel modules is host root by another name. `installation/docker.md` documented `NET_ADMIN` alone and never mentioned it. Removed, and applying a full rule set was verified in a container without it; `no-new-privileges` went from `false` — the Docker default written out as though it were a requirement — to `true`
+- **One checkbox on the options page could leave the host with no firewall at all.** A port marked for SSH protection was written as a jump to the `sshbrute` chain — a chain that exists only while the SSH brute-force module is switched on. Switching the module off therefore produced a rule pointing at nothing: the apply failed, the rollback failed for the same reason, and the kernel was left holding `table inet easywall {}` — no chains, no drop policy, everything let through. Every further apply failed identically, so there was no way back through the interface, and the only record was a `rollback_failed` line that did not say why. The port rule now accepts, and only accepts; the metering rule the module installs for each SSH port already runs earlier in the chain, so new connections still meet the limiter first. Measured before and after in a network namespace. The first-run wizard marks the SSH port on every new installation, which put this on the path everybody takes
+- **A port range marked for SSH protection was not protected.** The port was read with a parser that returns 0 for anything containing a colon, and a 0 was skipped — so the module reported itself enabled and metered nothing
+- **The first apply after the wizard cut off the interface it was applied from.** The input policy is drop and nothing opens the web port by itself, so a rule set holding only SSH made the page unreachable; the acceptance window then rolled the whole apply back, leaving an operator with an apply that would not stick and no stated reason. `requirements.md` lists 12227/tcp as required inbound and nothing was opening it. The wizard now stages the port it is being served on, reads it from `bind_addr` rather than assuming 12227, and says so on the page instead of doing it quietly
+- **A rejected first-run submission threw away every answer.** Mistype the password confirmation and the SSH port silently returned to 22 — so an operator who retyped only the passwords staged a port their machine does not listen on. The username, port, IPv6 choice and both switches now come back; the passwords never do
+- **Two setups arriving together could take the account from each other.** "Is this still the first run" was checked in the handler and acted on in the store, and both requests passed the check before either wrote. The test sits with the write now, under the same lock
+- **Four modules counted their rate once for the whole machine, not per source.** SSH brute force, SYN flood, ICMP flood and TCP RST flood used a bare `expr.Limit`, which is one bucket for the rule — while the interface, `filters.md` and the JSON schema all said "per source address". That inverts the protection rather than weakening it: five SSH connection attempts a minute from anywhere exhausted the budget and every further SSH connection was dropped, the administrator's included, so the module meant to prevent a lockout produced one at negligible cost. Each now keys on the source address through a dynamic set carrying its own limit, with a timeout so a spoofed-source flood fills nothing
+- **ICMP flood matched IPv4 only**, so a ping flood over IPv6 passed the module entirely
+- **The bogon filter and its documentation named different ranges.** `filters.md` listed "this network" and loopback, which the code did not drop, and omitted TEST-NET-3 and the reserved space, which it did. All eleven are now dropped and listed
+- **`SIGHUP` terminated the core.** `features/system-settings.md` documents it as the way to reload an edited `easywall.toml`, and `easywall-core.service` ships `ExecReload=/bin/kill -HUP $MAINPID` — but nothing handled the signal, and the default disposition for an unhandled one is to terminate. A reload during an open acceptance window took the window's goroutine with it, leaving the new rules live and the rollback that was meant to protect the operator unable to fire
+- **The acceptance duration was captured once**, when the daemon started. Changing it wrote the new value to `easywall.toml` and every apply for the rest of the process's life used the old one — while that page's own troubleshooting table said the next apply would pick it up
+- **A rollback threw away everything you had staged.** `Rollback` copied the backup over Current *and* over Staged, so the edits that had just been rolled back were gone with them. The published apply-flow diagram, on four pages, says in as many words: "Previous rules are back. Nothing staged was lost." It hurts most exactly where it happened — a bad rule cuts your connection, you wait out the window to get back in, and twenty rules of work have to be redone over the link you have just proved is fragile. Staged is the workbench; a rollback is a statement about what is enforced
+- **The Debian package installed a web interface that could not start.** `postinst` left `/etc/easywall` as `0750 root:root`, and the web service runs as `easywall` — a user with no traverse permission on that directory, so `easywall-web` exited immediately with "permission denied" reading its own configuration. The SSL directory was unreachable for the same reason, and the systemd unit additionally marked it `ReadOnlyPaths`, which would have prevented easywall from generating the certificate it then tries to serve. Nothing in CI installs the package, so nothing noticed. The directory is now `root:easywall` so the group can traverse and read; `web.toml` belongs to the web user, which is what the first-run wizard needs; and `easywall.toml` is `root:root 0600`, because a network-facing process able to rewrite what the root daemon loads would defeat the two-process split. Verified end to end in a container: the service starts, generates its certificate, completes the first-run wizard, and cannot touch the core's config
+- **The container image handed the whole config directory to the web user** — `chown -R easywall:easywall /etc/easywall`, `easywall.toml` included. Same boundary, same fix
+- **Snapshot rotation deleted the audit log.** After every apply, easywall writes an nftables snapshot into `log_dir` and prunes the old ones — and the pruning took *every* non-directory file in that directory. `log_dir` is also where `audit.log` lives, and "audit.log" sorts before "nftables_…", so it was the first thing removed: on the eleventh apply, easywall deleted the security record that `audit-log.md` describes as append-only and never truncated by easywall. Anything logrotate had put beside it went the same way. Rotation now touches only the files it wrote, keeps ten rather than nine, and the snapshot names cannot collide — at one-second resolution two applies in the same second overwrote each other, so "the last ten" could quietly be fewer
+- **Export downloaded the live rule set while the documentation said it downloads the staged one.** Import replaces staged, so the pair was not lossless: stage twenty edits, export to protect them — which is exactly what `export-import.md` recommends "before a risky change" — and the file held the rules that were already applied instead. The two are identical whenever nothing is pending, so the difference showed only in the case the advice was written for
+- **A data race on the password hash.** `RequireAuth` compares every authenticated request's session fingerprint against `cfg.Password`, and a password change writes that field from another goroutine. The race detector never saw it because no test changed a password while a request was in flight
+- **Two saves arriving together silently discarded one of them**, in both stores. The rules store lost 187 of 200 trials, the configuration 20 of 100. Every write is a read-modify-write of a single file and the daemon handles each connection on its own goroutine, so both saves were built on the same read; in the configuration's case an older snapshot could also reach the file after a newer one and undo it. Two browser tabs is all it takes: add a blacklist entry in one, save a port in the other, and one of them is gone with "Changes saved" reported to both
+- **Neither call to `nft` had a timeout.** `applyCustomRules` runs inside the apply mutex, so an `nft` that never returns did not just fail one apply — it wedged every future one, and `Stop` waits on the same goroutine, leaving a firewall manager that can no longer change the firewall and cannot be shut down either. Both calls are bounded now, `WaitDelay` included: killing the process is not enough on its own, because the wait is on the output pipes and anything the child spawned still holds them
+- **The apply page showed "Idle" when the core was unreachable.** The poll fell through to idle for any answer it did not recognise — a definite claim that nothing is pending, made at the moment nothing is known, and it swapped the confirm button for apply, inviting a second apply while a window might still be open on a core that could not be asked. Not knowing is now its own state, and offers neither action
+- **Confirming after the window closed reported success.** The confirmation was discarded in silence and the interface said "Rules accepted and applied successfully", then sent the operator to the dashboard — telling them their change was live at the one moment it was not, because it had just been rolled back. `ACCEPT` now reports whether a window was open, and a late confirmation says so and returns to the apply page
+- **Stopping the daemon during an acceptance window abandoned it.** The apply ran in a goroutine nothing waited for, so a package upgrade, a `systemctl restart` or a SIGTERM in the two minutes after an apply left the unconfirmed rules live and the rollback unable to run — turning "not confirming brings the old rules back" into "not confirming makes it permanent, if the machine is stopped first". Stop now ends the window as not accepted, which rolls back, and waits for the apply to finish
+- **A data race between an apply and a settings save.** Apply runs asynchronously and its window stays open for up to an hour; during that time the operator can save a setting on another page, and Apply reads exactly the sections that save writes. Found by a new test that dispatches every declared command in turn
+- **Saving a list deleted every comment in it.** `blacklist.md` documents `#` comments, the entry counter ignores them, the demo ships a list full of them and the core skips them wherever it reads a list — every part of the system expected them to survive except the function that decides what is stored. The custom rules page used the same one, where the comment is often the only thing that says what a hand-written nftables statement is for
+- **The dashboard read the whole audit log** to show the newest 200 entries, on every load
+- **The interface scrolled sideways between the mobile breakpoint and about 1085px.** `.main` is a flex item, so its default `min-width: auto` means "never shrink below what the content needs" — and the audit log table needs about 800 pixels. `.table-wrap` has always set `overflow-x: auto`; it could not do anything while the column it lives in refused to shrink. Worse in German, where the words are longer: 185 pixels of horizontal scroll on the whole page at 900px
+- **`render` reported a template failure as success.** Executing straight into the ResponseWriter commits a 200 first, so a missing template produced an empty page and a failing one produced half a form
+- **17 of the 31 controls on the options page never reached the firewall.** They were read from the form, persisted, given defaults in `config.go` and documented with those defaults — and absent from `nftables.go`. Missing entirely: `connection_limit_per_ip` (+max), `tcp_rst_flood` (+log, +limit), `drop_anycast`, `log_blacklist_connections` (+limit), and the eight per-module `*_log` switches with their two limit fields
+- **The whole logging feature was inert.** There was one `expr.Log` in the codebase and it was miswired: `Key` is a bitmask over the `NFTA_LOG_*` attribute indices, and setting it to `unix.NFTA_LOG_PREFIX` (2) sets the *group* bit and leaves the prefix bit clear. The kernel got an empty log group and no prefix. `filters.md` tells operators to run `journalctl -k -f | grep easywall`; there was never anything for that to match
+- **A blacklist entry could be listed as blocked and never enforced.** The web handler saved without checking, `SaveStaged` did not validate (only `ImportRules` called `validateRules`), and at apply time the parse guards returned quietly. Both layers now validate, and `Apply` refuses the set — before `Reset`, so a refused apply leaves the working rules in place rather than destroying them on the way to the error
+- **The dashboard's "rules are live" was never checked.** `Status` returned `Active: true` unconditionally, meaning "the daemon is running". After `nft delete table inet easywall`, or an apply whose rollback also failed, it still showed green. It now asks the kernel: table present, input chain present, rules in it
+- **Port forwarding was inverted.** The rule matched the destination port and redirected to the incoming one. The documented example `{"source_port": 2222, "dest_port": 22}` produced `tcp dport 22 redirect to :2222` — it captured SSH on 22 and sent it where nothing was listening, while 2222 did nothing. Two integration tests covered forwarding; both count rules, and a count cannot see direction. The guidance was wrong too: it named the *incoming* port as the one to open, but the redirect happens in prerouting, so the filter sees the destination port
+- **`acceptance.enabled` was never read.** The system settings page offers it and documents "Off — an apply is final", and the window opened regardless: someone who switched it off, on a machine they can physically reach, still had the change rolled back when the timer expired
+- **Ports were parsed loosely.** `fmt.Sscanf` stops at the first character it cannot read and reports success for what it got, so `"80abc"` validated as port 80 and `"80 90"` did too — someone meaning to open two ports opened one, and the rule list showed a string the firewall was not enforcing
+- **A data race between `Daemon.Start` and `Stop`** that CI's `-race` run had been passing by luck. Reachable in production when SIGTERM arrives during startup
+- **`lastApply` reset to "never" on every daemon restart** while the rules it referred to were still installed. It is now persisted, and reading it no longer races with the apply that writes it
+- **The dashboard waited five seconds for github.com on every load, on hosts with no route out.** The version check ran inline under a comment reading "non-blocking", and only successes were cached — so the failure repeated on every render, on exactly the isolated machines easywall is built for. The answer now comes from cache, refreshes in the background, and a failed check is remembered for an hour
+- **The update banner could point backwards.** "Is there something newer" was `latest != current`, which is also true when the running build is *ahead* of the newest release — a build from main, a release candidate, the maintainer's own machine — so the dashboard advertised an update to an older version. It is a version comparison now, and the claim is re-derived from the running binary rather than trusted from a cache an upgrade has outdated
+- **Importing a rule set larger than 64 KB failed with "no file uploaded".** The handler documented a 512 KB ceiling and set one, but the global body limit had already wrapped the request at 64 KB and wrapping a limited reader cannot widen it. A blacklist of a few thousand addresses — an ordinary export from a busy host — could not be imported back, and the message blamed the operator for a size problem. The limit is now set once, per route, and an oversized upload says so
+- **The acceptance window accepted any positive number.** The settings page has always advertised 10–3600 through the input's `min` and `max`, which the browser enforces and a POST ignores. A one-second window closes before the confirmation page can be read, so every apply rolls back and the firewall can no longer be changed through the interface. The range is enforced server-side; an existing file outside it is clamped with a warning rather than blocking startup
+- **A certificate could expire under a running service.** Renewal happened once, in `NewServer`, and `ListenAndServeTLS` reads the files once at startup — so a service running longer than its own one-year certificate served an expired one, and even replacing the files by hand changed nothing until a restart. The certificate is now supplied per handshake and rechecked twice a day; a custom certificate is re-read when it changes on disk and never overwritten
+- **`tls.cert` without `tls.key`** left easywall pairing the configured file with the other half of its own generated pair. TLS then failed with a key mismatch naming a certificate the operator never configured. Setting one without the other is refused at startup, by name
+
+### Added
+
+- **A host that routes can now say so, in those words.** The `forward` chain fix above let the Docker networks across, which covers a container host and nothing else — a VPN gateway or a router still had to describe its networks as Docker networks to get them through. That worked and put an untruth in the configuration file. `[routing]` replaces it with a three-way choice, built like `ipv6.mode` and for the same reason: the two useful answers at the ends are "route nothing" and "routing is somebody else's business", and the case most hosts actually have sits between them as a named list. `closed` is the default and is what every existing configuration gets, so an upgrade changes nothing. `networks` lets the CIDRs listed there cross in either direction. `open` sets the chain's policy to accept and stops easywall having an opinion about routed traffic at all — for a router whose far side keeps changing and cannot be enumerated. Docker's networks cross whatever the mode is, deliberately: making them subject to it would take a host's containers off the network the first time it upgraded without discovering the new key, which is the defect this whole thread started from. All four branches are covered by routing real packets between two network namespaces, and each was watched failing without its own code
+- **The installation count actually counts.** The switch shipped without a destination: no endpoint, no identifier, no sender, and the only caller of `TelemetryEnabled` was a test. It now sends one request a day — `GET https://telemetry.wdkro.de/v1/count?id=<32 hex>&v=<version>` — and nothing else, ever. The identifier is 16 random bytes generated on the machine and kept in `<data_dir>/telemetry.json`; random rather than derived from the hostname or machine-id, because a derived identifier can be reproduced by anyone who knows the host, which turns a count into a lookup. The first report waits a random part of an hour so installations upgraded together do not all arrive in the same minute, the request gives up after ten seconds, a redirect is refused, and a failure is retried the next time round rather than counted as done. The receiving end records the timestamp, the identifier and the version — **not the address it came from**, which is the one field that would make a count personal data
+- **The consent can be withdrawn.** The wizard said the answer was changeable and nothing in the interface could change it: after the first run the only way back was editing `web.toml` by hand. The System page now carries the switch, on its own route, deliberately not the one that saves the settings beside it — those go through the core, and consent that can only be withdrawn while another process is reachable is not consent. The page also names the destination, so the claim about outbound traffic is checkable from inside the product
+- **The public demo is never counted.** It runs in demo mode and is wiped every few hours, identifier included, which would have manufactured several installations a day in a number whose whole value is being small enough to mean something
+- **The first-run wizard is a short pass through the choices that matter**, not just an account form. The SSH port — the one answer that can lock an operator out — plus optionally 80 and 443, the IPv6 mode, and whether this installation may be counted. Everything but the account is staged rather than applied: nothing reaches the firewall until it is reviewed and applied, and an apply undoes itself unless confirmed. The port is checked before the account is created, because that is the last moment the form is still on screen; if the core cannot be reached, the account is created anyway and the message says what did not land
+- **`telemetry` in `web.toml`**, off unless switched on and asked for during the first run rather than assumed. A random identifier and the version, printed in full in `configuration.md`. Recording consent before there was anything to send is the honest order to build it in
+- **`SIGHUP` reloads `[firewall]`, `[acceptance]`, `[ipv6]` and `[docker]`** without dropping the socket. The paths stay bound to what the daemon started with, and a file that does not parse or does not validate is refused with the running configuration left untouched
+- **Tests that keep the documentation honest**: every `toml` key must appear in `configuration.md` and in its JSON Schema, every log prefix constant must appear in the `filters.md` table, every declared protocol command must have a handler, and a locale string containing markup must be rendered through `richText`
+- **`update_check` in `web.toml`.** The version check is the only outbound request easywall makes, and on an isolated network it is one an operator may want gone rather than merely failing quietly. Unset means on, so existing configurations are unaffected
+- `internal/core/nftables_semantics_test.go` — the existing integration tests assert rule counts, which a rule that drops where it should accept passes without complaint. These read back `nft list table`, the view an operator gets, and assert on meaning: verdicts, source vs destination, log prefixes, and that the blacklist is evaluated before the whitelist
+- Integration coverage for the three modules that produced nothing, and for the refusal path leaving the previous ruleset untouched
+
+### Changed
+
+- **Saving no longer strips `web.toml` of its documentation.** The file the package installs is three kilobytes of comments explaining every key; the config writer serialised a struct, so the first save replaced all of it with fourteen bare lines — 3,198 bytes down to 340. On a container installation the first save is the first *start*, because the shipped `session_key` is a placeholder that `ensureSessionKey` replaces and writes back, so the file was gutted before anyone had touched it. `configuration.md` still sends operators there to configure easywall, and they arrived at a file that no longer said anything. The four values easywall actually writes — the session key, the username, the password hash and the telemetry answer — are now replaced in the existing text, alignment and trailing comments included; nothing else in the file is touched. What makes that safe enough to write credentials with is the last step: the result is decoded again and compared against the configuration it was meant to express, and any difference at all throws the whole attempt away in favour of the encoder, which still says at the top where the comments went. A file with a key said twice, or with nothing above the first table to append to, takes that path. Measured in the container that produced the original report: `wc -c` on the mounted `web.toml` after first start, 340 bytes before and 3,203 after, with the generated key in place of the placeholder
+- **`easywall-core.service` set a directive systemd does not have.** `RuntimeDirectoryGroup=easywall` produced `Unknown key 'RuntimeDirectoryGroup' in section [Service], ignoring` on every load — `systemd-analyze verify` names it. `/run/easywall` came out `root:easywall` regardless, because `Group=easywall` is what systemd actually uses for a runtime directory's group, so nothing was broken and nothing was holding it up either. Removed, and the line that is load-bearing now says so
+- **The Network page is documented, and has a picture.** Two pages linked to "network settings" and landed on a page about the acceptance window; the page an operator actually sets IPv6, routed traffic and Docker on had no documentation and no screenshot at all. `features/system-settings.md` now covers both settings pages and carries the shot, in both themes like every other screen
+- **There is a support server, and it is linked.** A Discord invite that has existed for years and appeared nowhere: `discord.gg/3zJMvChvUA`, checked against Discord's own invite API for a server named easywall with no expiry set. In the README, the documentation footer, the landing page and the contributing guide — with security reports pointedly not sent there
+- **The README badges are one set, and one of them was lying.** The badge labelled *Build* pointed at `test.yml`, so `build.yml` — the workflow that cross-compiles both binaries, builds the image and builds the `.deb` — had no badge at all and could go red unnoticed. All of them now come from one service, so they share a shape, a typeface and a logo treatment, and the three that can drift no longer can: the Go version reads `go.mod`, the licence and the release read the repository. Added a real *build* badge, a *release* badge and Discord. Every badge URL was fetched and every link followed before shipping them — `tests: passing`, `build: passing`, `security: passing`, `coverage: 68%`, `release: v2.4.2`, `go: v1.25.0`, `license: GPL-3.0` — and the row was rendered on a light and a dark ground to check it reads as one set
+- **The audit log filter searches the newest 200 entries, not the file.** It is fed by the same `GET_LOG` the table is, and `audit-log.md` listed only the field set as a reason a search comes back empty. Now it says which window it searches, and to `grep` the file for anything older
+- **Two features finally have a documentation page.** Port Forwarding and Custom Rules each had a page in the interface, a rule type, an entry in the export schema and a dashboard tile — and nothing on the documentation site, whose Features section listed the other seven. Custom Rules is the feature that runs raw nftables statements as root, so it is the one that least deserved to be undocumented; `ports.md` also pointed at a section of `configuration.md` for it that does not exist. The forwarding page carries a new diagram for the thing that catches everyone: the redirect happens in prerouting, so the input filter sees the destination port and that is the one to open
+- **`docker.md` said outbound survived `{"iptables": false}`. It does not.** The sentence read "Outbound still works through Docker's NAT" — and Docker's NAT *is* iptables, so the setting removes the thing the sentence relies on. Measured against Docker 29.7.2 in a nested daemon, with a peer reachable only by leaving the bridge so that no outer layer could supply the translation: as the daemon comes, one `MASQUERADE` rule and seven `DOCKER` filter rules, peer reachable; with `{"iptables": false}`, zero of each and the peer unreachable. A container's packets leave with a `172.17.x.x` source and nothing comes back. The page now says so, and says that easywall cannot supply the masquerade either — custom rules are appended to its `input` chain, and this needs a `postrouting` chain in a table of the operator's own. Worth noting how it read: the claim was plausible, sat beside a correct warning about published ports, and had been there long enough to look checked
+- **`docs/security.md` no longer claims there is no subprocess in the apply path.** There is one: custom rules are nftables statements typed by an operator, and the netlink library takes typed expressions rather than text, so they are applied by writing them into `nft -f -`. The page now says so and states the mitigation that was hiding behind the claim — a newline or a semicolon is refused structurally, on the shape of the input rather than by a parser, because nft reads either as the end of one command and the start of the next
+- **Three places still called the update check "the only outbound request easywall makes"** — `config/web.toml`, the published JSON schema and the struct comment — in files that describe the installation count a few lines further down
+- **The stale copy of the JSON schemas at `schemas/` is gone.** `docs/schemas/` is what GitHub Pages serves and what `taplo.toml` points editors at, and what the tests validate; the root copy was referenced by nothing, still documented `ipv6.enabled` as if it worked, and had never heard of `demo_mode`, `telemetry` or `update_check`
+- **`ValidateRules` moved to `internal/shared`**, because three places have to agree on what a storable rule set is. The demo checked only that the payload was JSON of the right shape, so it accepted `192.168.1.999` and listed it as blocked — in the thing people judge the product by before installing it
+- **The audit log is written with `encoding/json`**, not `fmt`'s `%q`. The reader has always parsed with `encoding/json` and skips a line it cannot decode, so a line the writer produced and the reader rejected would remove an entry from the record with nothing to show it had been there
+- **The demo records what changed, like the product does.** Its saves wrote an empty detail while its own seeded history showed detailed ones, so the first change a visitor made produced a poorer entry than every line above it. The helpers that build those strings moved from `internal/core` to `internal/shared`, so there is one implementation and the demo cannot drift from it
+- **Changing the password now ends every other session.** Sessions live in a signed cookie, so there is nothing server-side to revoke and a change left anyone already signed in exactly where they were until the session timed out — including in the case the change is usually made for. Each session carries a fingerprint of the password hash it was issued under and is refused as soon as that stops matching. The browser making the change stays signed in
+- **`ipv6.enabled` became `ipv6.mode`, with three values.** The boolean was documented — in the interface, in its own warning, and in `configuration.md` — as "off means IPv6 traffic is not filtered at all". It did the opposite: the table is `inet`, so every rule and the drop policy still applied to IPv6 and only the ICMPv6 exemptions were removed, leaving IPv6 filtered *and* non-functional. `filter` puts IPv6 through every rule (the default), `passthrough` accepts it before any rule, `block` drops it except loopback. Existing configurations load and both old values become `filter`; a zero-valued config filters too, so the old behaviour cannot return through a caller that builds the struct by hand
+- **The audit log's detail column says what changed.** It was empty on every save. Rule saves name the addresses added and removed, or count entries for the rule kinds whose members are structures; option and settings saves name the fields that moved, including nested ones such as `docker.enabled`
+- **A failed rollback is recorded** as `rollback_failed` instead of being discarded with `_ =`. New rules not taking *and* the old ones not returning is the worst outcome the system has, and it was the quietest one
+- `NftablesManager.Restore` is removed. It took a snapshot argument, ignored it and returned nil — shaped exactly like a recovery path that recovered nothing
+- The roadmap in `README.md` is rewritten around correctness before features, and gains an opt-in installation count for 2.9 — a critical bug matters differently at ten installations than at ten thousand, and nobody currently knows which this is
+
+### Documentation corrections
+
+- `config/easywall.toml`, the file the package installs, still set the obsolete `ipv6.enabled` a release after `mode` replaced it — a fresh install took the migration path and warned about its own packaging on every start. `config/web.toml` had never heard of `update_check`. Both are checked against the structs now, in both directions
+- `WriteDefaultCoreConfig` and `WriteDefaultWebConfig` were a second set of defaults compiled into the binaries that nothing but their own tests ever called, and they had already drifted from the files that ship. Removed
+- `debian/postinst` generated a CSRF secret and substituted it into a placeholder the template does not contain. There is no `csrf_key` — `configuration.md` says so
+- `blacklist.md` said a whitelist entry "survives a rate limit that trips and every protection module in the chain". It survives neither: the modules are evaluated first, as its own comparison table three paragraphs earlier says. `ports.md` gave the same wrong remedy — add your address to the whitelist — for being rate-limited
+- The README counted nine protection modules with four on by default; there are twelve, five of them on. It also claimed the audit log records *who* changed something, which the audit log page itself corrects two sections later
+- `docker.go` described its detection as reading `/proc/net/fib_trie`, which nothing in that file has ever opened, and carried two functions — `isDockerRunning`, `readProcNetDev` — that nothing but their own tests called. One of them was documented as a fallback that could not work
+- Both binaries logged `version 2.0.0-dev` at startup, hardcoded, while `shared.CurrentVersion` said otherwise
+- The rule-order diagram gained the IPv6 decision, which has sat between loopback and the rest since this release without being drawn
+- Two IPv6 strings on the settings page were written with `code` and *emphasis* markers and rendered with plain `T`, which does not process them — so the markers reached the page as literal backticks and asterisks, in both languages. A test now fails when a locale string containing markup is rendered without `richText`
+- `export-import.md` did not mention an upload limit of any kind
+- Both TOML JSON Schemas were a release behind the code: `ipv6.mode` was missing while the obsolete `ipv6.enabled` was still described as the way to disable IPv6, and `demo_mode` was absent altogether. With `additionalProperties: false` on both files, that meant a correct config was reported as invalid in the editor
+- `security.md` said the certificate is renewed "when it is within 30 days of expiry" without saying that only happened at startup, which for a long-running service is the difference between renewal and none
+- `filters.md` listed three log prefixes; none of them were ever emitted, and the per-module prefix it named (`easywall`) did not exist. The table now lists all ten, with the prefix each rule actually carries
+- `architecture.md` claimed the socket protocol has "no untyped fields". `SaveRulesPayload.Rules` is an `interface{}` that the core re-encodes and decodes by `rule_type`
+- `audit-log.md` said only four actions carry colour; there are five, and the one it left out was `rollback_failed` — the entry the same page calls the one worth alerting on. A test now derives the list and the count from the code
+- `audit-log.md` described the detail column as "usually empty" and that is no longer true; it now also states that entries are attributed to `web` rather than to an account
+
+### Tooling
+
+- **The documentation site was only ever built on the way out.** The Docs workflow ran on push to `main` and nowhere else, so a change that stops Jekyll building — a mistyped Liquid tag, an include that moved, front matter with a stray colon — was merged first and discovered afterwards, as a red deploy with the published site left stale. A pull request touching `docs/` now builds the site with the same command and the same `JEKYLL_ENV`, and counts what came out, because Jekyll exits 0 having written an empty site if every page were skipped. Publishing rights moved to the deploy job, so a pull-request run cannot reach GitHub Pages even in principle. The current tree builds 19 pages
+- **CI now drives the interface in a real browser.** `npm run check:ui` signs in — through the first-run wizard, which it therefore exercises too — walks every page in both themes asserting no console error, no failed request and no sideways scroll, and re-runs the input that produced the forwarding-port bug, checking the number that reaches storage rather than the message on screen. Two of this release's defects were invisible to the Go suite because the mistake was a disagreement with the browser about what a number is, and one was visible only as a 500 with a panic in the log, which the job also fails on. Runs against demo mode, so it needs no core daemon, no root and no nftables; Chromium is pinned through `playwright-core` in the lockfile rather than taken from the runner image
+- **The apply guard is covered without a kernel.** The proof that a second apply is refused rather than queued needs a cycle that actually reaches nftables, so it lives under `-tags integration` and a plain `go test ./internal/...` never ran it. The mechanism — the slot, the refusal, the exact error string the web process matches on, and the release afterwards — is now a unit test as well, so the guard cannot be removed without a plain test run going red
+- **`npm run check:diagrams` could not see a renderer upgrade.** It hashed only the `.mmd` source, so when mermaid went from 11.16.0 to 11.16.1 — moving the bezier control points on every rounded container — the committed SVGs stopped matching what the pinned renderer produced, and the check still called them current. The mermaid version is now part of the stamp, so an upgrade is a re-render
+
+### Security
+
+- **Five rate limits were silently substituted** while `configuration.md` promised "a bad value is a clean exit with a message — never a silent fallback". An enabled module with a limit of zero quietly became the documented default, so the file and the running firewall disagreed with nothing to say so. The substitution is now logged with the key named, a value arriving through the interface is refused instead, and the page describes the policy it actually follows. The options form parsed its numbers with `fmt.Sscanf` — the third copy of the loose parse that read `"5abc"` as 5
+- **An imported custom rule could write into tables easywall does not own.** Custom rules are joined into a script for `nft -f -`, where a newline ends one command and starts the next. The editor splits its input on newlines so none could get through it — but import does not, and imported rules were never syntax-checked either, so a rules file could carry `accept\nadd rule inet <other> …` and the root daemon would run it. Demonstrated against a real kernel: easywall wrote a rule into a neighbouring table, which is precisely what "easywall owns `table inet easywall` and touches nothing else" says cannot happen. The same shape reaches `flush ruleset`, or a chain at prerouting priority that accepts everything while the interface still lists the rules. Custom rules are now rejected if they carry a command separator — checked structurally, so it does not depend on nft's grammar or on a subprocess — and imported ones go through the same `nft --check` the editor uses
+- **Logging out did not log you out.** Sessions live in a signed, self-contained cookie and the server kept no record of them, so "log out" only asked the *browser* to drop it. Presenting the same cookie afterwards was still accepted on `/dashboard` — anyone still holding the value, from a shared machine or a proxy log, stayed signed in to a firewall's administration interface for the rest of the session lifetime. Logged-out sessions are now recorded as revoked and refused; other browsers are unaffected
+- **The login page told an attacker the account name.** The check short-circuited — `username != want || !VerifyPassword(...)` — so a wrong username skipped the argon2 verification entirely. argon2 is deliberately slow: a wrong username answered in 60µs and the right one in 37ms, a **600-fold** difference readable over any network. One request per guess identified the account name of the only account the system has. Both checks now always run, and the username is compared in constant time
+- **The daily log rotation terminated the firewall daemon.** `debian/easywall.logrotate` sent `SIGHUP` to `easywall-core` in a `postrotate` hook, and nothing handled that signal, so the default disposition applied. systemd restarted it five seconds later, which hid it — but an acceptance window open at that moment went with the process, leaving unconfirmed rules live and the rollback unable to run. The hook is gone: easywall opens the audit log per entry, so a rotated file needs no signal at all
+- **`docker compose up` ran with a session key published in this repository.** The compose file bind-mounts `./config` over `/etc/easywall`, and `config/web.toml` shipped `session_key = "CHANGE_ME_…"` — which nothing validated. That key signs the session cookie, so anyone who had read the repository could mint a valid one: a forged cookie built from it was accepted on `/dashboard` with **no password at all**. easywall now generates a key on first start when the configured one is missing, too short, or still the placeholder, and writes it back so sessions survive a restart
+- **The container ran the web process as root.** `supervisord` had no `user=` directive, so `easywall-web` inherited root inside a container holding `NET_ADMIN` and `SYS_MODULE` — while `architecture.md` states, in a table and in every diagram, that it runs as an unprivileged user. The Debian units always had `User=easywall`; the image did not
+- **mermaid 11.16.0 → 11.16.1**, closing five advisories: prototype pollution in the configuration APIs and in architecture diagrams, denial of service in XY charts and radar diagrams, and CSS injection into siblings of a diagram. Build-time exposure only — mermaid is a devDependency used by `scripts/render-diagrams.mjs` to pre-render diagrams into committed SVGs, and no runtime copy is served (that was removed in 2.4.1)
+
+## [2.4.2] - 2026-08-09
+
+**The documentation site stops drawing boxes inside boxes.**
+
+### Fixed
+
+Documentation site — six rendering defects, all of them visible only on screen:
+
+- **Every highlighted code block was drawn as a box inside a box.** kramdown nests `div.highlighter-rouge > div.highlight > pre.highlight`, and the stylesheet gave a background, a border and a radius to *two* of them. It went unnoticed because the border colour measured about 1.05:1 against the fill, so each frame was individually almost invisible — the pair only read as a doubled edge. The frame now lives on the outer wrapper alone
+- **Code blocks had no panel at all in light mode.** They were filled with `--surface` (`#ffffff`) on a `#fcfcfd` page. They now use `--surface-2` and `--border` in both themes
+- **Light mode painted grey rectangles behind parts of every code block.** A `[data-theme="easywall-light"]` copy of the inline-code rule outranked the `.content-body pre code` reset on specificity (0,3,1 against 0,2,2), so the inline chip's background followed `<code>` into `<pre>`; being an inline box, it painted per line box. The override set the same value as the rule it was shadowing — it existed only to cause this
+- **Bullets and numbers were missing site-wide.** Tailwind's preflight sets `list-style: none` and nothing restored it, which cost `configuration.md` the numbering of its language-priority list, where the order is the content
+- **Diagrams and screenshots could show the wrong theme.** They were selected by `<picture>` with `prefers-color-scheme` — the operating system — while the site theme is a `data-theme` attribute set by the sidebar toggle. The layout tried to reconcile the two by reassigning `img.src`, which cannot work: a matching `<source>` always outranks the `src`. A reader on a dark OS who chose the light documentation got dark diagrams on a white page, with no way to fix it. Both variants are now in the markup and CSS picks one; `loading="lazy"` keeps the hidden one off the wire
+- **Fourteen tables rendered a blank grey band** where the headerless markdown idiom (`| | |`) left kramdown emitting a `<thead>` of empty cells
+
+### Changed
+
+- **Diagrams are legible now.** They were stretched to the 880px text measure regardless of their own size, which scaled the widest flow charts to about 0.6 and their labels to roughly eight pixels, while blowing the narrow rule-order flow up nearly 2×. They now keep their intrinsic size inside a full-width frame, scroll instead of shrinking on a phone, and are rendered at 17px rather than 14px
+- `rule-states.mmd` used `<i>…</i>` in three node labels. The renderer sets `htmlLabels: false` — required, since mermaid's `<foreignObject>` output is not valid XML — so the published diagram read `<i>what you are writing</i>`, literally. `apply-flow.mmd` became a flowchart, which lays out in two thirds of the height and without the empty quadrant the state-diagram note placement left behind
+- Callouts are no longer set in italic. That is fine for one line and slow to read across the multi-line ones on `security.md`, which are the paragraphs a reader most needs to get right
+- Inline code is no longer accent-coloured. On `configuration.md` it made a page of keys and values read as a page of links, and left the real links with nothing to stand out against
+- Reference tables scroll on a phone instead of squeezing to one word per line
+
+Documentation site — layout and content:
+
+- **Headings sat at a different left edge from the content below them.** Prose was held to an 880px measure centred in the available area, while tables and diagrams stepped outside it and centred on the same axis. Everything now runs full width between the sidebar and the contents column, sharing one left edge
+- **The landing page's call to action had its three elements on two centre lines**, 104px apart, and a chapter divider drawn inside the card. Both came from the generic `h2` and `p` rules: those are unlayered, the card's rules are in `@layer components`, and an unlayered rule beats a layered one whatever the specificity — so raising the selector inside the layer changed nothing
+- **The sidebar version badge read `v2.4`.** It was hardcoded in the layout and a patch release behind. It now comes from `docs/_config.yml`, as do the hero badge and the two pinning examples in `docker.md`, which named `v2.4.0`
+- **A Playwright storage-state file was published** at `/assets/img/screens/state.json`, committed by accident with the screenshot set in 2.4.1. It holds a session cookie for a local demo instance, long expired and never valid off that host, but it had no business being served. Removed, and `state.json` is now ignored
+
+### Removed
+
+- **"How the public demo stays current"**, and its diagram. It documented how the project's own demo host is deployed — registries, the update daemon, the restart timer, the hostname — which is operational detail about someone's infrastructure rather than documentation for a reader. The parts about resetting your *own* demo remain; two other pages that leaked the same detail are reworded
+
+### Added
+
+- **An on-page contents column** on wide viewports, built from the rendered headings so it cannot drift from the page, and absent on pages with fewer than three. Earns its place on the long reference pages — `configuration.md` runs to about 5,600px
+- `internal/web/docs_style_test.go` asserts that load-bearing rules survive into the built documentation stylesheet. Nothing had ever checked that file, and it has now broken twice in a way no build could catch — once when removing daisyUI took the page background with it, once when a mistyped comment terminator silently deleted the rule that hides the non-current theme's images. Each assertion was confirmed to fail with the defect reintroduced
+
+## [2.4.1] - 2026-08-04
+
+**The documentation site has a dark mode.**
+
+### Fixed
+
+- **Dark mode on the documentation site.** daisyUI's base layer had been supplying the page background and `color-scheme`; removing daisyUI in 2.4.0 took them with it and nothing replaced them, so the site rendered dark components on a browser-white page. Light mode looked correct by coincidence, which is how it shipped
+- **Every documentation diagram with a line break failed to load.** mermaid emits HTML inside a `<foreignObject>` for multi-line labels, and an unclosed `<br>` makes the file invalid XML. An SVG used as an `<img>` source is parsed strictly, so the whole picture silently became alt text. The renderer now parses each SVG before writing it and fails the build if it would not load
+- **`go/bad-redirect-check`.** The last guard before a `Location` header tested for a leading slash and a second slash but relied on a backslash check twenty lines earlier. All three conditions now live in one function, `isLocalPath`, tested directly. The redirect target is rebuilt from a parsed path and query rather than the caller's string, which also closes percent-encoded slashes that a raw prefix check would have passed
+- The documentation site was loading **mermaid from a CDN** on every page — the only third-party request on a site built to make none — configured with a palette and font that 2.4.0 removed. No page contained a diagram, so it had never rendered anything
+
+### Changed
+
+- **The documentation was rewritten around pictures.** 17,000 words with no diagrams and no screenshots became 12,000 with 32 diagram references and 12 screenshots of the real interface, in both themes. Diagrams are named `.mmd` sources in `docs/_diagrams/`, pre-rendered to one SVG per theme by `npm run build:diagrams`; `npm run check:diagrams` fails if a source changed without a re-render
+- **`csrf_key` is gone from the shipped `web.toml`.** Nothing has read it since `net/http.CrossOriginProtection` replaced the token scheme. An existing config keeping the key is unaffected — it is ignored
+- CI action bumps: `actions/download-artifact` 4 → 8, `docker/login-action` 3 → 4, `actions/checkout` 6 → 7, `codecov/codecov-action` 6 → 7
+
+### Documentation corrections
+
+Eight statements that were not true, several of them security-relevant:
+
+- **The audit log does not record logins.** `security.md` listed `login_success`, `login_failed` and `logout` among its event types. Nothing writes them, and nothing ever did — a reader relying on that page would believe failed logins were on record. Use `journalctl -u easywall-web` instead
+- **The audit log's JSON shape** was documented as `{time, event, user, ip, scope, reason}`. The core writes `{time, action, rule_type, detail, user}`
+- **CSRF is not `gorilla/csrf`** — that is not a dependency. It is Go 1.25's `net/http.CrossOriginProtection`, checking `Origin` and `Sec-Fetch-Site`. The claim appeared twice
+- **`csrf_key`** was documented as a required secret and requested by the manual install
+- **"Rule injection is structurally impossible"** overstated it: true of the apply path, but custom rules do reach `nft -f -`, over stdin, inside the privileged core
+- **Certificates** are ECDSA P-256 only, not "RSA-4096 / ECDSA P-256"
+- **The docs stack** is Jekyll, not MkDocs Material
+- **The demo indicator** is a neutral chip, not an amber banner — amber is reserved for firewall state
+
+Also now stated rather than omitted: the audit log's `detail` column is empty for every save and apply, so the column that should answer *what changed* is almost always a dash.
+
+[2.5.1]: https://github.com/jp1337/easywall/compare/v2.5.0...v2.5.1
+[2.5.0]: https://github.com/jp1337/easywall/compare/v2.4.2...v2.5.0
+[2.4.2]: https://github.com/jp1337/easywall/compare/v2.4.1...v2.4.2
+[2.4.1]: https://github.com/jp1337/easywall/compare/v2.4.0...v2.4.1
+
+## [2.4.0] - 2026-08-03
+
+**A public demo, running the whole interface against nothing.**
+
+### Added
+
+- **Public demo at [easywall.wdkro.de](https://easywall.wdkro.de)** — login with `demo` / `demo`. Auto-redeployed on every successful CI build of `main` via the new `publish-edge` workflow + Watchtower hook on the demo host. Container restarts every 6 hours to wipe accumulated visitor state. Linked from the hero CTA and the bottom CTA card on the homepage
+- **Multi-registry container publishing** — every release is now pushed to **GitHub Container Registry, Docker Hub, and Quay.io** simultaneously. Same multi-arch (`linux/amd64` + `linux/arm64`) image, byte-for-byte identical across all three mirrors. Pull from whichever is closest to your environment
+- **`:edge` rolling tag for the public demo** — new `.github/workflows/publish-edge.yml` builds and publishes after every successful CI on `main`, then triggers Watchtower on the demo host to pull the new digest. The four-tag scheme (`:latest` for releases, `:vX.Y.Z` for pinning, `:edge` for nightly, `:sha-<commit>` for rollback debugging) is documented on the Docker installation page
+- Documentation site (jp1337.github.io/easywall) now uses **the same stack as the app**: Tailwind CSS v4 with the same palette, fonts and `easywall-dark`/`easywall-light` theme tokens as the running web UI. Previous 693-line hand-rolled stylesheet replaced by `web/src/docs.css` compiled to `docs/assets/css/style.css` via `make docs-css`
+- **Demo mode** — set `demo_mode = true` in `web.toml` and `easywall-web` runs against an in-memory mock instead of the Unix socket. No `easywall-core` process, no root privileges, no nftables dependency. The state machine seeds itself with realistic example data and supports every page (rules, options, settings, system, audit log, apply/accept/rollback). Designed for hosting a public demo so visitors can explore the UI without affecting a real firewall. State resets when the process restarts. A topbar banner makes the demo status visible on every page
+- **Language switch in the interface** — one button per installed locale in the sidebar footer, and on the login and first-run cards, so an operator who cannot read the interface can still change it before signing in. The choice is stored in an `easywall_lang` cookie for a year and outranks `Accept-Language`. Each locale names itself through a `language_name` key, so a language always appears under its own name. Adding `locales/<lang>.json` is all it takes for it to appear
+- **The interface is fully translated.** Every visible string — page copy, context cards, placeholders, `aria-label`s, empty states, toasts, audit actions, validation messages — goes through the message catalogue in English and German. Sentences containing a link or a literal stay one message with `{}` and `` ` `` markers so a translator controls word order
+- `<html lang>` now reports the language actually served instead of always `en` (WCAG 2.1 SC 3.1.1)
+
+### Changed
+
+- **The interface was rebuilt on a written design system.** `DESIGN.md` in the repository root is now the single source of truth for colour, typography, spacing, radii, motion and components, validated with `@google/design.md`. daisyUI is gone: it contributed 14 components against 107 hand-written rules, and every exact requirement in the spec — control heights, the focus ring, control outlines — was an override. Tailwind v4 stays, with the tokens declared once in `@theme` so a template names `bg-surface`, never a colour. The compiled stylesheet dropped from 95 KB to 48 KB
+- **Graphite + ice palette, dual theme.** Green, amber and red are reserved for firewall state — live, unconfirmed, rolled back — so colour in the interface always means something about the firewall. The accent marks only what is focused, what is active, and the one primary action
+- **Fonts are self-hosted.** Inter and JetBrains Mono are subset and served from `web/static/fonts/`, so `style-src` and `font-src` are now `'self'` with no exceptions. The interface no longer makes a third-party request, and typography survives on an air-gapped host
+- Pages are full-width with a context column beside the rule editors, tables reflow into labelled cards below 720px, and the protection modules on the options page are a self-sizing card grid rather than a single column of two-storey rows
+- `language` in `web.toml` is now the *fallback* locale rather than the default. An explicit choice in the interface wins, then `Accept-Language`, then this setting
+
+### Fixed
+
+- **Live validation rendered unstyled.** The blacklist, whitelist and custom-rule editors emitted `alert-success`, `alert-error`, `alert-info` and `alert-soft` — daisyUI class names that stopped existing when daisyUI was removed. Every validation response an operator has seen since was a box with no colour, on the three pages where "did that parse?" is the entire question. The tests asserted the same dead names and passed throughout
+- **The audit log's colour coding never worked in production.** The stylesheet keyed on `rules_applied` and `rules_rolled_back`, names only the demo client produced. The core writes `apply_accepted`, `apply_rolledback`, `apply_started` and `apply_failed`, so a rolled-back apply — the most consequential line in the log — rendered neutral grey
+- **The demo told every visitor their nftables syntax was valid.** It has no `nft` binary and answered "no errors" whatever was typed. It now reports the checker as unavailable, which is true. The documentation claimed a notice already made this clear; it did not
+- **Text fields and secondary buttons failed WCAG 2.1 SC 1.4.11.** Their borders measured 1.20–1.35:1 where the criterion requires 3:1, and the field fill sits ~1.05:1 from the panel behind it, so the border carried the whole affordance. On the login page the password field was effectively an unmarked rectangle. Toggles and checkboxes had already been fixed; every other control was missed
+- **`docs/features/blacklist.md` stated twice that the whitelist overrides the blacklist.** The code drops blacklisted sources first, as the same page's own ordering table shows. A reader trusting the prose could have locked themselves out
+- The audit log filter searched only the stored identifier, so typing the wording shown on screen returned nothing
+- Entry counters in the list editors counted comment and blank lines as entries
+- The theme switch had no accessible state and a label that named neither of its two positions; it is now a `role="switch"` labelled "Light mode"
+- Light-mode `ink-subtle` failed AA on two of three grounds; raised to `#666e7b`
+- `--form-max` was referenced by `.content-narrow` and `.form-stack` but never declared, so neither had any effect
+- The first-run screen printed its own subtitle again as a notice; it now carries the one thing an operator cannot look up once locked out — that this is the only account, and resetting it needs shell access
+
+[2.4.0]: https://github.com/jp1337/easywall/compare/v2.3.0...v2.4.0
+
+## [2.3.0] - 2026-05-03
+
+**The interface is built from a component library instead of by hand.**
+
+### Added
+
+- DaisyUI 5.5 component library + HTMX 2.0 are now part of the web UI build. All 15 templates use DaisyUI primitives (cards, buttons, alerts, fieldsets, toggles, tables, badges, tabs, steps); the custom CSS in `web/src/app.css` now contains only layout-specific chrome
+- New "Aurora Operator" color palette — analogous cool-tone scheme with deep slate-blue chrome and cyan-400/teal-400 accents in dark mode, white + cyan-600/teal-600 in light mode. Status colors: emerald (success), amber (warning), rose (error), sky (info). Replaces the previous orange/navy complementary pair which created visual tension
+- Custom rules now validate **live** as you type — the textarea sends the content to `POST /custom/validate` (HTMX, 600ms debounce) and per-line syntax errors appear inline without a form submit. Falls back to a soft notice when the core daemon is unreachable
+- Blacklist & whitelist editors now validate **live** as you type — invalid IPv4/IPv6/CIDR entries are listed by line number under the textarea via the shared `POST /iplist/validate` HTMX endpoint
+- Audit log page now has a **search filter** — type in the search box above the table and rows are filtered live (case-insensitive substring match across action / rule type / detail / user) via `GET /log/filter`. The filter operates on the loaded 200 entries; older history is read directly from `audit.log`
+- `/options`, `/settings`, and `/system` now **auto-save on change** — toggle a switch or change a numeric input and the form is silently submitted via HTMX, with a small toast notification appearing in the bottom-right corner ("Saved" / "Save failed"). The traditional Save button is still present for graceful degradation when JavaScript is disabled
+- Custom rules syntax validation also runs on save — the web UI validates raw nftables rules via `nft --check`; per-line errors are displayed inline in the editor (was already in 2.2 release flow, now used by the live-validation endpoint too)
+- Tailwind CSS v4 UI — the web interface now uses a purpose-built "Operator Interface" design with Outfit UI font and JetBrains Mono for IPs/rules; replaces the previous IBM Plex stylesheet
+- `make css` target and CI steps compile the Tailwind source in `web/src/app.css` to `web/static/style.css` during build
+
+### Fixed
+
+- Custom rules in `state.Current.Custom` are now actually applied to the nftables kernel after the typed rules flush; previously the slice was stored and validated but never passed to `nft`
+
+[2.3.0]: https://github.com/jp1337/easywall/compare/v2.2.0...v2.3.0
+
+## [2.2.0] - 2026-04-28
+
+**The audit log is readable from the interface.**
+
+### Added
+
+- Audit log viewer (`GET /log`) — the core's per-change `audit.log` is now accessible from the web UI in a table showing timestamp, action, rule type, detail, and user; most-recent entries first (up to 200)
+- Dashboard rule-count cards — TCP port count, UDP port count, blocked IPs (blacklist), and allowed IPs (whitelist) are now shown as stat-cards on the dashboard, each linking to the relevant management page
+- `GET/POST /system` — acceptance window duration and enabled flag are now configurable from the web UI without editing `easywall.toml`
+
+## [2.1.0] - 2026-04-27
+
+**The protection modules are editable from the interface.**
+
+### Added
+
+- Firewall protection options (`[firewall]` config section) are now editable directly from the web UI via `POST /options`; changes are persisted atomically to `easywall.toml`
+- `GET/POST /password` — administrators can change their password from the web UI without editing config files
+- `GET/POST /settings` — IPv6 support flags and Docker network integration settings (`[ipv6]`, `[docker]` config sections) are now editable from the web UI
+- Option toggle switches on the Options and Network Settings pages now update their status icon live when toggled (no page reload required)
+
+### Fixed
+
+- IPv6 CIDR rules in blacklist and whitelist now correctly generate nftables expressions with `NFPROTO_IPV6` protocol-family guards in the `inet` table; previously IPv6 CIDRs were silently skipped
+- IPv6 single-address whitelist entries now produce an accept rule (the branch was missing entirely)
+- Docker custom networks using IPv6 CIDRs are now handled correctly
+- CSP nonce added to the inline theme-init `<script>` in `login.html` and `firstrun.html`; the script was previously blocked by the `script-src` policy on those pages
+- Removed remaining inline `style=` attributes from auth templates that were blocked by `style-src` without `'unsafe-inline'`
+- Removed unused htmx CDN script from base template; the script tag was blocked by CSP and no `hx-*` attributes were used anywhere
+- Apply status polling no longer stops at `accepted` state; the backend resets to `idle` immediately after acceptance, so the UI now transitions naturally without getting stuck
+
+### Changed
+
+- CSP `script-src` and `style-src` no longer contain `'unsafe-inline'`; inline scripts use per-request nonces instead
+- GoReleaser Docker configuration migrated from deprecated `dockers` + `docker_manifests` to `dockers_v2`
+- CI build workflow updated: Debian package step uses `-d` to skip Go build-dependency check and artifacts are moved to `dist/` before upload
+
+## [2.0.0] - 2026-04-26
+
+**easywall is Go, end to end.**
+
+### Added
+
+- Complete rewrite of easywall from Python to Go (requires Go 1.25, no Python dependency)
+- Two-process architecture: `easywall-core` (root, nftables via netlink) and `easywall-web` (unprivileged HTTPS UI)
+- Unix socket IPC between core and web processes with typed JSON commands
+- Three-state rules system (current / staged / backup) to prevent administrator lockouts
+- Two-step activation safety window: rules auto-rollback if not confirmed within configurable timeout
+- Argon2id password hashing
+- HTTPS-only web interface with auto-generated ECDSA P-256 self-signed certificates (auto-renewed 30 days before expiry)
+- Per-IP login rate limiting (5 attempts per 10 minutes)
+- Comprehensive security headers (HSTS, CSP, X-Frame-Options, Permissions-Policy)
+- CSRF protection via Go 1.25 `net/http.CrossOriginProtection`
+- nftables backend via netlink — only touches `table inet easywall`, Docker chains are not modified
+- Protection modules: SSH brute-force, SYN flood, ICMP flood, port scan detection, invalid packet drop, bogon filter, connection limit, TCP RST flood, broadcast/multicast/anycast drop, and logging
+- IPv6 support with configurable ICMPv6 type allowlist
+- Docker bridge network auto-detection and whitelisting
+- Structured audit log of all rule changes
+- Rule import/export as JSON
+- i18n support (English and German)
+- Docker Compose and systemd deployment support
+
+### Changed
+
+- Configuration format changed from INI/YAML to TOML
+- Rules storage changed from YAML files to a single JSON file with three-state versioning
+- nftables replaces iptables as the kernel firewall backend
+
+## [0.3.1] - 2021-02-17
+
+**A shell flag that broke the installer on older systems.**
+
+### Changed
+
+- Remove `--show-progress` from shell scripts and fix issue #26
+
+## [0.3.0] - 2020-09-30
+
+**A port can say what it is for.**
+
+### Added
+
+- Ports can now have a description. In future versions you will be able to edit this description. Currently you can only delete the port and add a new description.
+- CodeQL analysis of GitHub enabled. This is a beta test of Github.
+- Python tests prepared for Python 3.9
+- It is now recognized when adding a port, if it is already present.
+- A new pip3 module pyyaml is now required. This should be installed automatically during the update.
+
+### Changed
+
+- Ports page in the web interface visually redesigned for the new port description
+- The update script no longer updates to the master branch, but to the last release
+- The Feature-Policy HTTP Header is deprecated and was replaced by Permissions-Policy.
+- Buffer overflow problem solved with very large HTTP header in request
+- Problem solved, if values were written in capital letters in the configuration
+- Tests rewritten for use with the new Rules Handler
+
+### Removed
+
+- Rules are no longer stored in the rules folder but in config/rules.yml. The folder structure under rules can therefore be deleted. There is no import of old rules, because easywall is still in beta status.
+
+## [0.2.4] - 2020-09-06
+
+**The demo page's security headers are checked.**
+
+### Added
+
+- Security headers of the demo page are checked for correctness and actuality.
+- Information about what to do after the installation of easywall to adjust the access data.
+- Class documentation automatically generated and added to the dosc folder
+- If no user name and password is set in the configuration file, the First Run Wizard is automatically displayed in the web interface
+- After saving the options in the web interface, the tab you saved will be displayed.
+- Login attempts and the lockout time for too many failed logins can now be configured under "Web Interface".
+- bindip and bindport option with the info that these are debug variables
+
+### Changed
+
+- The bindip and bindport options have been replaced by the UWSGI start parameters
+- Error messages when saving the options are now displayed correctly
+- Fixed several errors when starting the web interface in debug mode
+
+## [0.2.3] - 2020-08-28
+
+**The installation works.**
+
+### Changed
+
+- Problems with the installation fixed
+- Installation guide improved
+- Problems at startup under Ubuntu 18.04 solved
+
+## [0.2.2] - 2020-08-24
+
+**The readme explains the thing it is the readme for.**
+
+### Added
+
+- Readme and documentation improved
+- Added quick start guide to documentation
+- APT package and repository guide added to installation documentation
+- New security and general HTTP headers added
+- Installation shellscripts strongly improved
+
+### Changed
+
+- Inline Javascript moved to separate file
+
+## [0.2.1] - 2020-08-22
+
+**easywall installs from a Debian package.**
+
+### Added
+
+- easywall is now also available as installable Debian package
+- easywall is now also available on pypi and can be installed over it
+- Massive improvement of GitHub workflows
+- Improve automated testing through GitHub workflows
+- There is now an FAQ documentation, which will be filled with time
+- The web server now sends headers to harden the application such as no permission for frames
+- 403 Error page added and web errors generally improved
+- The web configuration is now also checked for missing entries
+- flask-ipban dependency added
+- pypi package information improved and completed
+- Unit Tests significantly improved and the tools for Core and Web Tests combined
+
+### Changed
+
+- After 10 incorrect login attempts on the web interface by default, the attacker address is blocked
+- The log settings were moved to a separate configuration file "log.ini" in the "config" folder
+- The SSL settings were hardened - only current browsers can be used
+- The easywall_web folder was moved to the easywall folder as "easywall/web
+
+## [0.2.0] - 2020-07-20
+
+**The project can be sponsored.**
+
+### Added
+
+- GitHub sponsorship was activated for the project
+- A large number of configuration entries have been added
+- Blocked connections can be logged by iptables
+- Connections from blacklisted senders can be logged
+- Broadcast, multicast and anycast packets can be blocked
+- SSH brute force prevention was added. Attention! The feature is in alpha state and untested
+- ICMP flood prevention has been implemented. The feature is also in alpha state
+- Drop Invalid Packages was implemented. This is also an Alpa version
+- Port Scan Prevention has been implemented. The feature is currently unstable in my tests
+- IPv6 Router Advertisement connections can be allowed or prohibited
+- IPv6 Neighbor Advertisement packets can also be allowed or prohibited
+- Installation and update documentation has been improved
+- easywall is now programmed completely typed thanks to mypy
+- Ports can now be forwarded from the local system. Note that both the source and destination ports must be opened. This is because this is only a nat forwarding and not a FORWARDING forwarding
+- The translations have been significantly improved thanks to deepl.com
+- Username and password for the web interface can be changed directly in the web interface
+- It is recognized if configuration entries are missing. This is especially important in this version, because we have added some variables. You will be notified about the differences in the web interface
+- The start page of the web interface has been completely reworked. In the future I imagine a tag cloud from the open ports
+- The options page in the web interface now contains almost all settings from the files
+
+### Changed
+
+- Python 3.5 is no longer supported, because no typing of variables is possible
+- The detection from the first start has now been changed to a detection at every start. This has proven to be useful, as more rule types may be added in the future.
+- The configuration files are reloaded each time a variable is called. This is needed to activate changes from the web interface immediately.
+- An additional Python package "natsort" is required. The package offers the possibility to sort the ports naturally.
+- The allowed ICMPv4/v6 types are now strongly restricted.
+
+Allowed ICMPv4 types:
+
+- 0 echo-reply
+- 3 destination-unreachable
+- 11 time-exceeded
+- 12 parameter problem
+
+Allowed ICMPv6 types:
+
+- 1 destination-unreachable
+- 2 packet-too-big
+- 3 time-exceeded
+- 4 parameter problem
+- 128 echo request
+- 129 echo-reply
+
+After explicit configuration the following ICMPv6 types are allowed additionally:
+
+- 133 router solicitation
+- 134 router advertisement
+- 135 neighbor solicitation
+- 136 neighbor advertisement
+
+## [0.1.0] - 2020-06-21
+
+**Almost every line is covered by a unit test.**
+
+### Added
+
+- This version is almost completely tested by unit tests.
+- The documentation was completely revised and can now be found in the `docs` folder.
+- The configuration has been shortened and simplified.
+- The installation, uninstallation and an update can now be carried out via scripts.
+- The web interface installation now creates self-signed SSL certificates and can only be used over HTTPS.
+
+### Changed
+
+- create a setup.py and setup.cfg file for publishing
+- create a requirements.txt file with all the requirements
+- create github actions testing and linting
+- implement custom rules feature
+- create unit tests for all classes in easywall folder
+- create unit tests for all classes in web folder
+- rework all classes in easywall folder
+- rework all classes in web folder
+- set up a demo server
+- write documentation for development setup
+- SSL Implementation for web application
+- write documentation for installing and uninstalling
+
+## [0.0.4] - 2019-10-04
+
+**Custom iptables rules can be applied.**
+
+### Added
+
+- added possibility to apply custom IPTables rules
+- full implemented webinterface - old PHP sources are history
+- rule changes made in the webinterface are only written temporary into web directory
+- rules can be applied in the webinterface
+- a lot of code improvements
+- this is kind the first "stable" version ready for testing
+- I will test this on my webserver a lot, so the next versions will be more stable
+
+### Changed
+
+- too many, I can't count them
+- there was a long time since the last version
+
+## [0.0.3] - 2019-06-30
+
+**A web interface, on Flask.**
+
+### Added
+
+- added easywall-Web using flask
+- added old php templates to web
+- improved install script a lot and added so many features to it
+- simplified code using codacy and code climate
+- ICMP Support added after testing on a server of mine
+- added a daemon script for running easywall-Web
+- 404 error page added to web
+- for a production use of easywall-Web I added uwsgi instead of the small development server of flask
+- logout button added to web
+- added a password generator script and added it to install script
+
+### Changed
+
+- improved exception handling in several files
+- the `.running` file was not deleted properly
+- moved the system `os.system` to a single function where security checks can be implemented in the future
+
+## [0.0.2] - 2019-06-08
+
+**The Python rewrite takes over from master.**
+
+### Added
+
+- Changed branch master to old python branch
+- Renamed old master branch to php-old
+- Bumped version
+- Changed documentation
+
+### Changed
+
+- Information of the user in install.sh if not running as root or using sudo
+- Removed quiet option in install.sh for apt-get and pip3 for better user experience
+
+## [0.0.1] - 2019-04-24
+
+**Two parts: one running as root, one not.**
+
+### Added
+
+- Incomplete Rework of Branch php-old
+- easywall is split in two parts in the new concept
+- easywall Firewall Core Part running as root user finished
+- The New easywall will be one part running as root and one part running as easywall user which has access to config files.
+
+[Unreleased]: https://github.com/jp1337/easywall/compare/v2.29.2...HEAD
+[2.29.2]: https://github.com/jp1337/easywall/compare/v2.29.1...v2.29.2
+[2.29.1]: https://github.com/jp1337/easywall/compare/v2.29.0...v2.29.1
+[2.29.0]: https://github.com/jp1337/easywall/compare/v2.28.0...v2.29.0
+[2.28.0]: https://github.com/jp1337/easywall/compare/v2.27.1...v2.28.0
+[2.27.1]: https://github.com/jp1337/easywall/compare/v2.27.0...v2.27.1
+[2.27.0]: https://github.com/jp1337/easywall/compare/v2.26.0...v2.27.0
+[2.26.0]: https://github.com/jp1337/easywall/compare/v2.25.2...v2.26.0
+[2.25.2]: https://github.com/jp1337/easywall/compare/v2.25.1...v2.25.2
+[2.25.1]: https://github.com/jp1337/easywall/compare/v2.25.0...v2.25.1
+[2.25.0]: https://github.com/jp1337/easywall/compare/v2.24.1...v2.25.0
+[2.24.1]: https://github.com/jp1337/easywall/compare/v2.24.0...v2.24.1
+[2.24.0]: https://github.com/jp1337/easywall/compare/v2.23.2...v2.24.0
+[2.23.2]: https://github.com/jp1337/easywall/compare/v2.23.1...v2.23.2
+[2.23.1]: https://github.com/jp1337/easywall/compare/v2.23.0...v2.23.1
+[2.23.0]: https://github.com/jp1337/easywall/compare/v2.22.0...v2.23.0
+[2.22.0]: https://github.com/jp1337/easywall/compare/v2.21.1...v2.22.0
+[2.21.1]: https://github.com/jp1337/easywall/compare/v2.21.0...v2.21.1
+[2.21.0]: https://github.com/jp1337/easywall/compare/v2.20.1...v2.21.0
+[2.20.1]: https://github.com/jp1337/easywall/compare/v2.20.0...v2.20.1
+[2.20.0]: https://github.com/jp1337/easywall/compare/v2.19.0...v2.20.0
+[2.19.0]: https://github.com/jp1337/easywall/compare/v2.18.0...v2.19.0
+[2.18.0]: https://github.com/jp1337/easywall/compare/v2.17.0...v2.18.0
+[2.17.0]: https://github.com/jp1337/easywall/compare/v2.16.0...v2.17.0
+[2.16.0]: https://github.com/jp1337/easywall/compare/v2.15.1...v2.16.0
+[2.15.1]: https://github.com/jp1337/easywall/compare/v2.15.0...v2.15.1
+[2.15.0]: https://github.com/jp1337/easywall/compare/v2.14.0...v2.15.0
+[2.2.0]: https://github.com/jp1337/easywall/compare/v2.1.0...v2.2.0
+[2.1.0]: https://github.com/jp1337/easywall/compare/v2.0.0...v2.1.0
+[2.0.0]: https://github.com/jp1337/easywall/compare/v0.3.1...v2.0.0
+[0.3.1]: https://github.com/jp1337/easywall/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/jp1337/easywall/compare/v0.2.4...v0.3.0
+[0.2.4]: https://github.com/jp1337/easywall/compare/v0.2.3...v0.2.4
+[0.2.3]: https://github.com/jp1337/easywall/compare/v0.2.2...v0.2.3
+[0.2.2]: https://github.com/jp1337/easywall/compare/v0.2.1...v0.2.2
+[0.2.1]: https://github.com/jp1337/easywall/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/jp1337/easywall/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/jp1337/easywall/compare/v0.0.4...v0.1.0
+[0.0.4]: https://github.com/jp1337/easywall/compare/v0.0.3...v0.0.4
+[0.0.3]: https://github.com/jp1337/easywall/compare/v0.0.2...v0.0.3
+[0.0.2]: https://github.com/jp1337/easywall/compare/v0.0.1...v0.0.2
+[0.0.1]: https://github.com/jp1337/easywall/releases/tag/v0.0.1
