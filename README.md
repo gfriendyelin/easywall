@@ -1,5 +1,5 @@
-本项目forkhttps://github.com/jp1337/easywall
-增加了中文支持，如有其他bug请移步到https://github.com/jp1337/easywall提交bug
+本项目fork jp1337/easywall
+增加了中文支持，如有其他bug请移步到https://github.com/jp1337/easywall 提交bug
 <p align="center">
   <img src="web/static/icon.svg" alt="" width="88" height="88">
 </p>
